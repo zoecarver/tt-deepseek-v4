@@ -46,6 +46,37 @@ scale_fmt: Optional[str] = "ue8m0"
 scale_dtype = torch.float32
 
 
+# Per-phase wall-time accumulators. Populated by _phase() context manager; printed
+# at end of main(). Phases nest freely — each name accumulates independently, so
+# a parent phase double-counts its children. Interpret as "time attributed to X,
+# inclusive of its instrumented subregions" and only compare sibling phases.
+_PHASE_ACCUM: dict[str, float] = {}
+_PHASE_COUNTS: dict[str, int] = {}
+
+
+@contextmanager
+def _phase(name: str):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        dt = time.perf_counter() - t0
+        _PHASE_ACCUM[name] = _PHASE_ACCUM.get(name, 0.0) + dt
+        _PHASE_COUNTS[name] = _PHASE_COUNTS.get(name, 0) + 1
+
+
+def _phase_report() -> str:
+    if not _PHASE_ACCUM:
+        return "(no phases recorded)"
+    lines = ["phase                      total(s)    n    avg(ms)"]
+    for k in sorted(_PHASE_ACCUM, key=lambda k: -_PHASE_ACCUM[k]):
+        tot = _PHASE_ACCUM[k]
+        n = _PHASE_COUNTS[k]
+        avg_ms = 1000.0 * tot / n
+        lines.append(f"  {k:24s}  {tot:7.2f}  {n:4d}  {avg_ms:9.1f}")
+    return "\n".join(lines)
+
+
 @contextmanager
 def set_dtype(dtype):
     prev = torch.get_default_dtype()
@@ -948,8 +979,10 @@ class ParallelHead(nn.Module):
         return F.linear(x[:, -1].float(), self.weight)
 
     def forward(self, x: torch.Tensor, hc_fn, hc_scale, hc_base, norm: RMSNorm):
-        x = self.hc_head(x, hc_fn, hc_scale, hc_base)
-        logits = self.get_logits(norm(x))
+        with _phase("head.hc_combiner"):
+            x = self.hc_head(x, hc_fn, hc_scale, hc_base)
+        with _phase("head.norm_and_logits"):
+            logits = self.get_logits(norm(x))
         return logits
 
     def hc_head(self, x, hc_fn, hc_scale, hc_base):
@@ -994,11 +1027,14 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
-        h = self.embed(input_ids)
-        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-        for layer in self.layers:
-            h = layer(h, start_pos, input_ids)
-        logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+        with _phase("embed"):
+            h = self.embed(input_ids)
+            h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        with _phase("blocks"):
+            for layer in self.layers:
+                h = layer(h, start_pos, input_ids)
+        with _phase("head"):
+            logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
         return logits
 
 
@@ -1349,13 +1385,16 @@ class Model:
         if include_final_norm:
             # Replace the whole head forward so CPU norm is skipped.
             def _device_head_forward(self_head, x, hc_fn, hc_scale, hc_base, norm):
-                x = self_head.hc_head(x, hc_fn, hc_scale, hc_base)  # still CPU
-                return dlh(x[:, -1].contiguous())
+                with _phase("head.hc_combiner"):
+                    x = self_head.hc_head(x, hc_fn, hc_scale, hc_base)  # still CPU
+                with _phase("head.norm_and_logits"):
+                    return dlh(x[:, -1].contiguous())
             head.forward = _device_head_forward.__get__(head, type(head))
             final_norm.weight.data = torch.empty(0)  # device owns it
         else:
             def _device_get_logits(self_head, x):
-                return dlh(x[:, -1].contiguous())
+                with _phase("head.norm_and_logits"):
+                    return dlh(x[:, -1].contiguous())
             head.get_logits = _device_get_logits.__get__(head, type(head))
         head.weight.data = torch.empty(0)
 
@@ -1374,16 +1413,19 @@ class Model:
 
     @torch.inference_mode()
     def generate(self, tokens: list[int], max_tokens: int = 32, temperature: float = 1.0):
-        logits = self.prefill(tokens)
+        with _phase("prefill"):
+            logits = self.prefill(tokens)
         pos = len(tokens)
         for _ in range(max_tokens):
-            if temperature == 0:
-                nxt = int(logits.argmax().item())
-            else:
-                probs = F.softmax(logits.float() / temperature, dim=-1)
-                nxt = int(torch.multinomial(probs, num_samples=1).item())
+            with _phase("sample"):
+                if temperature == 0:
+                    nxt = int(logits.argmax().item())
+                else:
+                    probs = F.softmax(logits.float() / temperature, dim=-1)
+                    nxt = int(torch.multinomial(probs, num_samples=1).item())
             yield nxt
-            logits = self.step_decode(nxt, pos)
+            with _phase("decode_step"):
+                logits = self.step_decode(nxt, pos)
             pos += 1
 
 
@@ -1471,6 +1513,9 @@ def main():
     print(f"[debug] full decode: {model.tokenizer.decode(out_tokens)!r}")
     dt = time.time() - t0
     print(f"\n[phase] generated {len(out_tokens)} tokens in {dt:.1f}s ({len(out_tokens)/dt:.2f} tok/s)")
+
+    print("\n[timing] per-phase breakdown (inclusive; sort by total):")
+    print(_phase_report())
 
     if mesh is not None:
         _close_mesh(mesh)
