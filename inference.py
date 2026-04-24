@@ -1421,6 +1421,83 @@ class DeviceMoEGate(nn.Module):
         return weights, indices
 
 
+class DeviceSharedExpert(nn.Module):
+    """V4-Flash shared-expert SwiGLU on a 1xN mesh (replicated weights).
+
+    Each chip holds full copies of w1, w2, w3 (~48MB per layer bf16) and
+    runs the full forward:
+
+        y1 = x @ w1^T
+        y3 = x @ w3^T
+        y1 = clamp(y1, max=limit);  y3 = clamp(y3, -limit, +limit)
+        mid = silu(y1) * y3
+        out = mid @ w2^T
+
+    Activations are replicated; output read back from chip 0. This is
+    correctness-first TP (no CCL); compute is duplicated 4x but the
+    shared expert is small relative to the mesh's aggregate throughput.
+    """
+
+    def __init__(self, mesh, cpu_w1: torch.Tensor, cpu_w2: torch.Tensor,
+                 cpu_w3: torch.Tensor, swiglu_limit: float):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        inter_dim, dim = cpu_w1.shape
+        if cpu_w3.shape != (inter_dim, dim):
+            raise ValueError(f"w3 shape {tuple(cpu_w3.shape)} != w1 {(inter_dim, dim)}")
+        if cpu_w2.shape != (dim, inter_dim):
+            raise ValueError(f"w2 shape {tuple(cpu_w2.shape)} != expected {(dim, inter_dim)}")
+        self.dim = dim
+        self.inter_dim = inter_dim
+        self.swiglu_limit = float(swiglu_limit)
+
+        common_rep = dict(
+            device=mesh,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        self.w1_tt = ttnn.as_tensor(
+            _weight_to_bf16(cpu_w1).transpose(0, 1).contiguous(), **common_rep)
+        self.w3_tt = ttnn.as_tensor(
+            _weight_to_bf16(cpu_w3).transpose(0, 1).contiguous(), **common_rep)
+        self.w2_tt = ttnn.as_tensor(
+            _weight_to_bf16(cpu_w2).transpose(0, 1).contiguous(), **common_rep)
+
+    def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """x: [M, dim] -> [M, dim]. `weights` kwarg matches Expert.forward signature;
+        shared expert is always called with weights=None."""
+        if weights is not None:
+            raise ValueError("DeviceSharedExpert does not support per-token `weights`")
+        ttnn = self._ttnn
+        M, D = x.shape
+        if D != self.dim:
+            raise ValueError(f"x last dim {D} != expected {self.dim}")
+        x_tt = ttnn.as_tensor(
+            x.to(torch.bfloat16).contiguous(),
+            device=self.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        y1_tt = ttnn.matmul(x_tt, self.w1_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        y3_tt = ttnn.matmul(x_tt, self.w3_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        if self.swiglu_limit > 0:
+            y1_tt = ttnn.clamp(y1_tt, max=self.swiglu_limit)
+            y3_tt = ttnn.clamp(y3_tt, min=-self.swiglu_limit, max=self.swiglu_limit)
+        mid_tt = ttnn.multiply(ttnn.silu(y1_tt), y3_tt)
+        out_tt = ttnn.matmul(mid_tt, self.w2_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
+        y = ttnn.to_torch(out_tt, mesh_composer=composer)[:M]
+        return y.to(x.dtype)
+
+
 def _open_mesh(shape=(1, 4)):
     import ttnn
     return ttnn.open_mesh_device(ttnn.MeshShape(*shape))
@@ -1749,6 +1826,25 @@ class Model:
             attn._wo_a_grouped = _device_wo_a_call.__get__(attn, type(attn))
             self._device_wo_a.append(dg)
 
+    def offload_moe_shared_expert(self, mesh):
+        """Move every MoE layer's shared-expert SwiGLU to the 1xN mesh.
+
+        Weights are small per layer (~48MB bf16) and replicated on every chip;
+        output is read back from chip 0. Correctness-first TP (no CCL).
+        """
+        self._device_shared_experts = []
+        for layer in self.transformer.layers:
+            ffn = layer.ffn
+            if not isinstance(ffn, MoE):
+                continue
+            se = ffn.shared_experts
+            dse = DeviceSharedExpert(
+                mesh, se.w1.weight, se.w2.weight, se.w3.weight,
+                swiglu_limit=se.swiglu_limit,
+            )
+            ffn.shared_experts = dse
+            self._device_shared_experts.append(dse)
+
     def offload_moe_gate(self, mesh):
         """Move every non-hash MoE gate to the 1xN mesh.
 
@@ -1862,6 +1958,8 @@ def main():
                         help="Row-parallel shard wo_b across the 1x4 mesh (Phase 2)")
     parser.add_argument("--offload-moe-gate", action="store_true",
                         help="Replicate MoE gate on 1x4 mesh (sqrtsoftplus); non-hash layers only")
+    parser.add_argument("--offload-moe-shared-expert", action="store_true",
+                        help="Replicate MoE shared-expert SwiGLU on 1x4 mesh (all layers)")
     parser.add_argument("--weights-cache",
                         default=os.environ.get("DS_WEIGHTS_CACHE",
                                                "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
@@ -1891,6 +1989,7 @@ def main():
         or args.offload_attn_wo_a
         or args.offload_attn_wo_b
         or args.offload_moe_gate
+        or args.offload_moe_shared_expert
     )
     if need_mesh:
         print("[phase] opening 1x4 mesh ...")
@@ -1933,6 +2032,11 @@ def main():
         t0 = time.time()
         model.offload_moe_gate(mesh)
         print(f"[phase] moe_gate offloaded in {time.time() - t0:.1f}s")
+    if args.offload_moe_shared_expert:
+        print(f"[phase] replicating MoE shared experts across {n_layers} layers on mesh ...")
+        t0 = time.time()
+        model.offload_moe_shared_expert(mesh)
+        print(f"[phase] moe_shared_expert offloaded in {time.time() - t0:.1f}s")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")
