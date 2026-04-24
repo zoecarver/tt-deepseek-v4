@@ -1421,6 +1421,179 @@ class DeviceMoEGate(nn.Module):
         return weights, indices
 
 
+_RMS_TILE = 32
+
+
+def _pack_rms_gamma(gamma_1d: torch.Tensor) -> torch.Tensor:
+    """[hidden] -> [TILE, hidden] with gamma replicated across all 32 rows."""
+    (hidden,) = gamma_1d.shape
+    if hidden % _RMS_TILE:
+        raise ValueError(f"rms hidden={hidden} must be multiple of {_RMS_TILE}")
+    return gamma_1d.unsqueeze(0).expand(_RMS_TILE, -1).to(torch.bfloat16).contiguous()
+
+
+import ttl  # type: ignore[import-not-found]
+
+
+def _compile_rmsnorm_kernel(num_row_tiles: int, h_tiles: int, rms_eps: float, inv_D: float):
+    """Inlined from tt-lang-kernels/rmsnorm.py. Streams one row-tile (32 tokens)
+    per core-iteration. Two passes over x per row-tile: sum(x^2), then
+    gamma*inv_rms apply. Requires module-level `ttl` so the @ttl.operation
+    decorator's source inspector sees it as a global (not a closure var)."""
+
+    @ttl.operation(
+        grid="auto",
+        options="--no-ttl-reduce-full-fp32",
+        fp32_dest_acc_en=True,
+    )
+    def rmsnorm_kernel(x, gamma, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        tiles_per_core = -(-num_row_tiles // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        g_dfb = ttl.make_dataflow_buffer_like(gamma, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        xsq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        red_step_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        inv_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            sc = sc_dfb.wait()
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    x0 = x_dfb.wait()
+                    xsq_dfb.reserve().store(x0 * x0)
+                    sq_dfb.reserve().store(
+                        ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
+                    )
+                    for _ in range(h_tiles - 1):
+                        xk = x_dfb.wait()
+                        xsq_dfb.reserve().store(xk * xk)
+                        red_step_dfb.reserve().store(
+                            ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
+                        )
+                        prev = sq_dfb.wait()
+                        sq_dfb.reserve().store(prev + red_step_dfb.wait())
+
+                    sq = sq_dfb.wait()
+                    inv_bc = inv_bc_dfb.reserve()
+                    inv_bc.store(ttl.math.broadcast(
+                        ttl.math.rsqrt(
+                            sq * ttl.math.fill(sq, inv_D) + ttl.math.fill(sq, rms_eps)
+                        ),
+                        inv_bc, dims=[1],
+                    ))
+                    inv = inv_bc_dfb.wait()
+
+                    for _ in range(h_tiles):
+                        xk = x_dfb.wait()
+                        gk = g_dfb.wait()
+                        out_dfb.reserve().store(xk * gk * inv)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    for h in range(h_tiles):
+                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
+                    for h in range(h_tiles):
+                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
+                        ttl.copy(gamma[0, h], g_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    for h in range(h_tiles):
+                        ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
+
+    return rmsnorm_kernel
+
+
+class DeviceRMSNorm(nn.Module):
+    """RMSNorm via the tt-lang fused kernel on a 1xN mesh (replicated gamma).
+
+    Pads M to a multiple of TILE (32). Gamma is packed to [TILE, hidden] and
+    replicated across every chip. Each chip runs the kernel on its replicated
+    inputs -- output is the same on every chip; we read chip 0's rows.
+    Per-(M_tiles) kernel is compiled lazily and cached.
+    """
+
+    def __init__(self, mesh, cpu_gamma: torch.Tensor, eps: float):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        g = cpu_gamma.to(torch.bfloat16).flatten().contiguous()
+        (hidden,) = g.shape
+        self.hidden = hidden
+        self.eps = float(eps)
+        self._kernels: dict = {}
+
+        rep = dict(
+            device=mesh,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        self.gamma_tt = ttnn.as_tensor(_pack_rms_gamma(g), **rep)
+        self.sc_tt = ttnn.as_tensor(
+            torch.ones((_RMS_TILE, _RMS_TILE), dtype=torch.bfloat16), **rep)
+
+    def _kernel(self, num_row_tiles: int):
+        k = self._kernels.get(num_row_tiles)
+        if k is None:
+            k = _compile_rmsnorm_kernel(
+                num_row_tiles=num_row_tiles,
+                h_tiles=self.hidden // _RMS_TILE,
+                rms_eps=self.eps,
+                inv_D=1.0 / self.hidden,
+            )
+            self._kernels[num_row_tiles] = k
+        return k
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ttnn = self._ttnn
+        orig_shape = x.shape
+        x2 = x.reshape(-1, self.hidden).to(torch.bfloat16)
+        M = x2.shape[0]
+        Mt = -(-M // _RMS_TILE)
+        Mpad = Mt * _RMS_TILE
+        if M < Mpad:
+            pad = torch.zeros((Mpad - M, self.hidden), dtype=torch.bfloat16)
+            x2 = torch.cat([x2, pad], dim=0)
+
+        rep = dict(
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        x_tt = ttnn.as_tensor(x2.contiguous(), **rep)
+        out_tt = ttnn.as_tensor(torch.zeros_like(x2), **rep)
+        self._kernel(Mt)(x_tt, self.gamma_tt, self.sc_tt, out_tt)
+
+        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
+        y = ttnn.to_torch(out_tt, mesh_composer=composer)[:M]
+        return y.view(*orig_shape).to(x.dtype)
+
+
 class DeviceSharedExpert(nn.Module):
     """V4-Flash shared-expert SwiGLU on a 1xN mesh (replicated weights).
 
@@ -1826,6 +1999,21 @@ class Model:
             attn._wo_a_grouped = _device_wo_a_call.__get__(attn, type(attn))
             self._device_wo_a.append(dg)
 
+    def offload_rms_norms(self, mesh):
+        """Move attn_norm + ffn_norm on every Block to the 1xN mesh.
+
+        Uses the tt-lang fused rmsnorm kernel (replicated gamma). Per-M_tiles
+        kernel is compiled lazily; first call of each shape takes a compile hit.
+        Final norm is already on device via offload_lm_head(include_final_norm=True).
+        """
+        self._device_rms_norms = []
+        for layer in self.transformer.layers:
+            for attr in ("attn_norm", "ffn_norm"):
+                norm = getattr(layer, attr)
+                dn = DeviceRMSNorm(mesh, norm.weight, norm.eps)
+                norm.forward = dn.forward
+                self._device_rms_norms.append(dn)
+
     def offload_moe_shared_expert(self, mesh):
         """Move every MoE layer's shared-expert SwiGLU to the 1xN mesh.
 
@@ -1960,6 +2148,8 @@ def main():
                         help="Replicate MoE gate on 1x4 mesh (sqrtsoftplus); non-hash layers only")
     parser.add_argument("--offload-moe-shared-expert", action="store_true",
                         help="Replicate MoE shared-expert SwiGLU on 1x4 mesh (all layers)")
+    parser.add_argument("--offload-rms-norms", action="store_true",
+                        help="Run attn_norm + ffn_norm via tt-lang rmsnorm kernel on 1x4 mesh")
     parser.add_argument("--weights-cache",
                         default=os.environ.get("DS_WEIGHTS_CACHE",
                                                "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
@@ -1990,6 +2180,7 @@ def main():
         or args.offload_attn_wo_b
         or args.offload_moe_gate
         or args.offload_moe_shared_expert
+        or args.offload_rms_norms
     )
     if need_mesh:
         print("[phase] opening 1x4 mesh ...")
@@ -2037,6 +2228,11 @@ def main():
         t0 = time.time()
         model.offload_moe_shared_expert(mesh)
         print(f"[phase] moe_shared_expert offloaded in {time.time() - t0:.1f}s")
+    if args.offload_rms_norms:
+        print(f"[phase] binding tt-lang rmsnorm across {n_layers} layers (attn+ffn) ...")
+        t0 = time.time()
+        model.offload_rms_norms(mesh)
+        print(f"[phase] rms_norms offloaded in {time.time() - t0:.1f}s")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")
