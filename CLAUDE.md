@@ -51,6 +51,10 @@ remote-run.sh cat /tmp/mylog.out | grep '\[phase\]'
 
 **Do not** wrap the remote command with `| tail -N` on its own — that buffers and the user can't see anything until the process exits.
 
+### Scratch / probe scripts go in /tmp, not the repo
+
+Ad-hoc, one-shot probe scripts (checking a ttnn API signature, listing device ops, etc.) should live in `/tmp` locally and be copied to the remote, NOT committed under `scripts/`. `scripts/` is for scripts that have durable value (e.g. `test_<op>.py` PCC tests, `prompts/*.txt`). If a probe starts getting reused, graduate it into `scripts/` with a clear name; otherwise delete it when you're done.
+
 ## Hang recovery
 
 **Important: follow these steps exactly. Deviating can leave the device in an unrecoverable state. If anything is unclear, stop and ask the user before running commands.**
@@ -131,6 +135,8 @@ Only these sibling directories are in scope for exploration:
 - `../nanochat`
 - `../oasis-ttlang`
 - `../tt-lang-import`
+- `../gemma` — multi-chip mesh reference (mesh setup, shard/replicate patterns)
+- `../lingbot-world` — multi-chip mesh reference
 
 In-repo reference:
 - `./TileKernels` — DeepSeek's reference tilelang kernels for important ops (FP8/FP4 GEMM, sparse attention, HC Sinkhorn, etc.). **Reference only.** Tilelang does not run on Tenstorrent hardware, so these kernels cannot be used as-is. Consult them to understand the intended compute/dataflow, then re-implement in tt-lang for the device.
@@ -138,3 +144,5 @@ In-repo reference:
 Rules:
 - Do **not** explore `tt-lang/third_party/` (or any `third_party/` inside these repos). The authoritative copy of `tt-metal` lives at `../tt-metal`, which is more up to date than any vendored copy.
 - Do **not** do global searches across `~` or `~/Developer`. Stay inside this repo and the six paths above.
+
+Make sure to check metal-reuse.md, the kernel you want might already exist.
