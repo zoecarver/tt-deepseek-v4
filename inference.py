@@ -813,10 +813,17 @@ class Attention(nn.Module):
             o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o.to(wo_a.dtype), wo_a)
+        o = self._wo_a_grouped(o)
         x = self.wo_b(o.flatten(2))
         return x
+
+    def _wo_a_grouped(self, o: torch.Tensor) -> torch.Tensor:
+        """Block-diagonal per-group linear: [B,S,G,D] -> [B,S,G,R].
+
+        Default CPU path; offload_attn_wo_a swaps this for a device path.
+        """
+        w = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        return torch.einsum("bsgd,grd->bsgr", o.to(w.dtype), w)
 
 
 class Gate(nn.Module):
@@ -1261,6 +1268,82 @@ class DeviceRowLinear(nn.Module):
         return y.to(torch.bfloat16)
 
 
+class DeviceGroupedLinear(nn.Module):
+    """Block-diagonal (per-group) linear across a 1xN mesh.
+
+    For wo_a: weight is [n_groups*out_per_group, in_per_group] where each group
+    g has its own [out_per_group, in_per_group] matrix; activations are
+    [B, S, n_groups, in_per_group]. Computes
+        out[b,s,g,r] = sum_d x[b,s,g,d] * w[g,r,d]
+    i.e. the einsum "bsgd,grd->bsgr".
+
+    Sharding: groups are distributed across mesh axis 1 (must divide evenly).
+    Each chip holds its groups' weights AND sees only its groups' activations
+    -- no wasted compute. Output is gathered and permuted back to
+    [B, S, n_groups, out_per_group].
+    """
+
+    def __init__(self, mesh, cpu_weight: torch.Tensor, n_groups: int):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        N = self.mesh_shape[1]
+        if n_groups % N != 0:
+            raise ValueError(f"n_groups {n_groups} not divisible by mesh axis 1 {N}")
+        out_total, in_per_group = cpu_weight.shape
+        if out_total % n_groups != 0:
+            raise ValueError(f"weight out_dim {out_total} not divisible by n_groups {n_groups}")
+        out_per_group = out_total // n_groups
+        self.n_groups = n_groups
+        self.in_per_group = in_per_group
+        self.out_per_group = out_per_group
+
+        w_bf16 = _weight_to_bf16(cpu_weight).view(n_groups, out_per_group, in_per_group)
+        # Transpose to [n_groups, in_per_group, out_per_group] for A @ B matmul.
+        w_gio = w_bf16.transpose(1, 2).contiguous()
+        self.w_tt = ttnn.as_tensor(
+            w_gio,
+            device=mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, 0)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, S, n_groups, in_per_group] -> [B, S, n_groups, out_per_group]."""
+        ttnn = self._ttnn
+        B, S, G, D = x.shape
+        if G != self.n_groups or D != self.in_per_group:
+            raise ValueError(
+                f"x shape ({B},{S},{G},{D}) mismatch "
+                f"expected groups={self.n_groups} in_per_group={self.in_per_group}"
+            )
+        # [B,S,G,D] -> [G, B*S, D] so each chip's slice on dim 0 = its groups.
+        x_g = x.to(torch.bfloat16).permute(2, 0, 1, 3).reshape(G, B * S, D).contiguous()
+        x_tt = ttnn.as_tensor(
+            x_g,
+            device=self.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(None, 0)),
+        )
+        y_tt = ttnn.linear(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        # Each chip holds [G/N, B*S, out_per_group]; stack along mesh axis 1 onto
+        # tensor dim 0 (ConcatMesh2dToTensor dims=(1, 0) -- mesh axis 0 is size 1,
+        # routes to tensor dim 1 no-op; axis 1 stacks on dim 0).
+        y = ttnn.to_torch(
+            y_tt,
+            mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0)),
+        )
+        y = y[:G]  # trim any trailing pad
+        y = y.view(G, B, S, self.out_per_group).permute(1, 2, 0, 3).contiguous()
+        return y.to(torch.bfloat16)
+
+
 def _open_mesh(shape=(1, 4)):
     import ttnn
     return ttnn.open_mesh_device(ttnn.MeshShape(*shape))
@@ -1569,6 +1652,26 @@ class Model:
             attn.wkv = dw
             self._device_wkv.append(dw)
 
+    def offload_attn_wo_a(self, mesh):
+        """Shard wo_a block-diagonal per-group across the 1xN mesh.
+
+        wo_a is bf16 with a block-diagonal usage: each of the n_groups groups
+        has its own [o_lora_rank, in_per_group] matrix, and activations are
+        reshaped to [B, S, n_groups, in_per_group] before the einsum. Groups
+        divide evenly across the mesh axis 1 (8 groups / 4 chips = 2/chip).
+        Swaps Attention._wo_a_grouped for a device callable.
+        """
+        self._device_wo_a = []
+        for layer in self.transformer.layers:
+            attn = layer.attn
+            dg = DeviceGroupedLinear(mesh, attn.wo_a.weight, n_groups=attn.n_local_groups)
+
+            def _device_wo_a_call(self_attn, o, _dg=dg):
+                return _dg(o)
+
+            attn._wo_a_grouped = _device_wo_a_call.__get__(attn, type(attn))
+            self._device_wo_a.append(dg)
+
     def offload_attn_wo_b(self, mesh):
         """Col-parallel shard wo_b on its 4096-wide output dim.
 
@@ -1648,6 +1751,8 @@ def main():
                         help="Shard wq_a (Q-LoRA down) across the 1x4 mesh (Phase 2)")
     parser.add_argument("--offload-attn-wkv", action="store_true",
                         help="Shard wkv (KV-with-MQA down) across the 1x4 mesh (Phase 2)")
+    parser.add_argument("--offload-attn-wo-a", action="store_true",
+                        help="Block-diagonal per-group shard wo_a across the 1x4 mesh (Phase 2)")
     parser.add_argument("--offload-attn-wo-b", action="store_true",
                         help="Row-parallel shard wo_b across the 1x4 mesh (Phase 2)")
     parser.add_argument("--weights-cache",
@@ -1676,6 +1781,7 @@ def main():
         or args.offload_attn_wq_a
         or args.offload_attn_wq_b
         or args.offload_attn_wkv
+        or args.offload_attn_wo_a
         or args.offload_attn_wo_b
     )
     if need_mesh:
@@ -1704,6 +1810,11 @@ def main():
         t0 = time.time()
         model.offload_attn_wkv(mesh)
         print(f"[phase] wkv offloaded in {time.time() - t0:.1f}s")
+    if args.offload_attn_wo_a:
+        print(f"[phase] grouped-sharding wo_a across {n_layers} layers on mesh ...")
+        t0 = time.time()
+        model.offload_attn_wo_a(mesh)
+        print(f"[phase] wo_a offloaded in {time.time() - t0:.1f}s")
     if args.offload_attn_wo_b:
         print(f"[phase] row-sharding wo_b across {n_layers} layers on mesh ...")
         t0 = time.time()
