@@ -1344,6 +1344,83 @@ class DeviceGroupedLinear(nn.Module):
         return y.to(torch.bfloat16)
 
 
+class DeviceMoEGate(nn.Module):
+    """V4-Flash MoE gate (sqrtsoftplus score_func) on a 1xN mesh.
+
+    Replicates the tiny gate weight (n_experts x dim bf16, ~2MB) on every chip
+    and runs the full gate pipeline with ttnn primitives:
+
+        scores  = sqrt(softplus(x @ W^T))
+        indices = topk(scores + bias, k=topk)
+        weights = scores.gather(-1, indices)
+        weights = weights / weights.sum(-1, keepdim)       # non-softmax branch
+        weights = weights * route_scale
+
+    Output is replicated; read back via a composer that stacks 4 copies on
+    tensor dim 0 and the first M rows are chip-0's result.
+    """
+
+    def __init__(self, mesh, cpu_weight: torch.Tensor, cpu_bias: torch.Tensor,
+                 topk: int, route_scale: float, score_func: str):
+        super().__init__()
+        import ttnn
+        if score_func != "sqrtsoftplus":
+            raise ValueError(
+                f"DeviceMoEGate v1 only supports score_func='sqrtsoftplus', got {score_func!r}"
+            )
+        if cpu_bias is None:
+            raise ValueError("sqrtsoftplus gate requires bias; got None")
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        n_experts, dim = cpu_weight.shape
+        self.n_experts = n_experts
+        self.dim = dim
+        self.topk = topk
+        self.route_scale = float(route_scale)
+
+        w_kn = _weight_to_bf16(cpu_weight).transpose(0, 1).contiguous()  # [dim, n_experts]
+        b_row = cpu_bias.to(torch.bfloat16).view(1, n_experts).contiguous()
+        common_rep = dict(
+            device=mesh,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        self.w_tt = ttnn.as_tensor(w_kn, **common_rep)
+        self.bias_tt = ttnn.as_tensor(b_row, **common_rep)
+
+    def forward(self, x: torch.Tensor):
+        """x: [M, dim] -> (weights [M, topk] float32, indices [M, topk] int64)."""
+        ttnn = self._ttnn
+        M, D = x.shape
+        if D != self.dim:
+            raise ValueError(f"x last dim {D} mismatch gate dim {self.dim}")
+        x_tt = ttnn.as_tensor(
+            x.to(torch.bfloat16).contiguous(),
+            device=self.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        raw_tt = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        scores_tt = ttnn.sqrt(ttnn.softplus(raw_tt))
+        biased_tt = ttnn.add(scores_tt, self.bias_tt)
+        _, indices_tt = ttnn.topk(biased_tt, k=self.topk, dim=-1, largest=True, sorted=True)
+        gathered_tt = ttnn.gather(scores_tt, dim=-1, index=indices_tt)
+        wsum_tt = ttnn.sum(gathered_tt, dim=-1, keepdim=True)
+        normed_tt = ttnn.div(gathered_tt, wsum_tt)
+        weights_tt = ttnn.multiply(normed_tt, self.route_scale)
+
+        # Replicated readback: stack 4 copies on tensor dim 0, take first M rows.
+        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
+        weights = ttnn.to_torch(weights_tt, mesh_composer=composer)[:M].float()
+        indices = ttnn.to_torch(indices_tt, mesh_composer=composer)[:M].long()
+        return weights, indices
+
+
 def _open_mesh(shape=(1, 4)):
     import ttnn
     return ttnn.open_mesh_device(ttnn.MeshShape(*shape))
@@ -1672,6 +1749,34 @@ class Model:
             attn._wo_a_grouped = _device_wo_a_call.__get__(attn, type(attn))
             self._device_wo_a.append(dg)
 
+    def offload_moe_gate(self, mesh):
+        """Move every non-hash MoE gate to the 1xN mesh.
+
+        Gate is tiny (n_experts x dim bf16, ~2MB + n_experts bias) -- replicated
+        on every chip. Rebinds Gate.forward to call the device gate. Hash gates
+        (layer < n_hash_layers) keep their CPU lookup path.
+        """
+        self._device_moe_gates = []
+        for layer in self.transformer.layers:
+            ffn = layer.ffn
+            if not isinstance(ffn, MoE):
+                continue
+            gate = ffn.gate
+            if gate.hash:
+                continue
+
+            dg = DeviceMoEGate(
+                mesh, gate.weight, gate.bias,
+                topk=gate.topk, route_scale=gate.route_scale,
+                score_func=gate.score_func,
+            )
+
+            def _device_gate_forward(self_gate, x, input_ids=None, _dg=dg):
+                return _dg(x)
+
+            gate.forward = _device_gate_forward.__get__(gate, type(gate))
+            self._device_moe_gates.append(dg)
+
     def offload_attn_wo_b(self, mesh):
         """Col-parallel shard wo_b on its 4096-wide output dim.
 
@@ -1755,6 +1860,8 @@ def main():
                         help="Block-diagonal per-group shard wo_a across the 1x4 mesh (Phase 2)")
     parser.add_argument("--offload-attn-wo-b", action="store_true",
                         help="Row-parallel shard wo_b across the 1x4 mesh (Phase 2)")
+    parser.add_argument("--offload-moe-gate", action="store_true",
+                        help="Replicate MoE gate on 1x4 mesh (sqrtsoftplus); non-hash layers only")
     parser.add_argument("--weights-cache",
                         default=os.environ.get("DS_WEIGHTS_CACHE",
                                                "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
@@ -1783,6 +1890,7 @@ def main():
         or args.offload_attn_wkv
         or args.offload_attn_wo_a
         or args.offload_attn_wo_b
+        or args.offload_moe_gate
     )
     if need_mesh:
         print("[phase] opening 1x4 mesh ...")
@@ -1820,6 +1928,11 @@ def main():
         t0 = time.time()
         model.offload_attn_wo_b(mesh)
         print(f"[phase] wo_b offloaded in {time.time() - t0:.1f}s")
+    if args.offload_moe_gate:
+        print(f"[phase] replicating MoE gates across {n_layers} layers on mesh ...")
+        t0 = time.time()
+        model.offload_moe_gate(mesh)
+        print(f"[phase] moe_gate offloaded in {time.time() - t0:.1f}s")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")
