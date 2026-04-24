@@ -14,6 +14,17 @@ Pause and ask only if one of the following happens:
 
 Everything else — naming, file structure, minor refactors, choice of initial offload target, which kernel to write first — is yours to decide.
 
+## Precision policy: bf16 across the board for now
+
+All activations and on-device weights are **bf16**. Do not introduce bfp8 / bfp4 / fp8 paths in kernels or in inference.py weight uploads — the goal is on-device correctness first, memory-density optimizations come later.
+
+Why:
+- Simpler: one dtype path to debug, no cast boundaries between kernels and ttnn ops.
+- Avoids toolchain issues: tt-lang currently rejects bf16→bfp8 CB stores, and bf16 L1 → bfp8 DRAM copies silently produce NaN.
+- Matches metal V3's activation convention (bf16); only V3's on-DRAM weights are bfp8/bfp4, and that's a drop-in change once the bf16 path is stable.
+
+Cost: ~2× device DRAM per weight vs bfp8, ~4× vs bfp4. Less of the model fits on QB; CPU fallback picks up the rest. Revisit once the bf16 path produces coherent text end-to-end.
+
 ## Setup (do this first, every session)
 
 Load these skills before doing any work:
