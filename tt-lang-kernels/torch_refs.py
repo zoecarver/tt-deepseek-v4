@@ -63,6 +63,27 @@ def mhc_pre_apply_mix_ref(x: torch.Tensor, mix: torch.Tensor) -> torch.Tensor:
     return (x * mix).sum(-2).bfloat16()
 
 
+def mhc_post_ref(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    """mHC post. Companion to pre-big-fuse on the output side.
+
+    x: [n0, n1, h] bf16 — attention/FFN output for the token.
+    residual: [n0, n1, mhc, h] bf16 — the mhc residual streams to merge back.
+    post_layer_mix: [n0, n1, mhc, 1] fp32 — per-stream scaling of x.
+    comb_res_mix: [n0, n1, mhc, mhc] fp32 — sinkhorn-normalized mixing matrix.
+    Output: [n0, n1, mhc, h] bf16.
+
+    out[n, h] = x[h] * post_layer_mix[n]
+              + sum_m(comb_res_mix[m, n] * residual[m, h])
+    """
+    term2 = torch.einsum("abmn,abmc->abnc", comb_res_mix, residual.float())
+    return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+
+
 def mhc_pre_norm_fn_ref(
     residual: torch.Tensor,
     mhc_fn: torch.Tensor,
