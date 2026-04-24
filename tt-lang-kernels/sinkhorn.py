@@ -21,6 +21,11 @@ Structure:
     same `with state_dfb.wait()` scope (FA-style, see test_fa_simple.py).
   - Compiler bug workaround: `options="--no-ttl-reduce-full-fp32"` (see
     README "reduce dims=[1] returns zeros on fp32 tiles").
+
+Multi-core: every 4x4 slice is independent, so we partition num_slices across
+the auto-selected grid. Each core reads its own mask/eps_mask/scaler tiles
+from DRAM once (small, cheap) and then streams its assigned slices. No
+cross-core communication required.
 """
 from __future__ import annotations
 
@@ -31,8 +36,13 @@ TILE = 32
 
 def make_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
 
-    @ttl.operation(grid=(1, 1), options="--no-ttl-reduce-full-fp32")
+    @ttl.operation(grid="auto", options="--no-ttl-reduce-full-fp32")
     def sinkhorn_kernel(x, mask, eps_mask, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        # divceil so every slice is covered; tail cores may partially idle.
+        slices_per_core = -(-num_slices // total_cores)
+
         x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
         m_dfb = ttl.make_dataflow_buffer_like(mask, shape=(1, 1), block_count=1)
         em_dfb = ttl.make_dataflow_buffer_like(eps_mask, shape=(1, 1), block_count=1)
@@ -50,54 +60,35 @@ def make_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
 
         @ttl.compute()
         def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
             sc = sc_dfb.wait()
             m = m_dfb.wait()
             em = em_dfb.wait()
 
-            for _ in range(num_slices):
-                # ----- Row softmax: state := softmax(x, dim=-1) -----
-                x_in = x_dfb.wait()
-                red_dfb.reserve().store(ttl.math.reduce_max(x_in, sc, dims=[1]))
-                rmx = bc_dfb.reserve()
-                rmx.store(ttl.math.broadcast(red_dfb.wait(), rmx, dims=[1]))
-                exp_dfb.reserve().store(ttl.math.exp(x_in - bc_dfb.wait()))
+            for local_i in range(slices_per_core):
+                global_i = core_idx * slices_per_core + local_i
+                if global_i < num_slices:
+                    # ----- Row softmax: state := softmax(x, dim=-1) -----
+                    x_in = x_dfb.wait()
+                    red_dfb.reserve().store(ttl.math.reduce_max(x_in, sc, dims=[1]))
+                    rmx = bc_dfb.reserve()
+                    rmx.store(ttl.math.broadcast(red_dfb.wait(), rmx, dims=[1]))
+                    exp_dfb.reserve().store(ttl.math.exp(x_in - bc_dfb.wait()))
 
-                ex = exp_dfb.wait()
-                red_dfb.reserve().store(ttl.math.reduce_sum(ex, sc, dims=[1]))
-                state_copy_dfb.reserve().store(ex)
-                rinv = bc_dfb.reserve()
-                rinv.store(ttl.math.broadcast(ttl.math.recip(red_dfb.wait()), rinv, dims=[1]))
-                state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
-
-                # ----- Mask + eps: state := state * mask + eps_mask -----
-                state_copy_dfb.reserve().store(state_dfb.wait() * m + em)
-                state_dfb.reserve().store(state_copy_dfb.wait())
-
-                # ----- First col-normalize: state := state / (col_sum + eps) -----
-                s = state_dfb.wait()
-                red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[0]))
-                state_copy_dfb.reserve().store(s)
-                cinv = bc_dfb.reserve()
-                csum = red_dfb.wait()
-                cinv.store(ttl.math.broadcast(
-                    ttl.math.recip(csum + ttl.math.fill(csum, eps)),
-                    cinv, dims=[0]))
-                state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
-
-                # ----- repeat - 1 alternating (row, col) normalizations -----
-                for _ in range(repeat - 1):
-                    # row normalize
-                    s = state_dfb.wait()
-                    red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[1]))
-                    state_copy_dfb.reserve().store(s)
+                    ex = exp_dfb.wait()
+                    red_dfb.reserve().store(ttl.math.reduce_sum(ex, sc, dims=[1]))
+                    state_copy_dfb.reserve().store(ex)
                     rinv = bc_dfb.reserve()
-                    rsum = red_dfb.wait()
-                    rinv.store(ttl.math.broadcast(
-                        ttl.math.recip(rsum + ttl.math.fill(rsum, eps)),
-                        rinv, dims=[1]))
+                    rinv.store(ttl.math.broadcast(ttl.math.recip(red_dfb.wait()), rinv, dims=[1]))
                     state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
 
-                    # col normalize
+                    # ----- Mask + eps: state := state * mask + eps_mask -----
+                    state_copy_dfb.reserve().store(state_dfb.wait() * m + em)
+                    state_dfb.reserve().store(state_copy_dfb.wait())
+
+                    # ----- First col-normalize: state := state / (col_sum + eps) -----
                     s = state_dfb.wait()
                     red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[0]))
                     state_copy_dfb.reserve().store(s)
@@ -108,21 +99,55 @@ def make_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
                         cinv, dims=[0]))
                     state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
 
-                # ----- Final copy state -> out -----
-                out_dfb.reserve().store(state_dfb.wait())
+                    # ----- repeat - 1 alternating (row, col) normalizations -----
+                    for _ in range(repeat - 1):
+                        # row normalize
+                        s = state_dfb.wait()
+                        red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[1]))
+                        state_copy_dfb.reserve().store(s)
+                        rinv = bc_dfb.reserve()
+                        rsum = red_dfb.wait()
+                        rinv.store(ttl.math.broadcast(
+                            ttl.math.recip(rsum + ttl.math.fill(rsum, eps)),
+                            rinv, dims=[1]))
+                        state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                        # col normalize
+                        s = state_dfb.wait()
+                        red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[0]))
+                        state_copy_dfb.reserve().store(s)
+                        cinv = bc_dfb.reserve()
+                        csum = red_dfb.wait()
+                        cinv.store(ttl.math.broadcast(
+                            ttl.math.recip(csum + ttl.math.fill(csum, eps)),
+                            cinv, dims=[0]))
+                        state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                    # ----- Final copy state -> out -----
+                    out_dfb.reserve().store(state_dfb.wait())
 
         @ttl.datamovement()
         def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
             ttl.copy(mask[0, 0], m_dfb.reserve()).wait()
             ttl.copy(eps_mask[0, 0], em_dfb.reserve()).wait()
             ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
-            for t in range(num_slices):
-                ttl.copy(x[t, 0], x_dfb.reserve()).wait()
+            for local_i in range(slices_per_core):
+                global_i = core_idx * slices_per_core + local_i
+                if global_i < num_slices:
+                    ttl.copy(x[global_i, 0], x_dfb.reserve()).wait()
 
         @ttl.datamovement()
         def dm_write():
-            for t in range(num_slices):
-                ttl.copy(out_dfb.wait(), out[t, 0]).wait()
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_i in range(slices_per_core):
+                global_i = core_idx * slices_per_core + local_i
+                if global_i < num_slices:
+                    ttl.copy(out_dfb.wait(), out[global_i, 0]).wait()
 
     return sinkhorn_kernel
 
@@ -183,7 +208,15 @@ def _test_shape(device, ttnn, torch, n0, n1, mhc, repeat, eps, threshold):
     em_tt = ttnn.from_torch(em, **common)
     sc_tt = ttnn.from_torch(sc, **common)
 
+    import time
+    # Warm-up (JIT compile + first launch) then time a second run.
     solve(x_tt, mask_tt, em_tt, sc_tt, out_tt, repeat=repeat, eps=eps)
+    ttnn.synchronize_device(device)
+    t0 = time.perf_counter()
+    solve(x_tt, mask_tt, em_tt, sc_tt, out_tt, repeat=repeat, eps=eps)
+    ttnn.synchronize_device(device)
+    dt_ms = (time.perf_counter() - t0) * 1000
+    print(f"  kernel_time: {dt_ms:.3f} ms  ({num_slices / dt_ms * 1000:,.0f} slices/s)")
 
     out_packed = ttnn.to_torch(out_tt)
     y_tt = unpack_4x4_slices(out_packed, num_slices).reshape(n0, n1, mhc, mhc)
