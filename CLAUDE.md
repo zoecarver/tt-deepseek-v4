@@ -157,3 +157,13 @@ Rules:
 - Do **not** do global searches across `~` or `~/Developer`. Stay inside this repo and the six paths above.
 
 Make sure to check metal-reuse.md, the kernel you want might already exist.
+
+IMPORTANT: if you are starting a new session please take inventory of the current status, there maybe be kernels already written in the tt-lang-kernels or scripts directory.
+
+Please try to prioritize using tt-lang kernels where possible, even if they have a slight perf regression.
+
+ttnn has a number of CCLs for cross-chip scatter/gather that you can use (ttnn skill should document them).
+
+When setting timeouts, make them 1-2 minutes. The model should take 2-4 minutes end to end to load weights and produce token predictions. If you have to poll a few times per run, that is better then waiting 10+ mins for a run that fails early.
+
+Do not automatically fall back to cpu if imports are not available, just error and exit. We should trust this will only be run on a device with ttnn and ttlang set up.
