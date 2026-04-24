@@ -1008,14 +1008,19 @@ class Transformer(nn.Module):
 
 
 class DeviceLMHead:
-    """Column-parallel lm_head across a 1xN mesh.
+    """Column-parallel lm_head (+ optional final RMSNorm) across a 1xN mesh.
 
     Replaces ParallelHead.get_logits. Shards [dim, vocab] along vocab (last dim)
     so each chip holds vocab/N cols, runs the matmul on-device, and gathers on
     the host. vocab must be divisible by N.
+
+    If `norm_weight` is provided, also applies final RMSNorm on device before
+    the matmul — one fewer CPU→device round-trip, one less CPU norm.
     """
 
-    def __init__(self, mesh, cpu_weight: torch.Tensor):
+    def __init__(self, mesh, cpu_weight: torch.Tensor,
+                 norm_weight: Optional[torch.Tensor] = None,
+                 norm_eps: float = 1e-6):
         import ttnn
         self._ttnn = ttnn
         self.mesh = mesh
@@ -1025,6 +1030,7 @@ class DeviceLMHead:
             raise ValueError(f"vocab {vocab} not divisible by mesh axis 1 {self.mesh_shape[1]}")
         self.vocab = vocab
         self.dim = dim
+        self.norm_eps = norm_eps
         w_dv = cpu_weight.to(torch.bfloat16).transpose(0, 1).contiguous()  # [dim, vocab]
         self.w_tt = ttnn.as_tensor(
             w_dv,
@@ -1034,9 +1040,21 @@ class DeviceLMHead:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1)),
         )
+        self.norm_tt = None
+        if norm_weight is not None:
+            # Replicate norm weight across the mesh (tiny, [dim]).
+            nw = norm_weight.to(torch.bfloat16).contiguous()
+            self.norm_tt = ttnn.as_tensor(
+                nw,
+                device=mesh,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            )
 
     def __call__(self, x_last: torch.Tensor) -> torch.Tensor:
-        # x_last: [B, dim] (hidden state after norm, last seq position)
+        # x_last: [B, dim] — unnormalized if norm_tt is set, else normalized.
         ttnn = self._ttnn
         x_3d = x_last.to(torch.bfloat16).unsqueeze(1).contiguous()  # [B, 1, dim]
         x_tt = ttnn.as_tensor(
@@ -1047,6 +1065,12 @@ class DeviceLMHead:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
+        if self.norm_tt is not None:
+            # ttnn.rms_norm wants 4D input; wrap [B, 1, dim] -> [1, 1, B, dim] -> back.
+            B = x_last.shape[0]
+            x_tt = ttnn.reshape(x_tt, (1, 1, B, self.dim))
+            x_tt = ttnn.rms_norm(x_tt, weight=self.norm_tt, epsilon=self.norm_eps)
+            x_tt = ttnn.reshape(x_tt, (B, 1, self.dim))
         y_tt = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         y = ttnn.to_torch(
             y_tt,
@@ -1305,20 +1329,34 @@ class Model:
             torch.save(self.transformer.state_dict(), cache_path)
             print(f"[load] cache written in {time.time()-t0:.1f}s")
 
-    def offload_lm_head(self, mesh):
-        """Move the lm_head matmul to a 1xN device mesh (column-parallel on vocab).
+    def offload_lm_head(self, mesh, include_final_norm: bool = True):
+        """Move the lm_head matmul (and optionally the final RMSNorm) to a 1xN mesh.
 
-        Must be called after load_weights(). The CPU weight is transposed+sharded
-        once here; subsequent generate() calls dispatch the matmul to the device.
+        Must be called after load_weights(). Shards the lm_head column-parallel
+        across vocab; replicates the tiny final-norm weight on each chip.
+
+        When `include_final_norm=True`, ParallelHead.forward is rebound to skip
+        the CPU norm and pass the unnormalized last-token hidden straight to
+        the device (norm + matmul fused there).
         """
         head = self.transformer.head
-        self._device_lm_head = DeviceLMHead(mesh, head.weight.data)
-        # Rebind get_logits to route through the device.
+        final_norm = self.transformer.norm
+        norm_w = final_norm.weight.data if include_final_norm else None
+        norm_eps = final_norm.eps if include_final_norm else 1e-6
+        self._device_lm_head = DeviceLMHead(mesh, head.weight.data,
+                                            norm_weight=norm_w, norm_eps=norm_eps)
         dlh = self._device_lm_head
-        def _device_get_logits(self_head, x):
-            return dlh(x[:, -1].contiguous())
-        head.get_logits = _device_get_logits.__get__(head, type(head))
-        # Free the CPU copy — the device now owns it.
+        if include_final_norm:
+            # Replace the whole head forward so CPU norm is skipped.
+            def _device_head_forward(self_head, x, hc_fn, hc_scale, hc_base, norm):
+                x = self_head.hc_head(x, hc_fn, hc_scale, hc_base)  # still CPU
+                return dlh(x[:, -1].contiguous())
+            head.forward = _device_head_forward.__get__(head, type(head))
+            final_norm.weight.data = torch.empty(0)  # device owns it
+        else:
+            def _device_get_logits(self_head, x):
+                return dlh(x[:, -1].contiguous())
+            head.get_logits = _device_get_logits.__get__(head, type(head))
         head.weight.data = torch.empty(0)
 
     @torch.inference_mode()
