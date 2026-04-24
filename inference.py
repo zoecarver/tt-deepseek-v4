@@ -1624,6 +1624,528 @@ class DeviceRMSNorm(nn.Module):
         return out_tt
 
 
+# ============================================================================
+# MHC (hyper-connection mixing) — tt-lang fused kernels on a 1xN mesh
+# ============================================================================
+
+_MHC_TILE = 32
+
+
+def _mhc_pack_residual(residual: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
+    """[B, S, mhc, hidden] -> [num_tokens_pad, D=mhc*hidden] fp32, zero-padded rows."""
+    n0, n1, mhc, hidden = residual.shape
+    num_tokens = n0 * n1
+    D = mhc * hidden
+    flat = residual.reshape(num_tokens, D).to(torch.float32).contiguous()
+    if num_tokens < num_tokens_pad:
+        pad = torch.zeros(num_tokens_pad - num_tokens, D, dtype=torch.float32)
+        flat = torch.cat([flat, pad], dim=0)
+    return flat.contiguous()
+
+
+def _mhc_pack_fn(fn: torch.Tensor, mhc_mult3: int) -> torch.Tensor:
+    """[mhc_mult3, D] -> [D, TILE] fp32 (fn^T padded to TILE cols)."""
+    m3, D = fn.shape
+    if m3 != mhc_mult3:
+        raise ValueError(f"hc_fn rows {m3} != mhc_mult3 {mhc_mult3}")
+    out = torch.zeros(D, _MHC_TILE, dtype=torch.float32)
+    out[:, :m3] = fn.T.to(torch.float32)
+    return out.contiguous()
+
+
+def _mhc_pack_x_for_apply_mix(x: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
+    """[num_tokens, mhc, h] -> [num_tokens_pad * TILE, h] fp32 (rows 0..mhc-1 hold x; rest 0)."""
+    num_tokens, mhc, h = x.shape
+    out = torch.zeros(num_tokens_pad * _MHC_TILE, h, dtype=torch.float32)
+    out.view(num_tokens_pad, _MHC_TILE, h)[:num_tokens, :mhc, :] = x.to(torch.float32)
+    return out.contiguous()
+
+
+def _mhc_pack_mix(mix: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
+    """[num_tokens, mhc] -> [num_tokens_pad * TILE, TILE] fp32 (col 0 of rows 0..mhc-1)."""
+    num_tokens, mhc = mix.shape
+    out = torch.zeros(num_tokens_pad * _MHC_TILE, _MHC_TILE, dtype=torch.float32)
+    out.view(num_tokens_pad, _MHC_TILE, _MHC_TILE)[:num_tokens, :mhc, 0] = mix.to(torch.float32)
+    return out.contiguous()
+
+
+def _mhc_pack_x_bc(x: torch.Tensor, mhc: int, num_tokens_pad: int) -> torch.Tensor:
+    """[num_tokens, h] -> [num_tokens_pad * TILE, h] fp32 (rows 0..mhc-1 each hold a copy of x)."""
+    num_tokens, h = x.shape
+    src = x.unsqueeze(1).expand(-1, mhc, -1)
+    out = torch.zeros(num_tokens_pad * _MHC_TILE, h, dtype=torch.float32)
+    out.view(num_tokens_pad, _MHC_TILE, h)[:num_tokens, :mhc, :] = src.to(torch.float32)
+    return out.contiguous()
+
+
+def _mhc_pack_residual_for_post(residual: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
+    """[num_tokens, mhc, h] -> [num_tokens_pad * TILE, h] fp32 (rows 0..mhc-1 hold residual)."""
+    num_tokens, mhc, h = residual.shape
+    out = torch.zeros(num_tokens_pad * _MHC_TILE, h, dtype=torch.float32)
+    out.view(num_tokens_pad, _MHC_TILE, h)[:num_tokens, :mhc, :] = residual.to(torch.float32)
+    return out.contiguous()
+
+
+def _mhc_pack_comb_T(comb: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
+    """[num_tokens, mhc, mhc] -> [num_tokens_pad * TILE, TILE] fp32 (comb^T in top-left)."""
+    num_tokens, m, n = comb.shape
+    if m != n:
+        raise ValueError(f"comb must be square, got {m}x{n}")
+    out = torch.zeros(num_tokens_pad * _MHC_TILE, _MHC_TILE, dtype=torch.float32)
+    out.view(num_tokens_pad, _MHC_TILE, _MHC_TILE)[:num_tokens, :m, :m] = comb.transpose(-1, -2).to(torch.float32)
+    return out.contiguous()
+
+
+def _mhc_pack_post_mix(post: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
+    """[num_tokens, mhc] -> [num_tokens_pad * TILE, TILE] fp32 (col 0 of rows 0..mhc-1)."""
+    return _mhc_pack_mix(post, num_tokens_pad)
+
+
+def _mhc_unpack_apply_mix_out(packed: torch.Tensor, num_tokens: int, h: int) -> torch.Tensor:
+    """[num_tokens_pad * TILE, h] -> [num_tokens, h] (row 0 of each block)."""
+    return packed.view(-1, _MHC_TILE, h)[:num_tokens, 0, :].contiguous()
+
+
+def _mhc_unpack_post_out(packed: torch.Tensor, num_tokens: int, mhc: int, h: int) -> torch.Tensor:
+    """[num_tokens_pad * TILE, h] -> [num_tokens, mhc, h] (rows 0..mhc-1 of each block)."""
+    return packed.view(-1, _MHC_TILE, h)[:num_tokens, :mhc, :].contiguous()
+
+
+def _compile_mhc_norm_fn_kernel(num_out_tiles: int, K_tiles: int, rms_eps: float, inv_D: float):
+    """Inlined from tt-lang-kernels/pre_norm_fn.py.
+
+    Computes per-token: mixes[t, m] = (residual[t] @ fn[m, :]) * rsqrt(sum(residual[t]^2)/D + eps).
+    Uses ping-pong store(prev + a@b) accumulator (ksplit `c += a @ b` blocked
+    inside conditional bounds by tt-lang#504); accuracy degrades modestly at
+    K>>1. PCC ~0.998 at V4-Flash D=16384 (K=512); acceptable for now.
+    """
+
+    @ttl.operation(
+        grid="auto",
+        options="--no-ttl-reduce-full-fp32",
+        fp32_dest_acc_en=True,
+    )
+    def norm_fn_kernel(a, b, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        tiles_per_core = -(-num_out_tiles // total_cores)
+
+        a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
+        b_dfb = ttl.make_dataflow_buffer_like(b, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        c_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        sq_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        inv_bc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        asq_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
+        red_step_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            sc = sc_dfb.wait()
+
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_out_tiles:
+                    a0 = a_dfb.wait()
+                    b0 = b_dfb.wait()
+                    c_dfb.reserve().store(a0 @ b0)
+                    asq_dfb.reserve().store(a0 * a0)
+                    sq_dfb.reserve().store(
+                        ttl.math.reduce_sum(asq_dfb.wait(), sc, dims=[1])
+                    )
+
+                    for _ in range(K_tiles - 1):
+                        a = a_dfb.wait()
+                        b = b_dfb.wait()
+                        prev_c = c_dfb.wait()
+                        c_dfb.reserve().store(prev_c + a @ b)
+
+                        asq_dfb.reserve().store(a * a)
+                        red_step_dfb.reserve().store(
+                            ttl.math.reduce_sum(asq_dfb.wait(), sc, dims=[1])
+                        )
+                        prev_sq = sq_dfb.wait()
+                        sq_dfb.reserve().store(prev_sq + red_step_dfb.wait())
+
+                    sq = sq_dfb.wait()
+                    inv_bc = inv_bc_dfb.reserve()
+                    inv_bc.store(ttl.math.broadcast(
+                        ttl.math.rsqrt(
+                            sq * ttl.math.fill(sq, inv_D) + ttl.math.fill(sq, rms_eps)
+                        ),
+                        inv_bc, dims=[1],
+                    ))
+
+                    c = c_dfb.wait()
+                    out_dfb.reserve().store(c * inv_bc_dfb.wait())
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_out_tiles:
+                    for k in range(K_tiles):
+                        ttl.copy(a[global_t, k], a_dfb.reserve()).wait()
+                        ttl.copy(b[k, 0], b_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_out_tiles:
+                    ttl.copy(out_dfb.wait(), out[global_t, 0]).wait()
+
+    return norm_fn_kernel
+
+
+def _compile_mhc_apply_mix_kernel(num_tokens: int, h_tiles: int):
+    """Inlined from tt-lang-kernels/pre_apply_mix.py.
+
+    Per-token: out[h] = sum_m x[m, :] * mix[m] (column sum across rows 0..mhc-1).
+    Broadcast mix col-0 across all cols, multiply tile, reduce_sum dim=0 per h-tile.
+    """
+
+    @ttl.operation(grid="auto")
+    def apply_mix_kernel(x, mix, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        tokens_per_core = -(-num_tokens // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        mix_dfb = ttl.make_dataflow_buffer_like(mix, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        mix_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        prod_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            sc = sc_dfb.wait()
+
+            for local_t in range(tokens_per_core):
+                global_t = core_idx * tokens_per_core + local_t
+                if global_t < num_tokens:
+                    mix_raw = mix_dfb.wait()
+                    mx = mix_bc_dfb.reserve()
+                    mx.store(ttl.math.broadcast(mix_raw, mx, dims=[1]))
+                    mix_bc = mix_bc_dfb.wait()
+
+                    for _ in range(h_tiles):
+                        x_tile = x_dfb.wait()
+                        prod_dfb.reserve().store(x_tile * mix_bc)
+                        red_dfb.reserve().store(
+                            ttl.math.reduce_sum(prod_dfb.wait(), sc, dims=[0])
+                        )
+                        out_dfb.reserve().store(red_dfb.wait())
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for local_t in range(tokens_per_core):
+                global_t = core_idx * tokens_per_core + local_t
+                if global_t < num_tokens:
+                    ttl.copy(mix[global_t, 0], mix_dfb.reserve()).wait()
+                    for h in range(h_tiles):
+                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_t in range(tokens_per_core):
+                global_t = core_idx * tokens_per_core + local_t
+                if global_t < num_tokens:
+                    for h in range(h_tiles):
+                        ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
+
+    return apply_mix_kernel
+
+
+def _compile_mhc_post_kernel(num_tokens: int, h_tiles: int):
+    """Inlined from tt-lang-kernels/post.py.
+
+    Per-token, per-h-tile: out = x * post_mix_bc + comb^T @ residual.
+    `comb` is stored pre-transposed so a 32x32 tile-matmul produces the right
+    row layout; `post_mix` is broadcast from col 0 across all cols.
+    """
+
+    @ttl.operation(grid="auto")
+    def post_kernel(x, residual, comb_T, post_mix, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        tokens_per_core = -(-num_tokens // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        res_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, 1), block_count=2)
+        comb_dfb = ttl.make_dataflow_buffer_like(comb_T, shape=(1, 1), block_count=2)
+        post_dfb = ttl.make_dataflow_buffer_like(post_mix, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        post_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        post_term_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        matmul_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_t in range(tokens_per_core):
+                global_t = core_idx * tokens_per_core + local_t
+                if global_t < num_tokens:
+                    post = post_dfb.wait()
+                    comb_t = comb_dfb.wait()
+
+                    pbc = post_bc_dfb.reserve()
+                    pbc.store(ttl.math.broadcast(post, pbc, dims=[1]))
+                    post_bc = post_bc_dfb.wait()
+
+                    for _ in range(h_tiles):
+                        x_tile = x_dfb.wait()
+                        res_tile = res_dfb.wait()
+                        post_term_dfb.reserve().store(x_tile * post_bc)
+                        matmul_dfb.reserve().store(comb_t @ res_tile)
+                        out_dfb.reserve().store(
+                            post_term_dfb.wait() + matmul_dfb.wait()
+                        )
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_t in range(tokens_per_core):
+                global_t = core_idx * tokens_per_core + local_t
+                if global_t < num_tokens:
+                    ttl.copy(post_mix[global_t, 0], post_dfb.reserve()).wait()
+                    ttl.copy(comb_T[global_t, 0], comb_dfb.reserve()).wait()
+                    for h in range(h_tiles):
+                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
+                        ttl.copy(residual[global_t, h], res_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_t in range(tokens_per_core):
+                global_t = core_idx * tokens_per_core + local_t
+                if global_t < num_tokens:
+                    for h in range(h_tiles):
+                        ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
+
+    return post_kernel
+
+
+class DeviceMHC(nn.Module):
+    """MHC pre + post on a 1xN mesh via tt-lang fused kernels (fp32 throughout).
+
+    Pipeline (per Block.hc_pre call):
+      1. pre_norm_fn: [num_tokens, D] @ fn^T * inv_rms -> mixes [num_tokens, mhc_mult3]
+      2. CPU split + sinkhorn: mixes -> (pre, post, comb)
+      3. pre_apply_mix: x[num_tokens, mhc, h] reduced by pre[num_tokens, mhc, 1] -> y[num_tokens, h]
+
+    Pipeline (per Block.hc_post call):
+      1. post: x[num_tokens, h] * post_mix + comb^T @ residual -> [num_tokens, mhc, h]
+
+    Sinkhorn lives on CPU because it's a tight iterative loop on a tiny tensor
+    ([num_tokens, mhc, mhc]); the device split_mixes kernel would only save a
+    trivial elementwise op while requiring a host round-trip anyway for the
+    iterative normalization.
+
+    Decode pads num_tokens to TILE rows (1 token -> 32 padded rows) so the
+    kernels' tiles-per-core math holds. Padded rows hold zeros and contribute
+    nothing to the read-back range.
+    """
+
+    def __init__(self, mesh, hc_fn: torch.Tensor, hc_scale: torch.Tensor,
+                 hc_base: torch.Tensor, hc_mult: int, hc_eps: float,
+                 sinkhorn_iters: int, norm_eps: float):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        self.hc_mult = int(hc_mult)
+        self.mhc_mult3 = (2 + self.hc_mult) * self.hc_mult
+        if hc_fn.shape[0] != self.mhc_mult3:
+            raise ValueError(
+                f"hc_fn rows {hc_fn.shape[0]} != mhc_mult3 {self.mhc_mult3}")
+        self.D = hc_fn.shape[-1]
+        if self.D % self.hc_mult:
+            raise ValueError(f"D={self.D} not divisible by hc_mult={self.hc_mult}")
+        self.hidden = self.D // self.hc_mult
+        if self.hidden % _MHC_TILE:
+            raise ValueError(f"hidden {self.hidden} must be multiple of {_MHC_TILE}")
+        self.norm_eps = float(norm_eps)
+        self.hc_eps = float(hc_eps)
+        self.sinkhorn_iters = int(sinkhorn_iters)
+        # CPU copies of hc_scale/hc_base for the split + sinkhorn step.
+        self.hc_scale_cpu = hc_scale.detach().to(torch.float32).cpu()
+        self.hc_base_cpu = hc_base.detach().to(torch.float32).cpu()
+
+        rep = dict(
+            device=mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        fn_packed = _mhc_pack_fn(
+            hc_fn.detach().to(torch.float32).cpu(), self.mhc_mult3)
+        self.fn_tt = ttnn.as_tensor(fn_packed, **rep)
+        self.scaler_tt = ttnn.as_tensor(
+            torch.ones((_MHC_TILE, _MHC_TILE), dtype=torch.float32), **rep)
+
+        self._kernels: dict = {}
+
+    def _norm_fn_kernel(self, num_out_tiles: int):
+        key = ("norm_fn", num_out_tiles)
+        k = self._kernels.get(key)
+        if k is None:
+            k = _compile_mhc_norm_fn_kernel(
+                num_out_tiles=num_out_tiles,
+                K_tiles=self.D // _MHC_TILE,
+                rms_eps=self.norm_eps,
+                inv_D=1.0 / self.D,
+            )
+            self._kernels[key] = k
+        return k
+
+    def _apply_mix_kernel(self, num_tokens_pad: int):
+        key = ("apply_mix", num_tokens_pad)
+        k = self._kernels.get(key)
+        if k is None:
+            k = _compile_mhc_apply_mix_kernel(
+                num_tokens=num_tokens_pad,
+                h_tiles=self.hidden // _MHC_TILE,
+            )
+            self._kernels[key] = k
+        return k
+
+    def _post_kernel(self, num_tokens_pad: int):
+        key = ("post", num_tokens_pad)
+        k = self._kernels.get(key)
+        if k is None:
+            k = _compile_mhc_post_kernel(
+                num_tokens=num_tokens_pad,
+                h_tiles=self.hidden // _MHC_TILE,
+            )
+            self._kernels[key] = k
+        return k
+
+    def _rep_tensor(self, t: torch.Tensor):
+        ttnn = self._ttnn
+        return ttnn.as_tensor(
+            t,
+            device=self.mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+
+    def _zeros(self, shape):
+        ttnn = self._ttnn
+        return ttnn.zeros(
+            shape=tuple(shape), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            device=self.mesh, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def hc_pre(self, x: torch.Tensor):
+        """[B, S, mhc, hidden] -> (y [B, S, hidden], post [B, S, mhc], comb [B, S, mhc, mhc])."""
+        ttnn = self._ttnn
+        B, S, mhc, hidden = x.shape
+        if mhc != self.hc_mult or hidden != self.hidden:
+            raise ValueError(
+                f"x shape mismatch: got mhc={mhc}, hidden={hidden}; "
+                f"expected mhc={self.hc_mult}, hidden={self.hidden}")
+        out_dtype = x.dtype
+        num_tokens = B * S
+        num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
+
+        # Step 1: pre_norm_fn on device.
+        a_packed = _mhc_pack_residual(x, num_tokens_pad)
+        a_tt = self._rep_tensor(a_packed)
+        mixes_tt = self._zeros((num_tokens_pad, _MHC_TILE))
+        self._norm_fn_kernel(num_tokens_pad // _MHC_TILE)(
+            a_tt, self.fn_tt, self.scaler_tt, mixes_tt)
+
+        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
+        mixes_packed = ttnn.to_torch(mixes_tt, mesh_composer=composer)
+        # Take chip 0's row range (replicated across chips), unpack to [num_tokens, mhc_mult3].
+        mixes = mixes_packed[:num_tokens, :self.mhc_mult3].reshape(B, S, self.mhc_mult3)
+
+        # Step 2: CPU split + sinkhorn.
+        pre, post, comb = hc_split_sinkhorn(
+            mixes, self.hc_scale_cpu, self.hc_base_cpu,
+            self.hc_mult, self.sinkhorn_iters, self.hc_eps,
+        )
+
+        # Step 3: pre_apply_mix on device.
+        x_3d = x.view(num_tokens, mhc, hidden)
+        x_packed = _mhc_pack_x_for_apply_mix(x_3d, num_tokens_pad)
+        mix_packed = _mhc_pack_mix(
+            pre.reshape(num_tokens, mhc), num_tokens_pad)
+        x_tt = self._rep_tensor(x_packed)
+        mix_tt = self._rep_tensor(mix_packed)
+        out_tt = self._zeros((num_tokens_pad * _MHC_TILE, hidden))
+        self._apply_mix_kernel(num_tokens_pad)(
+            x_tt, mix_tt, self.scaler_tt, out_tt)
+
+        out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
+        y_flat = _mhc_unpack_apply_mix_out(out_packed, num_tokens, hidden)
+        y = y_flat.view(B, S, hidden).to(out_dtype)
+        return y, post, comb
+
+    def hc_post(self, x: torch.Tensor, residual: torch.Tensor,
+                post: torch.Tensor, comb: torch.Tensor):
+        """x [B, S, hidden], residual [B, S, mhc, hidden], post [B, S, mhc],
+        comb [B, S, mhc, mhc] -> [B, S, mhc, hidden]."""
+        ttnn = self._ttnn
+        B, S, hidden = x.shape
+        mhc = self.hc_mult
+        out_dtype = x.dtype
+        num_tokens = B * S
+        num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
+
+        x_2d = x.reshape(num_tokens, hidden)
+        res_3d = residual.reshape(num_tokens, mhc, hidden)
+        post_2d = post.reshape(num_tokens, mhc)
+        comb_3d = comb.reshape(num_tokens, mhc, mhc)
+
+        x_tt = self._rep_tensor(_mhc_pack_x_bc(x_2d, mhc, num_tokens_pad))
+        res_tt = self._rep_tensor(_mhc_pack_residual_for_post(res_3d, num_tokens_pad))
+        comb_tt = self._rep_tensor(_mhc_pack_comb_T(comb_3d, num_tokens_pad))
+        post_tt = self._rep_tensor(_mhc_pack_post_mix(post_2d, num_tokens_pad))
+        out_tt = self._zeros((num_tokens_pad * _MHC_TILE, hidden))
+        self._post_kernel(num_tokens_pad)(
+            x_tt, res_tt, comb_tt, post_tt, out_tt)
+
+        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
+        out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
+        y_flat = _mhc_unpack_post_out(out_packed, num_tokens, mhc, hidden)
+        return y_flat.view(B, S, mhc, hidden).to(out_dtype)
+
+
 class DeviceSharedExpert(nn.Module):
     """V4-Flash shared-expert SwiGLU on a 1xN mesh (replicated weights).
 
@@ -2673,6 +3195,64 @@ class Model:
             attn.forward = da.forward
             self._device_attn_full.append(da)
 
+    def offload_mhc(self, mesh):
+        """Run Block.hc_pre + Block.hc_post on the 1xN mesh via tt-lang kernels.
+
+        Per Block creates two DeviceMHC instances (one for hc_attn_*, one for
+        hc_ffn_*) since each variant owns its own hc_fn weight. hc_post uses
+        the same kernel either side and can dispatch through either DeviceMHC;
+        we use the attn-side instance arbitrarily.
+
+        ParallelHead.hc_head (the lm_head's combiner) keeps its CPU path; it
+        runs once per generate call and is not on the hot decode path.
+        """
+        self._device_mhc = []
+        for layer in self.transformer.layers:
+            mhc_attn = DeviceMHC(
+                mesh=mesh,
+                hc_fn=layer.hc_attn_fn,
+                hc_scale=layer.hc_attn_scale,
+                hc_base=layer.hc_attn_base,
+                hc_mult=layer.hc_mult,
+                hc_eps=layer.hc_eps,
+                sinkhorn_iters=layer.hc_sinkhorn_iters,
+                norm_eps=layer.norm_eps,
+            )
+            mhc_ffn = DeviceMHC(
+                mesh=mesh,
+                hc_fn=layer.hc_ffn_fn,
+                hc_scale=layer.hc_ffn_scale,
+                hc_base=layer.hc_ffn_base,
+                hc_mult=layer.hc_mult,
+                hc_eps=layer.hc_eps,
+                sinkhorn_iters=layer.hc_sinkhorn_iters,
+                norm_eps=layer.norm_eps,
+            )
+
+            attn_fn_id = id(layer.hc_attn_fn)
+            ffn_fn_id = id(layer.hc_ffn_fn)
+
+            def _device_hc_pre(self_layer, x, hc_fn, hc_scale, hc_base,
+                               _attn=mhc_attn, _ffn=mhc_ffn,
+                               _attn_id=attn_fn_id, _ffn_id=ffn_fn_id):
+                fid = id(hc_fn)
+                if fid == _attn_id:
+                    return _attn.hc_pre(x)
+                if fid == _ffn_id:
+                    return _ffn.hc_pre(x)
+                raise RuntimeError(
+                    "DeviceMHC dispatch: hc_fn identity matches neither "
+                    "hc_attn_fn nor hc_ffn_fn"
+                )
+
+            def _device_hc_post(self_layer, x, residual, post, comb,
+                                _mhc=mhc_attn):
+                return _mhc.hc_post(x, residual, post, comb)
+
+            layer.hc_pre = _device_hc_pre.__get__(layer, type(layer))
+            layer.hc_post = _device_hc_post.__get__(layer, type(layer))
+            self._device_mhc.append((mhc_attn, mhc_ffn))
+
     @torch.inference_mode()
     def step_decode(self, token_id: int, pos: int) -> torch.Tensor:
         """Single decode step. Returns logits [vocab_size]."""
@@ -2758,6 +3338,9 @@ def main():
     parser.add_argument("--offload-attn-full", action="store_true",
                         help="Fused MLA attention forward on device (decode path only). "
                              "Requires all attn sub-pieces already offloaded.")
+    parser.add_argument("--offload-mhc", action="store_true",
+                        help="Run Block.hc_pre / hc_post on 1x4 mesh via tt-lang fused kernels "
+                             "(pre_norm_fn + pre_apply_mix + post). Sinkhorn stays CPU.")
     parser.add_argument("--weights-cache",
                         default=os.environ.get("DS_WEIGHTS_CACHE",
                                                "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
@@ -2794,6 +3377,7 @@ def main():
         or args.offload_indexer_linears
         or args.offload_sparse_attn
         or args.offload_attn_full
+        or args.offload_mhc
     )
     if need_mesh:
         print("[phase] opening 1x4 mesh ...")
@@ -2871,6 +3455,11 @@ def main():
         t0 = time.time()
         model.offload_attn_full(mesh)
         print(f"[phase] attn_full offloaded in {time.time() - t0:.1f}s")
+    if args.offload_mhc:
+        print(f"[phase] binding DeviceMHC across {n_layers} layers on mesh ...")
+        t0 = time.time()
+        model.offload_mhc(mesh)
+        print(f"[phase] mhc offloaded in {time.time() - t0:.1f}s")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")
