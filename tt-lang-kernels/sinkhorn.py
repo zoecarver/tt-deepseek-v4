@@ -7,21 +7,20 @@ CPU torch reference: `torch_refs.sinkhorn_normalize_ref`.
 Input shape: [n0, n1, mhc, mhc], mhc=4 for V4-Flash. We flatten to
 [num_slices, 4, 4] where num_slices = n0*n1, then embed each 4x4 slice in the
 top-left of its own 32x32 tile. Padded cells are PAD_SENTINEL so exp(pad -
-row_max) underflows to 0 during softmax; immediately after the softmax, a
-mask-multiply zeros the padded region exactly and an eps-mask-add introduces
-eps only inside the valid 4x4 region. All subsequent iterations preserve the
-"0 outside the valid 4x4" invariant.
+row_max) underflows to 0 during softmax. After the softmax, a mask-multiply
+zeros the padded region exactly and an eps-mask-add introduces eps only
+inside the valid 4x4 region; subsequent normalize passes preserve the "0
+outside the valid 4x4" invariant.
 
-Implementation strategy: one slice = one 32x32 tile. All sinkhorn state lives
-in a single reserved output block (`xs`), modified in-place via repeated
-`xs.store(...)`. This is the same pattern layernorm_minimal uses for its
-`mean_blk` accumulator — it sidesteps the reduce-inside-scf.for legalization
-trap because there is no DFB reserve/wait pair inside the iteration; the
-block handle is captured once outside the loop and rewritten each pass.
-
-The reduce/recip pattern strictly follows prompt.md (tt-lang-import):
-  - reduce's output must be stored immediately into its own DFB;
-  - broadcast's second arg must be the reserved output block it stores into.
+Structure:
+  - Each major transform (softmax, mask+eps, col-normalize, iteration pair)
+    produces a fresh block into `state_dfb`. Intermediates (row-max, row-sum,
+    reciprocal-broadcast) each have their own DFB.
+  - `state_dfb` is consumed twice per normalize step (once for the reduction,
+    once for the multiply), so we reserve a copy into `state_copy_dfb` in the
+    same `with state_dfb.wait()` scope (FA-style, see test_fa_simple.py).
+  - Compiler bug workaround: `options="--no-ttl-reduce-full-fp32"` (see
+    README "reduce dims=[1] returns zeros on fp32 tiles").
 """
 from __future__ import annotations
 
@@ -31,10 +30,6 @@ TILE = 32
 
 
 def make_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
-    """Build a sinkhorn kernel for a fixed (num_slices, repeat, eps). All
-    three are compile-time constants so the loops unroll / scf.for lower
-    cleanly and `ttl.math.fill(..., eps)` is well-formed.
-    """
 
     @ttl.operation(grid=(1, 1), options="--no-ttl-reduce-full-fp32")
     def sinkhorn_kernel(x, mask, eps_mask, scaler, out):
@@ -44,61 +39,90 @@ def make_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
         sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
         out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
 
-        # Reused scratch DFBs for reduce results and their reciprocals.
+        # Intermediates shaped like a scalar tile (reductions land in row 0 or
+        # col 0 of a 32x32 tile).
         red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
-        inv_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        # Broadcasts and state carry full-tile shape (like x).
+        bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        state_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        state_copy_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        exp_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
 
         @ttl.compute()
         def compute():
             sc = sc_dfb.wait()
             m = m_dfb.wait()
             em = em_dfb.wait()
+
             for _ in range(num_slices):
+                # ----- Row softmax: state := softmax(x, dim=-1) -----
                 x_in = x_dfb.wait()
-                # out_dfb acts as the sinkhorn state buffer: `xs` starts as
-                # exp(x - row_max) and ends as the final sinkhorn output.
-                with out_dfb.reserve() as xs:
-                    # --- Row softmax ---
-                    red_dfb.reserve().store(ttl.math.reduce_max(x_in, sc, dims=[1]))
-                    xs.store(ttl.math.exp(x_in - ttl.math.broadcast(red_dfb.wait(), x_in, dims=[1])))
-                    red_dfb.reserve().store(ttl.math.reduce_sum(xs, sc, dims=[1]))
-                    inv_dfb.reserve().store(ttl.math.recip(red_dfb.wait()))
-                    # Fold softmax multiply + mask + eps into one rewrite of xs.
-                    xs.store((xs * ttl.math.broadcast(inv_dfb.wait(), x_in, dims=[1])) * m + em)
+                red_dfb.reserve().store(ttl.math.reduce_max(x_in, sc, dims=[1]))
+                rmx = bc_dfb.reserve()
+                rmx.store(ttl.math.broadcast(red_dfb.wait(), rmx, dims=[1]))
+                exp_dfb.reserve().store(ttl.math.exp(x_in - bc_dfb.wait()))
 
-                    # --- First col-normalize (paired with the initial softmax) ---
-                    red_dfb.reserve().store(ttl.math.reduce_sum(xs, sc, dims=[0]))
-                    cs0 = red_dfb.wait()
-                    inv_dfb.reserve().store(ttl.math.recip(cs0 + ttl.math.fill(cs0, eps)))
-                    xs.store(xs * ttl.math.broadcast(inv_dfb.wait(), x_in, dims=[0]))
+                ex = exp_dfb.wait()
+                red_dfb.reserve().store(ttl.math.reduce_sum(ex, sc, dims=[1]))
+                state_copy_dfb.reserve().store(ex)
+                rinv = bc_dfb.reserve()
+                rinv.store(ttl.math.broadcast(ttl.math.recip(red_dfb.wait()), rinv, dims=[1]))
+                state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
 
-                    # --- `repeat - 1` alternating (row, col) normalizations ---
-                    # Compiles to scf.for, but xs is captured from the enclosing
-                    # with-block so L1 state persists across iterations.
-                    for _ in range(repeat - 1):
-                        red_dfb.reserve().store(ttl.math.reduce_sum(xs, sc, dims=[1]))
-                        rs = red_dfb.wait()
-                        inv_dfb.reserve().store(ttl.math.recip(rs + ttl.math.fill(rs, eps)))
-                        xs.store(xs * ttl.math.broadcast(inv_dfb.wait(), x_in, dims=[1]))
+                # ----- Mask + eps: state := state * mask + eps_mask -----
+                state_copy_dfb.reserve().store(state_dfb.wait() * m + em)
+                state_dfb.reserve().store(state_copy_dfb.wait())
 
-                        red_dfb.reserve().store(ttl.math.reduce_sum(xs, sc, dims=[0]))
-                        cs = red_dfb.wait()
-                        inv_dfb.reserve().store(ttl.math.recip(cs + ttl.math.fill(cs, eps)))
-                        xs.store(xs * ttl.math.broadcast(inv_dfb.wait(), x_in, dims=[0]))
-                    # with exit -> pushes xs to out_dfb.
+                # ----- First col-normalize: state := state / (col_sum + eps) -----
+                s = state_dfb.wait()
+                red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[0]))
+                state_copy_dfb.reserve().store(s)
+                cinv = bc_dfb.reserve()
+                csum = red_dfb.wait()
+                cinv.store(ttl.math.broadcast(
+                    ttl.math.recip(csum + ttl.math.fill(csum, eps)),
+                    cinv, dims=[0]))
+                state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                # ----- repeat - 1 alternating (row, col) normalizations -----
+                for _ in range(repeat - 1):
+                    # row normalize
+                    s = state_dfb.wait()
+                    red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[1]))
+                    state_copy_dfb.reserve().store(s)
+                    rinv = bc_dfb.reserve()
+                    rsum = red_dfb.wait()
+                    rinv.store(ttl.math.broadcast(
+                        ttl.math.recip(rsum + ttl.math.fill(rsum, eps)),
+                        rinv, dims=[1]))
+                    state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                    # col normalize
+                    s = state_dfb.wait()
+                    red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[0]))
+                    state_copy_dfb.reserve().store(s)
+                    cinv = bc_dfb.reserve()
+                    csum = red_dfb.wait()
+                    cinv.store(ttl.math.broadcast(
+                        ttl.math.recip(csum + ttl.math.fill(csum, eps)),
+                        cinv, dims=[0]))
+                    state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                # ----- Final copy state -> out -----
+                out_dfb.reserve().store(state_dfb.wait())
 
         @ttl.datamovement()
         def dm_read():
             ttl.copy(mask[0, 0], m_dfb.reserve()).wait()
             ttl.copy(eps_mask[0, 0], em_dfb.reserve()).wait()
             ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
-            for tile_idx in range(num_slices):
-                ttl.copy(x[tile_idx, 0], x_dfb.reserve()).wait()
+            for t in range(num_slices):
+                ttl.copy(x[t, 0], x_dfb.reserve()).wait()
 
         @ttl.datamovement()
         def dm_write():
-            for tile_idx in range(num_slices):
-                ttl.copy(out_dfb.wait(), out[tile_idx, 0]).wait()
+            for t in range(num_slices):
+                ttl.copy(out_dfb.wait(), out[t, 0]).wait()
 
     return sinkhorn_kernel
 
@@ -119,7 +143,6 @@ def solve(x_tt, mask_tt, eps_mask_tt, scaler_tt, out_tt, *, repeat: int, eps: fl
 
 
 def _test_shape(device, ttnn, torch, n0, n1, mhc, repeat, eps, threshold):
-    """One shape: build inputs, run kernel, compare against torch ref."""
     from harness import (
         PAD_SENTINEL,
         assert_pcc,
@@ -141,12 +164,12 @@ def _test_shape(device, ttnn, torch, n0, n1, mhc, repeat, eps, threshold):
     y_ref = sinkhorn_normalize_ref(x_ref, repeat=repeat, eps=eps)
 
     x_flat = x_ref.reshape(num_slices, mhc, mhc)
-    x_packed = pack_4x4_slices(x_flat, pad_value=PAD_SENTINEL)
+    x_packed = pack_4x4_slices(x_flat, pad_value=PAD_SENTINEL, dtype=torch.float32)
     out_packed = torch.zeros_like(x_packed)
 
-    mask = mask_tile(valid=mhc)
-    em = eps_mask_tile(eps=eps, valid=mhc)
-    sc = scaler_tile()
+    mask = mask_tile(valid=mhc, dtype=torch.float32)
+    em = eps_mask_tile(eps=eps, valid=mhc, dtype=torch.float32)
+    sc = scaler_tile(dtype=torch.float32)
 
     common = dict(
         dtype=ttnn.float32,
@@ -165,12 +188,10 @@ def _test_shape(device, ttnn, torch, n0, n1, mhc, repeat, eps, threshold):
     out_packed = ttnn.to_torch(out_tt)
     y_tt = unpack_4x4_slices(out_packed, num_slices).reshape(n0, n1, mhc, mhc)
 
-    # Debug dump on the smoke case so we can diagnose without re-running.
     if num_slices == 1:
         print(f"  x_in[0]:\n{x_ref[0, 0].numpy()}")
         print(f"  y_ref[0]:\n{y_ref[0, 0].numpy()}")
         print(f"  y_tt[0]:\n{y_tt[0, 0].numpy()}")
-        print(f"  raw out tile top-left 8x8:\n{out_packed[:8, :8].numpy()}")
 
     assert_pcc(y_ref, y_tt, threshold=threshold)
 
@@ -183,28 +204,18 @@ if __name__ == "__main__":
     import torch
     import ttnn
 
-    import os
-
-    # Ramp up iteration count as we gain confidence; can override via env for
-    # local debugging without editing the file.
-    REPEAT = int(os.environ.get("SINKHORN_REPEAT", "1"))
+    REPEAT = 10
     EPS = 1e-6
     THRESHOLD = 0.9995
 
-    # Smoke first: single slice is the easiest to diagnose. Once the smoke
-    # shape passes we'll extend to V4-Flash shapes from kernels.md.
     SHAPES = [
-        (1, 1, 4),     # smoke: 1 slice
+        (1, 1, 4),
+        (2, 1, 4),
+        (1, 1024, 4),
+        (2, 1024, 4),
+        (1, 4096, 4),
+        (2, 4096, 4),
     ]
-    if os.environ.get("SINKHORN_ALL", "") == "1":
-        SHAPES = [
-            (1, 1, 4),
-            (2, 1, 4),
-            (1, 1024, 4),
-            (2, 1024, 4),
-            (1, 4096, 4),
-            (2, 4096, 4),
-        ]
 
     device = ttnn.open_device(device_id=0)
     try:
