@@ -1003,6 +1003,71 @@ class Transformer(nn.Module):
 
 
 # ==============================================================================
+# DEVICE OFFLOAD: per-op wrappers for Tenstorrent mesh
+# ==============================================================================
+
+
+class DeviceLMHead:
+    """Column-parallel lm_head across a 1xN mesh.
+
+    Replaces ParallelHead.get_logits. Shards [dim, vocab] along vocab (last dim)
+    so each chip holds vocab/N cols, runs the matmul on-device, and gathers on
+    the host. vocab must be divisible by N.
+    """
+
+    def __init__(self, mesh, cpu_weight: torch.Tensor):
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        vocab, dim = cpu_weight.shape
+        if vocab % self.mesh_shape[1] != 0:
+            raise ValueError(f"vocab {vocab} not divisible by mesh axis 1 {self.mesh_shape[1]}")
+        self.vocab = vocab
+        self.dim = dim
+        w_dv = cpu_weight.to(torch.bfloat16).transpose(0, 1).contiguous()  # [dim, vocab]
+        self.w_tt = ttnn.as_tensor(
+            w_dv,
+            device=mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1)),
+        )
+
+    def __call__(self, x_last: torch.Tensor) -> torch.Tensor:
+        # x_last: [B, dim] (hidden state after norm, last seq position)
+        ttnn = self._ttnn
+        x_3d = x_last.to(torch.bfloat16).unsqueeze(1).contiguous()  # [B, 1, dim]
+        x_tt = ttnn.as_tensor(
+            x_3d,
+            device=self.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        y_tt = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        y = ttnn.to_torch(
+            y_tt,
+            mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(0, -1)),
+        )
+        if y.shape[0] != x_last.shape[0]:
+            y = y[: x_last.shape[0]]
+        return y[:, 0, :].float()  # [B, vocab]
+
+
+def _open_mesh(shape=(1, 4)):
+    import ttnn
+    return ttnn.open_mesh_device(ttnn.MeshShape(*shape))
+
+
+def _close_mesh(mesh):
+    import ttnn
+    ttnn.close_mesh_device(mesh)
+
+
+# ==============================================================================
 # MODEL: high-level wrapper (nanochat-style)
 # ==============================================================================
 
@@ -1118,12 +1183,31 @@ class Model:
         )
         return cls(args, tokenizer, ckpt_dir)
 
-    def load_weights(self, verbose: bool = False):
+    def load_weights(self, verbose: bool = False, cache_path: Optional[str] = None):
         """Load HF safetensors into the Transformer with on-the-fly key renaming and dtype fixes.
 
         Two-pass so we can combine FP8 wo_a weight+scale into a single bf16 tensor
         (the inference Linear for wo_a is declared bf16; convert.py does the same dequant).
+
+        If `cache_path` is set and the file exists, loads the prebuilt state_dict
+        via mmap (fast). If `cache_path` is set but the file is missing, runs the
+        full safetensors path and then saves the result for next time.
         """
+        if cache_path and os.path.exists(cache_path):
+            print(f"[load] reading weights cache from {cache_path}")
+            t0 = time.time()
+            cached = torch.load(cache_path, map_location="cpu", mmap=True, weights_only=True)
+            missing, unexpected = self.transformer.load_state_dict(cached, strict=False)
+            print(f"[load] cache hit: loaded {len(cached)} tensors in {time.time()-t0:.1f}s")
+            if missing or unexpected:
+                print(f"[load] cache: {len(missing)} missing, {len(unexpected)} unexpected (non-fatal)")
+                if verbose:
+                    for m in missing[:20]:
+                        print(f"[load.cache.missing] {m}")
+                    for u in unexpected[:20]:
+                        print(f"[load.cache.unexpected] {u}")
+            return
+
         from glob import glob
         files = sorted(glob(os.path.join(self.ckpt_dir, "*.safetensors")))
         assert files, f"No safetensors found in {self.ckpt_dir}"
@@ -1214,6 +1298,29 @@ class Model:
             if missing:
                 print(f"[load] first 10 missing: {missing[:10]}")
 
+        if cache_path:
+            print(f"[load] writing weights cache to {cache_path} (first-run only) ...")
+            t0 = time.time()
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            torch.save(self.transformer.state_dict(), cache_path)
+            print(f"[load] cache written in {time.time()-t0:.1f}s")
+
+    def offload_lm_head(self, mesh):
+        """Move the lm_head matmul to a 1xN device mesh (column-parallel on vocab).
+
+        Must be called after load_weights(). The CPU weight is transposed+sharded
+        once here; subsequent generate() calls dispatch the matmul to the device.
+        """
+        head = self.transformer.head
+        self._device_lm_head = DeviceLMHead(mesh, head.weight.data)
+        # Rebind get_logits to route through the device.
+        dlh = self._device_lm_head
+        def _device_get_logits(self_head, x):
+            return dlh(x[:, -1].contiguous())
+        head.get_logits = _device_get_logits.__get__(head, type(head))
+        # Free the CPU copy — the device now owns it.
+        head.weight.data = torch.empty(0)
+
     @torch.inference_mode()
     def step_decode(self, token_id: int, pos: int) -> torch.Tensor:
         """Single decode step. Returns logits [vocab_size]."""
@@ -1259,12 +1366,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", default="deepseek-ai/DeepSeek-V4-Flash")
     parser.add_argument("--prompt", default="The quick brown fox")
+    parser.add_argument("--prompt-file", default=None,
+                        help="Read prompt from file (bypasses shell quoting). Overrides --prompt.")
     parser.add_argument("--max-seq-len", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--weights-only", action="store_true",
                         help="Stop after loading weights (Phase 1 gate)")
     parser.add_argument("--verbose-load", action="store_true")
+    parser.add_argument("--offload-lm-head", action="store_true",
+                        help="Shard lm_head across a 1x4 Blackhole mesh (Phase 2)")
+    parser.add_argument("--weights-cache",
+                        default=os.environ.get("DS_WEIGHTS_CACHE",
+                                               "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
+                        help="Path to pickled state_dict cache. First run populates it; "
+                             "subsequent runs mmap it (set to empty string to disable).")
     args = parser.parse_args()
 
     torch.set_default_dtype(torch.bfloat16)
@@ -1277,16 +1393,33 @@ def main():
 
     print("[phase] loading weights ...")
     t0 = time.time()
-    model.load_weights(verbose=args.verbose_load)
+    model.load_weights(verbose=args.verbose_load, cache_path=args.weights_cache or None)
     print(f"[phase] weights loaded in {time.time() - t0:.1f}s")
+
+    mesh = None
+    if args.offload_lm_head:
+        print("[phase] opening 1x4 mesh ...")
+        t0 = time.time()
+        mesh = _open_mesh(shape=(1, 4))
+        print(f"[phase] mesh opened in {time.time() - t0:.1f}s")
+        print("[phase] sharding lm_head on mesh ...")
+        t0 = time.time()
+        model.offload_lm_head(mesh)
+        print(f"[phase] lm_head offloaded in {time.time() - t0:.1f}s")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")
+        if mesh is not None:
+            _close_mesh(mesh)
         return
 
     print("[phase] encoding prompt ...")
-    tokens = model.tokenizer.encode(args.prompt)
-    print(f"[phase] prompt = {args.prompt!r}, {len(tokens)} tokens")
+    prompt = args.prompt
+    if args.prompt_file:
+        with open(args.prompt_file) as f:
+            prompt = f.read().rstrip("\n")
+    tokens = model.tokenizer.encode(prompt)
+    print(f"[phase] prompt = {prompt!r}, {len(tokens)} tokens")
 
     print("[phase] generating ...")
     t0 = time.time()
@@ -1300,6 +1433,9 @@ def main():
     print(f"[debug] full decode: {model.tokenizer.decode(out_tokens)!r}")
     dt = time.time() - t0
     print(f"\n[phase] generated {len(out_tokens)} tokens in {dt:.1f}s ({len(out_tokens)/dt:.2f} tok/s)")
+
+    if mesh is not None:
+        _close_mesh(mesh)
 
 
 if __name__ == "__main__":
