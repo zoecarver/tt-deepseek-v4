@@ -2453,6 +2453,30 @@ class DeviceAttention(nn.Module):
         ).transpose(1, 2).contiguous()  # [G, in, R]
         self.wo_a_w_tt = ttnn.as_tensor(w_g, **rep)
 
+        # Persistent device-side joint MLA kv_cache. Lazy-allocated on first
+        # decode call so it inherits the post-prefill CPU cache. Shape on
+        # device: [1, 1, kv_cache_size_pad, head_dim] (B=1, num_heads=1) so
+        # ttnn.kv_cache.update_cache_for_token_ can write a single slot. We
+        # pad the seq dim up to a tile boundary; padding slots are never
+        # addressed by topk_idxs and remain zero.
+        kv_shape = tuple(attn.kv_cache.shape)
+        if len(kv_shape) != 3:
+            raise ValueError(
+                f"expected attn.kv_cache to be 3D [B, kv_cache_size, D], got {kv_shape}"
+            )
+        if kv_shape[2] != self.head_dim:
+            raise ValueError(
+                f"attn.kv_cache last dim {kv_shape[2]} != head_dim {self.head_dim}"
+            )
+        if self.head_dim % 32 != 0:
+            raise ValueError(
+                f"head_dim {self.head_dim} must be a multiple of 32 for tile layout"
+            )
+        self.kv_batch_size = kv_shape[0]
+        self.kv_cache_size = kv_shape[1]
+        self.kv_cache_size_pad = -(-self.kv_cache_size // 32) * 32
+        self.kv_cache_tt = None  # allocated on first _decode call
+
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         """Decode-only fused forward. Falls back to CPU for prefill."""
         attn = self.attn
@@ -2533,17 +2557,49 @@ class DeviceAttention(nn.Module):
         attn.kv_cache[:B, start_pos % win] = kv_cpu.squeeze(1)
         if self.compress_ratio:
             attn.compressor(x, start_pos)
-        kv_full_cpu = attn.kv_cache[:B]  # [B, kv_cache_size, D]
 
-        # Sparse_attn back on device.
+        # Mirror CPU writes onto the persistent device cache. Lazy-allocate it
+        # on the first decode call to inherit the post-prefill state.
         common_rep = dict(
             device=self.mesh, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
-        kv_full_tt = ttnn.as_tensor(
-            kv_full_cpu.squeeze(0).to(torch.bfloat16).contiguous(), **common_rep,
-        )
+        if self.kv_cache_tt is None:
+            cache_3d = attn.kv_cache[:B].to(torch.bfloat16).contiguous()
+            if self.kv_cache_size_pad != self.kv_cache_size:
+                pad = torch.zeros(
+                    B, self.kv_cache_size_pad - self.kv_cache_size, D,
+                    dtype=torch.bfloat16,
+                )
+                cache_3d = torch.cat([cache_3d, pad], dim=1)
+            cache_4d = cache_3d.view(B, 1, self.kv_cache_size_pad, D)
+            self.kv_cache_tt = ttnn.as_tensor(cache_4d, **common_rep)
+        else:
+            window_slot = (
+                attn.kv_cache[:B, start_pos % win]
+                .to(torch.bfloat16)
+                .contiguous()
+                .view(B, 1, 1, D)
+            )
+            window_slot_tt = ttnn.as_tensor(window_slot, **common_rep)
+            ttnn.kv_cache.update_cache_for_token_(
+                self.kv_cache_tt, window_slot_tt, start_pos % win, 0
+            )
+            if self.compress_ratio and (start_pos + 1) % self.compress_ratio == 0:
+                comp_idx = win + start_pos // self.compress_ratio
+                comp_slot = (
+                    attn.kv_cache[:B, comp_idx]
+                    .to(torch.bfloat16)
+                    .contiguous()
+                    .view(B, 1, 1, D)
+                )
+                comp_slot_tt = ttnn.as_tensor(comp_slot, **common_rep)
+                ttnn.kv_cache.update_cache_for_token_(
+                    self.kv_cache_tt, comp_slot_tt, comp_idx, 0
+                )
+
+        kv_full_tt = ttnn.reshape(self.kv_cache_tt, [self.kv_cache_size_pad, D])
         idxs_tt, valid_tt = self.sparse_attn_dev._upload_topk(topk_idxs)
         K = topk_idxs.shape[-1]
         o_tt = self.sparse_attn_dev.forward_device(
