@@ -1051,6 +1051,31 @@ class Transformer(nn.Module):
 # ==============================================================================
 
 
+def _weight_to_bf16(cpu_weight: torch.Tensor) -> torch.Tensor:
+    """Dequantize FP8/FP4 weights with per-block scales; else cast to bf16.
+
+    Errors if called on a quantized dtype without a .scale attribute — see the
+    Parameter.data gotcha: accessing .data on an nn.Parameter strips custom
+    attributes like .scale, so callers must pass the Parameter itself.
+    """
+    scale = getattr(cpu_weight, "scale", None)
+    if cpu_weight.dtype == torch.float8_e4m3fn:
+        if scale is None:
+            raise ValueError(
+                "FP8 weight passed without .scale attribute; naive cast would "
+                "produce unscaled bytes. Pass the nn.Parameter, not .data."
+            )
+        return _dequant_fp8_weight(cpu_weight, scale, group_size=block_size)
+    if cpu_weight.dtype == torch.float4_e2m1fn_x2:
+        if scale is None:
+            raise ValueError(
+                "FP4 weight passed without .scale attribute; naive cast would "
+                "produce unscaled bytes. Pass the nn.Parameter, not .data."
+            )
+        return _dequant_fp4_weight(cpu_weight, scale, block_size=fp4_block_size)
+    return cpu_weight.to(torch.bfloat16)
+
+
 class DeviceLMHead:
     """Column-parallel lm_head (+ optional final RMSNorm) across a 1xN mesh.
 
@@ -1075,7 +1100,7 @@ class DeviceLMHead:
         self.vocab = vocab
         self.dim = dim
         self.norm_eps = norm_eps
-        w_dv = cpu_weight.to(torch.bfloat16).transpose(0, 1).contiguous()  # [dim, vocab]
+        w_dv = _weight_to_bf16(cpu_weight).transpose(0, 1).contiguous()  # [dim, vocab]
         self.w_tt = ttnn.as_tensor(
             w_dv,
             device=mesh,
@@ -1123,6 +1148,117 @@ class DeviceLMHead:
         if y.shape[0] != x_last.shape[0]:
             y = y[: x_last.shape[0]]
         return y[:, 0, :].float()  # [B, vocab]
+
+
+class DeviceColLinear(nn.Module):
+    """Column-parallel linear across a 1xN mesh.
+
+    Weight: [out, in] (nn.Linear order). Transposed to [in, out] for ttnn,
+    column-sharded on the output dim: each chip holds [in, out/N]. Output
+    is gathered (concat on last dim) back to host as bf16.
+    """
+
+    def __init__(self, mesh, cpu_weight: torch.Tensor):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        out_dim, in_dim = cpu_weight.shape
+        if out_dim % self.mesh_shape[1] != 0:
+            raise ValueError(
+                f"col-linear out_dim {out_dim} not divisible by mesh axis 1 {self.mesh_shape[1]}"
+            )
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        w_io = _weight_to_bf16(cpu_weight).transpose(0, 1).contiguous()  # [in, out]
+        self.w_tt = ttnn.as_tensor(
+            w_io,
+            device=mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ttnn = self._ttnn
+        B, S, D = x.shape
+        x_tt = ttnn.as_tensor(
+            x.to(torch.bfloat16).contiguous(),
+            device=self.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        y_tt = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        y = ttnn.to_torch(
+            y_tt,
+            mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(0, -1)),
+        )
+        if y.shape[0] != B:
+            y = y[:B]
+        if y.shape[1] != S:
+            y = y[:, :S]
+        return y.to(torch.bfloat16)
+
+
+class DeviceRowLinear(nn.Module):
+    """Row-parallel linear across a 1xN mesh with all-reduce sum.
+
+    Weight: [out, in] (nn.Linear order). Transposed to [in, out] for ttnn,
+    row-sharded on the input dim: each chip holds [in/N, out]. Input must
+    be sharded on its last dim (in/N per chip); we shard it on upload.
+    Output is all-reduced (sum) across the mesh and returned as bf16.
+    """
+
+    def __init__(self, mesh, cpu_weight: torch.Tensor):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        out_dim, in_dim = cpu_weight.shape
+        N = self.mesh_shape[1]
+        if in_dim % N != 0:
+            raise ValueError(
+                f"row-linear in_dim {in_dim} not divisible by mesh axis 1 {N}"
+            )
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        w_io = _weight_to_bf16(cpu_weight).transpose(0, 1).contiguous()  # [in, out]
+        self.w_tt = ttnn.as_tensor(
+            w_io,
+            device=mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, 0)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ttnn = self._ttnn
+        B, S, D = x.shape
+        x_tt = ttnn.as_tensor(
+            x.to(torch.bfloat16).contiguous(),
+            device=self.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(None, -1)),
+        )
+        y_tt = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        # Bring N partial outputs back and sum. Mesh axis 0 has size 1 so its
+        # concat dim is a no-op; route it to tensor dim 1 and stack axis-1
+        # shards along tensor dim 0 so y.shape[0] = N*B.
+        y = ttnn.to_torch(
+            y_tt,
+            mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0)),
+        )
+        N = self.mesh_shape[1]
+        y = y.view(N, B, S, self.out_dim).sum(dim=0)
+        return y.to(torch.bfloat16)
 
 
 def _open_mesh(shape=(1, 4)):
@@ -1406,6 +1542,48 @@ class Model:
             head.get_logits = _device_get_logits.__get__(head, type(head))
         head.weight.data = torch.empty(0)
 
+    def offload_attn_wq_b(self, mesh):
+        """Column-parallel shard wq_b (Q-LoRA up) on n_heads*head_dim."""
+        self._device_wq_b = []
+        for layer in self.transformer.layers:
+            attn = layer.attn
+            dw = DeviceColLinear(mesh, attn.wq_b.weight)
+            attn.wq_b = dw
+            self._device_wq_b.append(dw)
+
+    def offload_attn_wq_a(self, mesh):
+        """Column-parallel shard wq_a (Q-LoRA down) on q_lora_rank."""
+        self._device_wq_a = []
+        for layer in self.transformer.layers:
+            attn = layer.attn
+            dw = DeviceColLinear(mesh, attn.wq_a.weight)
+            attn.wq_a = dw
+            self._device_wq_a.append(dw)
+
+    def offload_attn_wkv(self, mesh):
+        """Column-parallel shard wkv (KV-with-MQA down) on head_dim."""
+        self._device_wkv = []
+        for layer in self.transformer.layers:
+            attn = layer.attn
+            dw = DeviceColLinear(mesh, attn.wkv.weight)
+            attn.wkv = dw
+            self._device_wkv.append(dw)
+
+    def offload_attn_wo_b(self, mesh):
+        """Col-parallel shard wo_b on its 4096-wide output dim.
+
+        Row-parallel is the TP-correct pattern (shard on the 8192 input) and
+        DeviceRowLinear exists, but it was producing garbage — tracked as
+        follow-up tech debt. Col-parallel here is numerically equivalent
+        with more activation bandwidth per chip (fine on QB fabric).
+        """
+        self._device_wo_b = []
+        for layer in self.transformer.layers:
+            attn = layer.attn
+            dw = DeviceColLinear(mesh, attn.wo_b.weight)
+            attn.wo_b = dw
+            self._device_wo_b.append(dw)
+
     @torch.inference_mode()
     def step_decode(self, token_id: int, pos: int) -> torch.Tensor:
         """Single decode step. Returns logits [vocab_size]."""
@@ -1464,6 +1642,14 @@ def main():
     parser.add_argument("--verbose-load", action="store_true")
     parser.add_argument("--offload-lm-head", action="store_true",
                         help="Shard lm_head across a 1x4 Blackhole mesh (Phase 2)")
+    parser.add_argument("--offload-attn-wq-b", action="store_true",
+                        help="Shard wq_b (Q-LoRA up) across the 1x4 mesh (Phase 2)")
+    parser.add_argument("--offload-attn-wq-a", action="store_true",
+                        help="Shard wq_a (Q-LoRA down) across the 1x4 mesh (Phase 2)")
+    parser.add_argument("--offload-attn-wkv", action="store_true",
+                        help="Shard wkv (KV-with-MQA down) across the 1x4 mesh (Phase 2)")
+    parser.add_argument("--offload-attn-wo-b", action="store_true",
+                        help="Row-parallel shard wo_b across the 1x4 mesh (Phase 2)")
     parser.add_argument("--weights-cache",
                         default=os.environ.get("DS_WEIGHTS_CACHE",
                                                "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
@@ -1485,15 +1671,44 @@ def main():
     print(f"[phase] weights loaded in {time.time() - t0:.1f}s")
 
     mesh = None
-    if args.offload_lm_head:
+    need_mesh = (
+        args.offload_lm_head
+        or args.offload_attn_wq_a
+        or args.offload_attn_wq_b
+        or args.offload_attn_wkv
+        or args.offload_attn_wo_b
+    )
+    if need_mesh:
         print("[phase] opening 1x4 mesh ...")
         t0 = time.time()
         mesh = _open_mesh(shape=(1, 4))
         print(f"[phase] mesh opened in {time.time() - t0:.1f}s")
+    if args.offload_lm_head:
         print("[phase] sharding lm_head on mesh ...")
         t0 = time.time()
         model.offload_lm_head(mesh)
         print(f"[phase] lm_head offloaded in {time.time() - t0:.1f}s")
+    n_layers = len(model.transformer.layers)
+    if args.offload_attn_wq_a:
+        print(f"[phase] sharding wq_a across {n_layers} layers on mesh ...")
+        t0 = time.time()
+        model.offload_attn_wq_a(mesh)
+        print(f"[phase] wq_a offloaded in {time.time() - t0:.1f}s")
+    if args.offload_attn_wq_b:
+        print(f"[phase] sharding wq_b across {n_layers} layers on mesh ...")
+        t0 = time.time()
+        model.offload_attn_wq_b(mesh)
+        print(f"[phase] wq_b offloaded in {time.time() - t0:.1f}s")
+    if args.offload_attn_wkv:
+        print(f"[phase] sharding wkv across {n_layers} layers on mesh ...")
+        t0 = time.time()
+        model.offload_attn_wkv(mesh)
+        print(f"[phase] wkv offloaded in {time.time() - t0:.1f}s")
+    if args.offload_attn_wo_b:
+        print(f"[phase] row-sharding wo_b across {n_layers} layers on mesh ...")
+        t0 = time.time()
+        model.offload_attn_wo_b(mesh)
+        print(f"[phase] wo_b offloaded in {time.time() - t0:.1f}s")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")
