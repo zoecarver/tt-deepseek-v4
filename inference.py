@@ -2000,19 +2000,26 @@ class Model:
             self._device_wo_a.append(dg)
 
     def offload_rms_norms(self, mesh):
-        """Move attn_norm + ffn_norm on every Block to the 1xN mesh.
+        """Move attn_norm, ffn_norm, q_norm, kv_norm on every Block to the 1xN mesh.
 
-        Uses the tt-lang fused rmsnorm kernel (replicated gamma). Per-M_tiles
-        kernel is compiled lazily; first call of each shape takes a compile hit.
-        Final norm is already on device via offload_lm_head(include_final_norm=True).
+        Uses the tt-lang fused rmsnorm kernel (replicated gamma). Per-(hidden,
+        M_tiles) kernel compiled lazily. Compressor's internal norm stays CPU
+        for now (its inputs/outputs are still CPU; offloading would add
+        round-trips with no gain until Compressor itself is on device).
+        Final norm is already on device via offload_lm_head.
         """
         self._device_rms_norms = []
+
+        def _bind(norm):
+            dn = DeviceRMSNorm(mesh, norm.weight, norm.eps)
+            norm.forward = dn.forward
+            self._device_rms_norms.append(dn)
+
         for layer in self.transformer.layers:
-            for attr in ("attn_norm", "ffn_norm"):
-                norm = getattr(layer, attr)
-                dn = DeviceRMSNorm(mesh, norm.weight, norm.eps)
-                norm.forward = dn.forward
-                self._device_rms_norms.append(dn)
+            _bind(layer.attn_norm)
+            _bind(layer.ffn_norm)
+            _bind(layer.attn.q_norm)
+            _bind(layer.attn.kv_norm)
 
     def offload_moe_shared_expert(self, mesh):
         """Move every MoE layer's shared-expert SwiGLU to the 1xN mesh.
@@ -2032,6 +2039,86 @@ class Model:
             )
             ffn.shared_experts = dse
             self._device_shared_experts.append(dse)
+
+    def offload_embedding(self, mesh):
+        """Move token embedding to the 1xN mesh (replicated).
+
+        Replaces Transformer.embed.forward with a ttnn.embedding call. The
+        weight is tiny-ish for V4 (vocab=129280 * dim=4096 bf16 ~1GB) and
+        fits comfortably when replicated per chip.
+        """
+        import ttnn
+        embed = self.transformer.embed
+        w = _weight_to_bf16(embed.weight).contiguous()
+        mesh_shape = tuple(mesh.shape)
+        w_tt = ttnn.as_tensor(
+            w,
+            device=mesh,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        self._device_embed_weight = w_tt
+
+        def _device_embed(self_embed, x: torch.Tensor) -> torch.Tensor:
+            ids = x.to(torch.int32).contiguous()
+            ids_tt = ttnn.as_tensor(
+                ids,
+                device=mesh,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                dtype=ttnn.uint32,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            )
+            y_tt = ttnn.embedding(ids_tt, w_tt, layout=ttnn.TILE_LAYOUT)
+            composer = ttnn.ConcatMesh2dToTensor(mesh, mesh_shape, dims=(1, 0))
+            y = ttnn.to_torch(y_tt, mesh_composer=composer)
+            B = x.shape[0]
+            return y[:B].to(torch.bfloat16)
+
+        embed.forward = _device_embed.__get__(embed, type(embed))
+        embed.weight.data = torch.empty(0)  # device owns it
+
+    def offload_compressor_linears(self, mesh):
+        """Col-parallel shard Compressor.wkv + wgate on the 1xN mesh for every
+        layer that has a compressor (attn.compress_ratio > 0 OR indexer's
+        compressor). Linear compute is on device; the rest of Compressor
+        stays CPU."""
+        self._device_compressor_linears = []
+        for layer in self.transformer.layers:
+            attn = layer.attn
+            for comp in self._iter_compressors(attn):
+                for attr in ("wkv", "wgate"):
+                    lin = getattr(comp, attr)
+                    dw = DeviceColLinear(mesh, lin.weight)
+                    setattr(comp, attr, dw)
+                    self._device_compressor_linears.append(dw)
+
+    def offload_indexer_linears(self, mesh):
+        """Col-parallel shard Indexer.wq_b + weights_proj on the 1xN mesh for
+        every layer that has an indexer (attn.compress_ratio == 4)."""
+        self._device_indexer_linears = []
+        for layer in self.transformer.layers:
+            attn = layer.attn
+            indexer = getattr(attn, "indexer", None)
+            if indexer is None:
+                continue
+            for attr in ("wq_b", "weights_proj"):
+                lin = getattr(indexer, attr)
+                dw = DeviceColLinear(mesh, lin.weight)
+                setattr(indexer, attr, dw)
+                self._device_indexer_linears.append(dw)
+
+    @staticmethod
+    def _iter_compressors(attn):
+        """Yield every Compressor reachable from an Attention (the attn's own
+        compressor, plus the Indexer's compressor when the layer has one)."""
+        if getattr(attn, "compress_ratio", 0):
+            yield attn.compressor
+        indexer = getattr(attn, "indexer", None)
+        if indexer is not None:
+            yield indexer.compressor
 
     def offload_moe_gate(self, mesh):
         """Move every non-hash MoE gate to the 1xN mesh.
@@ -2149,7 +2236,13 @@ def main():
     parser.add_argument("--offload-moe-shared-expert", action="store_true",
                         help="Replicate MoE shared-expert SwiGLU on 1x4 mesh (all layers)")
     parser.add_argument("--offload-rms-norms", action="store_true",
-                        help="Run attn_norm + ffn_norm via tt-lang rmsnorm kernel on 1x4 mesh")
+                        help="Run attn_norm/ffn_norm/q_norm/kv_norm via tt-lang rmsnorm kernel on 1x4 mesh")
+    parser.add_argument("--offload-embedding", action="store_true",
+                        help="Replicate token embedding on 1x4 mesh (ttnn.embedding)")
+    parser.add_argument("--offload-compressor-linears", action="store_true",
+                        help="Col-parallel shard Compressor.wkv + wgate on 1x4 mesh (per layer)")
+    parser.add_argument("--offload-indexer-linears", action="store_true",
+                        help="Col-parallel shard Indexer.wq_b + weights_proj on 1x4 mesh (per layer)")
     parser.add_argument("--weights-cache",
                         default=os.environ.get("DS_WEIGHTS_CACHE",
                                                "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
@@ -2181,6 +2274,9 @@ def main():
         or args.offload_moe_gate
         or args.offload_moe_shared_expert
         or args.offload_rms_norms
+        or args.offload_embedding
+        or args.offload_compressor_linears
+        or args.offload_indexer_linears
     )
     if need_mesh:
         print("[phase] opening 1x4 mesh ...")
@@ -2229,10 +2325,25 @@ def main():
         model.offload_moe_shared_expert(mesh)
         print(f"[phase] moe_shared_expert offloaded in {time.time() - t0:.1f}s")
     if args.offload_rms_norms:
-        print(f"[phase] binding tt-lang rmsnorm across {n_layers} layers (attn+ffn) ...")
+        print(f"[phase] binding tt-lang rmsnorm across {n_layers} layers (attn/ffn/q/kv) ...")
         t0 = time.time()
         model.offload_rms_norms(mesh)
         print(f"[phase] rms_norms offloaded in {time.time() - t0:.1f}s")
+    if args.offload_embedding:
+        print(f"[phase] replicating embedding on mesh ...")
+        t0 = time.time()
+        model.offload_embedding(mesh)
+        print(f"[phase] embedding offloaded in {time.time() - t0:.1f}s")
+    if args.offload_compressor_linears:
+        print(f"[phase] sharding Compressor wkv+wgate across layers on mesh ...")
+        t0 = time.time()
+        model.offload_compressor_linears(mesh)
+        print(f"[phase] compressor_linears offloaded in {time.time() - t0:.1f}s")
+    if args.offload_indexer_linears:
+        print(f"[phase] sharding Indexer wq_b+weights_proj across layers on mesh ...")
+        t0 = time.time()
+        model.offload_indexer_linears(mesh)
+        print(f"[phase] indexer_linears offloaded in {time.time() - t0:.1f}s")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")
