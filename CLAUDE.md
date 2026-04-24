@@ -32,6 +32,25 @@ export TT_REMOTE_CONF=/Users/zcarver/.claude/skills/tt-connect-remote-device/scr
 
 For any Python file that imports or defines `ttl`/tt-lang kernels, run it via `scripts/run-test.sh` from the `tt-connect-remote-device` skill. Note: the functional simulator is out of date for this work, so going straight to `--hw` is fine and likely necessary. Pure-CPU scripts can be copied with `copy-file.sh` and run with `remote-run.sh`.
 
+### Running scripts on the remote (streaming & monitoring)
+
+**Prefer `run-test.sh`** whenever possible. It already streams output to a file, truncates the on-screen view, and leaves the full log on disk so you can `grep`/`cat` it after the run. No need to pipe `2>&1 | tail -N` yourself — that blocks on the pipeline and hides live progress.
+
+When `remote-run.sh` is required (e.g. for scripts that open a mesh directly, or pure CPU runs), **always tee output to a log file on the remote** so progress can be monitored while the process is still alive:
+
+```
+remote-run.sh "cd /tmp && python3 -u myscript.py ... 2>&1 | tee /tmp/mylog.out"
+```
+
+To check progress mid-run:
+
+```
+remote-run.sh tail -50 /tmp/mylog.out
+remote-run.sh cat /tmp/mylog.out | grep '\[phase\]'
+```
+
+**Do not** wrap the remote command with `| tail -N` on its own — that buffers and the user can't see anything until the process exits.
+
 ## Hang recovery
 
 **Important: follow these steps exactly. Deviating can leave the device in an unrecoverable state. If anything is unclear, stop and ask the user before running commands.**
