@@ -2,6 +2,18 @@
 
 Goal: bring DeepSeek-V4-Flash up on Tenstorrent hardware (Quiet Box, 4 chips, 64 GB DRAM total).
 
+## Autonomous task
+
+This is an autonomous task. Use your best judgement and keep making progress without pausing for questions. Do NOT ask the user to confirm design decisions, file layouts, or next steps — make a reasonable call, document it in code/notes, and move on. Commit incrementally so each step is revertible.
+
+Pause and ask only if one of the following happens:
+- A device hang or unrecoverable state (see Hang recovery below).
+- `tt-smi` reports hardware errors, or the smoke test fails and you cannot diagnose it from the remote logs.
+- A destructive action is needed (force push, wiping caches, removing weights, `rm -rf` beyond per-run scratch files).
+- You hit an ambiguity that would meaningfully change the architecture (e.g. choosing a fundamentally different sharding scheme than the references suggest).
+
+Everything else — naming, file structure, minor refactors, choice of initial offload target, which kernel to write first — is yours to decide.
+
 ## Setup (do this first, every session)
 
 Load these skills before doing any work:
