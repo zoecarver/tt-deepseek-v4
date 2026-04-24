@@ -953,16 +953,24 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]):
         residual = x
-        x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        x = self.attn_norm(x)
-        x = self.attn(x, start_pos)
-        x = self.hc_post(x, residual, post, comb)
+        with _phase("block.hc_pre"):
+            x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        with _phase("block.norm"):
+            x = self.attn_norm(x)
+        with _phase("block.attn"):
+            x = self.attn(x, start_pos)
+        with _phase("block.hc_post"):
+            x = self.hc_post(x, residual, post, comb)
 
         residual = x
-        x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
+        with _phase("block.hc_pre"):
+            x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        with _phase("block.norm"):
+            x = self.ffn_norm(x)
+        with _phase("block.ffn"):
+            x = self.ffn(x, input_ids)
+        with _phase("block.hc_post"):
+            x = self.hc_post(x, residual, post, comb)
         return x
 
 
