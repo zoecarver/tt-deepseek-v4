@@ -805,17 +805,21 @@ class Attention(nn.Module):
             if self.compress_ratio:
                 if (kv_compress := self.compressor(x, start_pos)) is not None:
                     kv = torch.cat([kv, kv_compress], dim=1)
-            o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+            o = self._sparse_attn(q, kv, topk_idxs)
         else:
             self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio:
                 self.compressor(x, start_pos)
-            o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
+            o = self._sparse_attn(q, self.kv_cache[:bsz], topk_idxs)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
         o = self._wo_a_grouped(o)
         x = self.wo_b(o.flatten(2))
         return x
+
+    def _sparse_attn(self, q: torch.Tensor, kv: torch.Tensor, topk_idxs: torch.Tensor) -> torch.Tensor:
+        """Default CPU path; offload_sparse_attn swaps for a device path."""
+        return sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
 
     def _wo_a_grouped(self, o: torch.Tensor) -> torch.Tensor:
         """Block-diagonal per-group linear: [B,S,G,D] -> [B,S,G,R].
@@ -1671,6 +1675,110 @@ class DeviceSharedExpert(nn.Module):
         return y.to(x.dtype)
 
 
+class DeviceSparseAttn(nn.Module):
+    """V4-Flash sparse_attn on a 1xN mesh (replicated attn_sink).
+
+    Drop-in replacement for `sparse_attn(q, kv, attn_sink, topk_idxs, scale)`.
+    Inputs uploaded per-call (replicated), output read back from chip 0.
+
+    Compute is identical to the CPU reference: gather kv at topk indices via
+    ttnn.embedding, score matmul, additive mask for `-1` slots, concat sink,
+    softmax, drop sink, weighted sum. ttnn.embedding sees [N, D] kv (batch=1
+    squeezed) and uint32 indices.
+    """
+
+    def __init__(self, mesh, attn_sink: torch.Tensor, softmax_scale: float):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        self.softmax_scale = float(softmax_scale)
+        self.n_heads = attn_sink.shape[0]
+        sink_4d = attn_sink.to(torch.bfloat16).view(1, 1, self.n_heads, 1).contiguous()
+        self.sink_tt = ttnn.as_tensor(
+            sink_4d,
+            device=mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        topk_idxs: torch.Tensor,
+    ) -> torch.Tensor:
+        ttnn = self._ttnn
+        B, S, H, D = q.shape
+        if H != self.n_heads:
+            raise ValueError(f"q heads {H} != attn_sink heads {self.n_heads}")
+        if B != 1:
+            raise ValueError(f"DeviceSparseAttn only supports B=1, got B={B}")
+        N = kv.shape[1]
+        K = topk_idxs.shape[-1]
+
+        common_rep = dict(
+            device=self.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+
+        q_tt = ttnn.as_tensor(q.to(torch.bfloat16).contiguous(), **common_rep)
+        # kv: [N, D] for embedding lookup
+        kv_tt = ttnn.as_tensor(kv.squeeze(0).to(torch.bfloat16).contiguous(), **common_rep)
+
+        # Indices: [B, S*K] for embedding; clamp_min(0) so masked slots are safe
+        safe = topk_idxs.clamp_min(0).reshape(B, S * K).to(torch.int32).contiguous()
+        idxs_tt = ttnn.as_tensor(
+            safe,
+            device=self.mesh,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            dtype=ttnn.uint32,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+
+        # valid mask: 0 for valid, -inf for masked. Shape [B, S, 1, K] broadcasts over heads.
+        valid = torch.where(
+            topk_idxs >= 0,
+            torch.zeros((), dtype=torch.bfloat16),
+            torch.tensor(float("-inf"), dtype=torch.bfloat16),
+        ).view(B, S, 1, K).contiguous()
+        valid_tt = ttnn.as_tensor(valid, **common_rep)
+
+        # Sink scores: broadcast attn_sink [1,1,H,1] to [1,S,H,1] for concat over S>1.
+        # For S=1 we can use sink_tt directly.
+        if S == 1:
+            sink_for_concat = self.sink_tt
+        else:
+            sink_for_concat = ttnn.repeat(self.sink_tt, ttnn.Shape([1, S, 1, 1]))
+
+        # Gather: [B, S*K] x [N, D] -> [B, S*K, D]
+        kv_gather = ttnn.embedding(idxs_tt, kv_tt, layout=ttnn.TILE_LAYOUT)
+        kv_gather = ttnn.reshape(kv_gather, [B, S, K, D])
+
+        # Scores: q [1,S,H,D] @ kv_gather.T [1,S,D,K] -> [1,S,H,K]
+        kv_gather_t = ttnn.transpose(kv_gather, -2, -1)
+        scores = ttnn.matmul(q_tt, kv_gather_t)
+        scores = ttnn.multiply(scores, self.softmax_scale)
+        scores = ttnn.add(scores, valid_tt)
+
+        full = ttnn.concat([scores, sink_for_concat], dim=-1)
+        probs_full = ttnn.softmax(full, dim=-1)
+        probs = ttnn.slice(probs_full, [0, 0, 0, 0], [B, S, H, K])
+
+        out_tt = ttnn.matmul(probs, kv_gather)
+
+        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
+        out = ttnn.to_torch(out_tt, mesh_composer=composer)[:B]
+        return out.to(q.dtype)
+
+
 def _open_mesh(shape=(1, 4)):
     import ttnn
     return ttnn.open_mesh_device(ttnn.MeshShape(*shape))
@@ -1999,6 +2107,25 @@ class Model:
             attn._wo_a_grouped = _device_wo_a_call.__get__(attn, type(attn))
             self._device_wo_a.append(dg)
 
+    def offload_sparse_attn(self, mesh):
+        """Run sparse_attn on the 1xN mesh per layer.
+
+        Replaces Attention._sparse_attn with a DeviceSparseAttn callable that
+        uploads (q, kv, topk_idxs), runs gather+score-matmul+masked-softmax+
+        weighted-sum on device, and reads back o from chip 0. Per-call round-
+        trips remain — they collapse once the rest of attn moves on-device.
+        """
+        self._device_sparse_attn = []
+        for layer in self.transformer.layers:
+            attn = layer.attn
+            dsa = DeviceSparseAttn(mesh, attn.attn_sink, attn.softmax_scale)
+
+            def _device_sparse_attn_call(self_attn, q, kv, topk_idxs, _dsa=dsa):
+                return _dsa(q, kv, topk_idxs)
+
+            attn._sparse_attn = _device_sparse_attn_call.__get__(attn, type(attn))
+            self._device_sparse_attn.append(dsa)
+
     def offload_rms_norms(self, mesh):
         """Move attn_norm, ffn_norm, q_norm, kv_norm on every Block to the 1xN mesh.
 
@@ -2243,6 +2370,8 @@ def main():
                         help="Col-parallel shard Compressor.wkv + wgate on 1x4 mesh (per layer)")
     parser.add_argument("--offload-indexer-linears", action="store_true",
                         help="Col-parallel shard Indexer.wq_b + weights_proj on 1x4 mesh (per layer)")
+    parser.add_argument("--offload-sparse-attn", action="store_true",
+                        help="Run sparse_attn (gather+score+masked-softmax+weighted-sum) on 1x4 mesh per layer")
     parser.add_argument("--weights-cache",
                         default=os.environ.get("DS_WEIGHTS_CACHE",
                                                "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
@@ -2277,6 +2406,7 @@ def main():
         or args.offload_embedding
         or args.offload_compressor_linears
         or args.offload_indexer_linears
+        or args.offload_sparse_attn
     )
     if need_mesh:
         print("[phase] opening 1x4 mesh ...")
@@ -2344,6 +2474,11 @@ def main():
         t0 = time.time()
         model.offload_indexer_linears(mesh)
         print(f"[phase] indexer_linears offloaded in {time.time() - t0:.1f}s")
+    if args.offload_sparse_attn:
+        print(f"[phase] binding device sparse_attn across {n_layers} layers on mesh ...")
+        t0 = time.time()
+        model.offload_sparse_attn(mesh)
+        print(f"[phase] sparse_attn offloaded in {time.time() - t0:.1f}s")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")
