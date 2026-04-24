@@ -208,15 +208,7 @@ def _test_shape(device, ttnn, torch, n0, n1, mhc, repeat, eps, threshold):
     em_tt = ttnn.from_torch(em, **common)
     sc_tt = ttnn.from_torch(sc, **common)
 
-    import time
-    # Warm-up (JIT compile + first launch) then time a second run.
     solve(x_tt, mask_tt, em_tt, sc_tt, out_tt, repeat=repeat, eps=eps)
-    ttnn.synchronize_device(device)
-    t0 = time.perf_counter()
-    solve(x_tt, mask_tt, em_tt, sc_tt, out_tt, repeat=repeat, eps=eps)
-    ttnn.synchronize_device(device)
-    dt_ms = (time.perf_counter() - t0) * 1000
-    print(f"  kernel_time: {dt_ms:.3f} ms  ({num_slices / dt_ms * 1000:,.0f} slices/s)")
 
     out_packed = ttnn.to_torch(out_tt)
     y_tt = unpack_4x4_slices(out_packed, num_slices).reshape(n0, n1, mhc, mhc)
