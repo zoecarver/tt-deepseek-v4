@@ -1214,6 +1214,13 @@ class DeviceColLinear(nn.Module):
             y = y[:, :S]
         return y.to(torch.bfloat16)
 
+    def forward_device(self, x_tt) -> "object":
+        """Device-only path. x_tt: replicated input. Returns replicated output
+        (full out_dim on every chip) via all_gather along the sharded axis."""
+        ttnn = self._ttnn
+        y_sharded = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        return ttnn.all_gather(y_sharded, dim=-1, num_links=1)
+
 
 class DeviceRowLinear(nn.Module):
     """Row-parallel linear across a 1xN mesh with all-reduce sum.
@@ -1590,12 +1597,31 @@ class DeviceRMSNorm(nn.Module):
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
         x_tt = ttnn.as_tensor(x2.contiguous(), **rep)
-        out_tt = ttnn.as_tensor(torch.zeros_like(x2), **rep)
-        self._kernel(Mt)(x_tt, self.gamma_tt, self.sc_tt, out_tt)
+        out_tt = self.forward_device(x_tt, M)
 
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
         y = ttnn.to_torch(out_tt, mesh_composer=composer)[:M]
         return y.view(*orig_shape).to(x.dtype)
+
+    def forward_device(self, x_tt, num_rows: int):
+        """Device-only path: x_tt must be a [Mpad, hidden] device tensor with
+        Mpad rows (TILE-aligned). Returns a same-shape device tensor. Caller
+        is responsible for any padding and for slicing rows back to num_rows.
+
+        num_rows is the unpadded row count and only selects the kernel
+        variant (M_tiles = ceil(num_rows / TILE)).
+        """
+        ttnn = self._ttnn
+        Mt = -(-num_rows // _RMS_TILE)
+        out_tt = ttnn.zeros(
+            shape=tuple(x_tt.shape),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.mesh,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        self._kernel(Mt)(x_tt, self.gamma_tt, self.sc_tt, out_tt)
+        return out_tt
 
 
 class DeviceSharedExpert(nn.Module):
@@ -1717,8 +1743,6 @@ class DeviceSparseAttn(nn.Module):
             raise ValueError(f"q heads {H} != attn_sink heads {self.n_heads}")
         if B != 1:
             raise ValueError(f"DeviceSparseAttn only supports B=1, got B={B}")
-        N = kv.shape[1]
-        K = topk_idxs.shape[-1]
 
         common_rep = dict(
             device=self.mesh,
@@ -1727,12 +1751,20 @@ class DeviceSparseAttn(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
-
         q_tt = ttnn.as_tensor(q.to(torch.bfloat16).contiguous(), **common_rep)
-        # kv: [N, D] for embedding lookup
         kv_tt = ttnn.as_tensor(kv.squeeze(0).to(torch.bfloat16).contiguous(), **common_rep)
+        idxs_tt, valid_tt = self._upload_topk(topk_idxs)
 
-        # Indices: [B, S*K] for embedding; clamp_min(0) so masked slots are safe
+        out_tt = self.forward_device(q_tt, kv_tt, idxs_tt, valid_tt, S, topk_idxs.shape[-1])
+        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
+        out = ttnn.to_torch(out_tt, mesh_composer=composer)[:B]
+        return out.to(q.dtype)
+
+    def _upload_topk(self, topk_idxs: torch.Tensor):
+        """Upload topk_idxs and the additive -inf mask. Returns (idxs_tt uint32
+        [B, S*K] row-major, valid_tt bf16 [B, S, 1, K] tile)."""
+        ttnn = self._ttnn
+        B, S, K = topk_idxs.shape
         safe = topk_idxs.clamp_min(0).reshape(B, S * K).to(torch.int32).contiguous()
         idxs_tt = ttnn.as_tensor(
             safe,
@@ -1742,27 +1774,37 @@ class DeviceSparseAttn(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
-
-        # valid mask: 0 for valid, -inf for masked. Shape [B, S, 1, K] broadcasts over heads.
         valid = torch.where(
             topk_idxs >= 0,
             torch.zeros((), dtype=torch.bfloat16),
             torch.tensor(float("-inf"), dtype=torch.bfloat16),
         ).view(B, S, 1, K).contiguous()
-        valid_tt = ttnn.as_tensor(valid, **common_rep)
+        valid_tt = ttnn.as_tensor(
+            valid,
+            device=self.mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        return idxs_tt, valid_tt
 
-        # Sink scores: broadcast attn_sink [1,1,H,1] to [1,S,H,1] for concat over S>1.
-        # For S=1 we can use sink_tt directly.
+    def forward_device(self, q_tt, kv_tt, idxs_tt, valid_tt, S: int, K: int):
+        """Device-only sparse_attn. q_tt: [1,S,H,D] tile; kv_tt: [N,D] tile;
+        idxs_tt: [1, S*K] uint32 row-major; valid_tt: [1,S,1,K] tile additive
+        mask. Returns o_tt [1,S,H,D] tile (replicated)."""
+        ttnn = self._ttnn
+        B = 1
+        H = self.n_heads
+        D = tuple(kv_tt.shape)[-1]
         if S == 1:
             sink_for_concat = self.sink_tt
         else:
             sink_for_concat = ttnn.repeat(self.sink_tt, ttnn.Shape([1, S, 1, 1]))
 
-        # Gather: [B, S*K] x [N, D] -> [B, S*K, D]
         kv_gather = ttnn.embedding(idxs_tt, kv_tt, layout=ttnn.TILE_LAYOUT)
         kv_gather = ttnn.reshape(kv_gather, [B, S, K, D])
 
-        # Scores: q [1,S,H,D] @ kv_gather.T [1,S,D,K] -> [1,S,H,K]
         kv_gather_t = ttnn.transpose(kv_gather, -2, -1)
         scores = ttnn.matmul(q_tt, kv_gather_t)
         scores = ttnn.multiply(scores, self.softmax_scale)
@@ -1771,22 +1813,308 @@ class DeviceSparseAttn(nn.Module):
         full = ttnn.concat([scores, sink_for_concat], dim=-1)
         probs_full = ttnn.softmax(full, dim=-1)
         probs = ttnn.slice(probs_full, [0, 0, 0, 0], [B, S, H, K])
+        return ttnn.matmul(probs, kv_gather)
 
-        out_tt = ttnn.matmul(probs, kv_gather)
 
+def _device_apply_rotary_interleaved(ttnn, x_tt, cos_pair_tt, sin_pair_tt, inverse: bool = False):
+    """Manual interleaved rotary on a device tensor.
+
+    Matches V4-Flash's view_as_complex format: x[..., rd] is reshaped to
+    [..., rd/2, 2] where the trailing 2 holds (real, imag) of one rotary
+    pair; cos_pair / sin_pair are [..., rd/2] broadcast tables.
+
+      forward:  (a, b) -> (a*cos - b*sin, a*sin + b*cos)
+      inverse:  (a, b) -> (a*cos + b*sin, -a*sin + b*cos)
+    """
+    out_shape = list(x_tt.shape)
+    rd = out_shape[-1]
+    pair_shape = out_shape[:-1] + [rd // 2, 2]
+    x_pairs = ttnn.reshape(x_tt, pair_shape)
+    pre = [0] * (len(pair_shape) - 1)
+    real = ttnn.slice(x_pairs, pre + [0], list(pair_shape[:-1]) + [1])
+    imag = ttnn.slice(x_pairs, pre + [1], list(pair_shape[:-1]) + [2])
+    # Add a trailing 1 dim to broadcast cos/sin across the (real, imag) pair.
+    cos_shape_b = list(cos_pair_tt.shape) + [1]
+    sin_shape_b = list(sin_pair_tt.shape) + [1]
+    cos_b = ttnn.reshape(cos_pair_tt, cos_shape_b)
+    sin_b = ttnn.reshape(sin_pair_tt, sin_shape_b)
+    if inverse:
+        new_real = ttnn.add(ttnn.multiply(real, cos_b), ttnn.multiply(imag, sin_b))
+        new_imag = ttnn.subtract(ttnn.multiply(imag, cos_b), ttnn.multiply(real, sin_b))
+    else:
+        new_real = ttnn.subtract(ttnn.multiply(real, cos_b), ttnn.multiply(imag, sin_b))
+        new_imag = ttnn.add(ttnn.multiply(real, sin_b), ttnn.multiply(imag, cos_b))
+    paired = ttnn.concat([new_real, new_imag], dim=-1)
+    return ttnn.reshape(paired, out_shape)
+
+
+def _device_q_rsqrt_norm(ttnn, q_tt, eps: float):
+    """Per-head rsqrt-norm: q *= rsqrt(mean(q^2, last) + eps).
+
+    q_tt: [B, S, H, D]. mean is taken over D. Returns same shape.
+    """
+    sq = ttnn.multiply(q_tt, q_tt)
+    mean_sq = ttnn.mean(sq, dim=-1, keepdim=True)
+    inv = ttnn.rsqrt(ttnn.add(mean_sq, eps))
+    return ttnn.multiply(q_tt, inv)
+
+
+class DeviceAttention(nn.Module):
+    """Fused MLA attention forward on a 1xN mesh (decode path device-resident).
+
+    Owns nothing but small tables (cos/sin, attn_sink, kv_norm/q_norm) and
+    references to the existing per-attn DeviceColLinear / DeviceGroupedLinear
+    instances. Reuses `DeviceRMSNorm.forward_device` for q_norm/kv_norm,
+    `DeviceColLinear.forward_device` for wq_a/wq_b/wkv/wo_b,
+    `DeviceGroupedLinear.forward_device` for wo_a, and
+    `DeviceSparseAttn.forward_device` for sparse_attn.
+
+    Decode path (start_pos > 0, seqlen == 1): one upload of x, end-to-end
+    on device, one download. CPU side effects (act_quant, kv_cache update,
+    indexer/compressor) get small download/upload trips in the middle.
+
+    Prefill path (start_pos == 0): falls back to the original CPU forward.
+    """
+
+    def __init__(self, mesh, attn, sparse_attn_dev: "DeviceSparseAttn",
+                 q_norm_dev: "DeviceRMSNorm", kv_norm_dev: "DeviceRMSNorm",
+                 wo_a_cpu_weight: torch.Tensor, max_seq_len: int):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        self.attn = attn
+        self.sparse_attn_dev = sparse_attn_dev
+        self.q_norm_dev = q_norm_dev
+        self.kv_norm_dev = kv_norm_dev
+        self.dim = attn.dim
+        self.n_heads = attn.n_local_heads
+        self.head_dim = attn.head_dim
+        self.rope_head_dim = attn.rope_head_dim
+        self.q_lora_rank = attn.q_lora_rank
+        self.n_groups = attn.n_local_groups
+        self.o_lora_rank = attn.o_lora_rank
+        self.softmax_scale = float(attn.softmax_scale)
+        self.eps = float(attn.eps)
+        self.window_size = attn.window_size
+        self.compress_ratio = attn.compress_ratio
+
+        # cos/sin tables: real and imag of freqs_cis (complex64). Replicated.
+        # Shape: [max_seq_len, rd/2]. We slice [start_pos:start_pos+1] per call.
+        rd = self.rope_head_dim
+        fc = attn.freqs_cis  # [max_seq_len, rd/2] complex
+        cos_full = fc.real.to(torch.bfloat16).contiguous()
+        sin_full = fc.imag.to(torch.bfloat16).contiguous()
+        rep = dict(
+            device=mesh,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        self.cos_full_tt = ttnn.as_tensor(cos_full, **rep)
+        self.sin_full_tt = ttnn.as_tensor(sin_full, **rep)
+        self.max_seq_len = cos_full.shape[0]
+
+        # wo_a: replicated [n_groups, in_per_group, o_lora_rank] (block-diagonal).
+        # Original CPU weight: [n_groups * o_lora_rank, in_per_group].
+        out_total, in_per_group = wo_a_cpu_weight.shape
+        if out_total != self.n_groups * self.o_lora_rank:
+            raise ValueError(
+                f"wo_a shape {tuple(wo_a_cpu_weight.shape)} != expected "
+                f"({self.n_groups * self.o_lora_rank}, in_per_group)"
+            )
+        self.wo_a_in_per_group = in_per_group
+        w_g = wo_a_cpu_weight.to(torch.bfloat16).view(
+            self.n_groups, self.o_lora_rank, in_per_group
+        ).transpose(1, 2).contiguous()  # [G, in, R]
+        self.wo_a_w_tt = ttnn.as_tensor(w_g, **rep)
+
+    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """Decode-only fused forward. Falls back to CPU for prefill."""
+        attn = self.attn
+        bsz, seqlen, _ = x.shape
+        if start_pos == 0 or seqlen != 1:
+            return self._cpu_forward(x, start_pos)
+        return self._decode(x, start_pos)
+
+    def _cpu_forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """Fallback: invoke the original Attention.forward via the saved
+        bound method. The Model wires this in offload_attn_full."""
+        return self._orig_forward(x, start_pos)
+
+    def _decode(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+        ttnn = self._ttnn
+        attn = self.attn
+        B, S, _ = x.shape
+        H, D = self.n_heads, self.head_dim
+        rd = self.rope_head_dim
+        win = self.window_size
+
+        # Single upload of x.
+        x_tt = ttnn.as_tensor(
+            x.to(torch.bfloat16).contiguous(),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+
+        # Q path: wq_a -> q_norm -> wq_b -> per-head rsqrt-norm -> rotary.
+        q_lora_tt = attn.wq_a.forward_device(x_tt)            # [B, S, q_lora_rank]
+        # q_norm: needs a [Mpad, hidden] device tensor. Reshape and pad-on-device.
+        q_lora_2d = ttnn.reshape(q_lora_tt, [B * S, self.q_lora_rank])
+        qr_2d = self._rmsnorm_device(self.q_norm_dev, q_lora_2d, B * S)
+        qr_tt = ttnn.reshape(qr_2d, [B, S, self.q_lora_rank])
+        # Save qr for the indexer (it needs CPU qr).
+        qr_cpu = self._download_replicated(qr_tt, B, S, self.q_lora_rank)
+
+        q_full_tt = attn.wq_b.forward_device(qr_tt)           # [B, S, H*D]
+        q_tt = ttnn.reshape(q_full_tt, [B, S, H, D])
+        q_tt = _device_q_rsqrt_norm(ttnn, q_tt, self.eps)
+
+        cos_q, sin_q = self._rotary_tables(start_pos, S, q_dims=4)
+        # Rotate q[..., -rd:] by slicing -> rotating -> concatenating.
+        q_nope = ttnn.slice(q_tt, [0, 0, 0, 0], [B, S, H, D - rd])
+        q_rope = ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, S, H, D])
+        q_rope = _device_apply_rotary_interleaved(ttnn, q_rope, cos_q, sin_q, inverse=False)
+        q_tt = ttnn.concat([q_nope, q_rope], dim=-1)
+
+        # KV path: wkv -> kv_norm -> rotary.
+        kv_tt = attn.wkv.forward_device(x_tt)                 # [B, S, D]
+        kv_2d = ttnn.reshape(kv_tt, [B * S, D])
+        kv_2d = self._rmsnorm_device(self.kv_norm_dev, kv_2d, B * S)
+        kv_tt = ttnn.reshape(kv_2d, [B, S, D])
+        cos_kv, sin_kv = self._rotary_tables(start_pos, S, q_dims=3)
+        kv_nope = ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd])
+        kv_rope = ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D])
+        kv_rope = _device_apply_rotary_interleaved(ttnn, kv_rope, cos_kv, sin_kv, inverse=False)
+        kv_tt = ttnn.concat([kv_nope, kv_rope], dim=-1)
+
+        # Round-trip kv to CPU for in-place act_quant and CPU side effects
+        # (kv_cache update, compressor, indexer).
+        kv_cpu = self._download_replicated(kv_tt, B, S, D).to(x.dtype)
+        act_quant(kv_cpu[..., :-rd], 64, scale_fmt, scale_dtype, True)
+
+        topk_idxs = get_window_topk_idxs(win, B, S, start_pos)
+        if self.compress_ratio:
+            offset = win
+            if attn.indexer is not None:
+                compress_topk_idxs = attn.indexer(x, qr_cpu, start_pos, offset)
+            else:
+                compress_topk_idxs = get_compress_topk_idxs(
+                    self.compress_ratio, B, S, start_pos, offset)
+            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+        topk_idxs = topk_idxs.int()
+
+        # KV cache update on CPU.
+        attn.kv_cache[:B, start_pos % win] = kv_cpu.squeeze(1)
+        if self.compress_ratio:
+            attn.compressor(x, start_pos)
+        kv_full_cpu = attn.kv_cache[:B]  # [B, kv_cache_size, D]
+
+        # Sparse_attn back on device.
+        common_rep = dict(
+            device=self.mesh, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        kv_full_tt = ttnn.as_tensor(
+            kv_full_cpu.squeeze(0).to(torch.bfloat16).contiguous(), **common_rep,
+        )
+        idxs_tt, valid_tt = self.sparse_attn_dev._upload_topk(topk_idxs)
+        K = topk_idxs.shape[-1]
+        o_tt = self.sparse_attn_dev.forward_device(
+            q_tt, kv_full_tt, idxs_tt, valid_tt, S, K
+        )
+        # o_tt: [B, S, H, D].
+
+        # Inverse rotary on o[..., -rd:].
+        cos_o, sin_o = self._rotary_tables(start_pos, S, q_dims=4)
+        o_nope = ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H, D - rd])
+        o_rope = ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H, D])
+        o_rope = _device_apply_rotary_interleaved(ttnn, o_rope, cos_o, sin_o, inverse=True)
+        o_tt = ttnn.concat([o_nope, o_rope], dim=-1)
+
+        # Group reshape: [B, S, H, D] -> [G, B*S, H*D/G] for batched matmul.
+        per_group = (H * D) // self.n_groups
+        if per_group != self.wo_a_in_per_group:
+            raise RuntimeError(
+                f"wo_a in_per_group {self.wo_a_in_per_group} != H*D/G {per_group}"
+            )
+        o_perm = ttnn.reshape(o_tt, [B, S, self.n_groups, per_group])
+        # Permute to [G, B, S, in_per_group] then merge B*S.
+        o_perm = ttnn.permute(o_perm, [2, 0, 1, 3])
+        o_g = ttnn.reshape(o_perm, [self.n_groups, B * S, per_group])
+        # Block-diag matmul: [G, B*S, in] @ [G, in, R] -> [G, B*S, R]
+        o_wo_a_g = ttnn.matmul(o_g, self.wo_a_w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        # Reshape back to [B, S, G, R] then flatten last two dims.
+        o_wo_a_rs = ttnn.reshape(o_wo_a_g, [self.n_groups, B, S, self.o_lora_rank])
+        o_wo_a = ttnn.permute(o_wo_a_rs, [1, 2, 0, 3])  # [B, S, G, R]
+        R = self.o_lora_rank
+        o_flat = ttnn.reshape(o_wo_a, [B, S, self.n_groups * R])
+        out_tt = attn.wo_b.forward_device(o_flat)             # [B, S, dim]
+
+        # Download once.
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
         out = ttnn.to_torch(out_tt, mesh_composer=composer)[:B]
-        return out.to(q.dtype)
+        return out.to(x.dtype)
+
+    def _rmsnorm_device(self, norm_dev: "DeviceRMSNorm", x_2d_tt, num_rows: int):
+        """Run device rmsnorm on a 2D [M, hidden] device tensor. Pads M to TILE
+        on device, runs the kernel, then slices the output back to [num_rows,
+        hidden]."""
+        ttnn = self._ttnn
+        Mpad = -(-num_rows // _RMS_TILE) * _RMS_TILE
+        cur_M = tuple(x_2d_tt.shape)[0]
+        hidden = tuple(x_2d_tt.shape)[1]
+        if cur_M < Mpad:
+            x_2d_tt = ttnn.pad(
+                x_2d_tt,
+                padding=[(0, Mpad - cur_M), (0, 0)],
+                value=0.0,
+            )
+        out = norm_dev.forward_device(x_2d_tt, num_rows)
+        if num_rows < Mpad:
+            out = ttnn.slice(out, [0, 0], [num_rows, hidden])
+        return out
+
+    def _rotary_tables(self, start_pos: int, S: int, q_dims: int):
+        """Slice cos/sin tables for [start_pos:start_pos+S] and reshape for
+        broadcasting against q (4D, [B,S,H,rd/2,1] post-unsqueeze) or kv
+        (3D, [B,S,rd/2,1])."""
+        ttnn = self._ttnn
+        rd_half = self.rope_head_dim // 2
+        cos = ttnn.slice(self.cos_full_tt, [start_pos, 0], [start_pos + S, rd_half])
+        sin = ttnn.slice(self.sin_full_tt, [start_pos, 0], [start_pos + S, rd_half])
+        if q_dims == 4:
+            cos = ttnn.reshape(cos, [1, S, 1, rd_half])
+            sin = ttnn.reshape(sin, [1, S, 1, rd_half])
+        else:  # q_dims == 3
+            cos = ttnn.reshape(cos, [1, S, rd_half])
+            sin = ttnn.reshape(sin, [1, S, rd_half])
+        return cos, sin
+
+    def _download_replicated(self, t_tt, *expected_shape):
+        """Read back a replicated tensor (chip 0's copy via concat-on-dim0
+        composer trick used elsewhere in this file)."""
+        ttnn = self._ttnn
+        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
+        t = ttnn.to_torch(t_tt, mesh_composer=composer)
+        return t[:expected_shape[0]] if expected_shape else t
 
 
 def _open_mesh(shape=(1, 4)):
+    """Open a mesh device. Enables 1D fabric for CCL ops (all_gather etc.)."""
     import ttnn
+    ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D, ttnn.FabricReliabilityMode.RELAXED_INIT)
     return ttnn.open_mesh_device(ttnn.MeshShape(*shape))
 
 
 def _close_mesh(mesh):
     import ttnn
     ttnn.close_mesh_device(mesh)
+    ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
 
 
 # ==============================================================================
@@ -2290,6 +2618,61 @@ class Model:
             attn.wo_b = dw
             self._device_wo_b.append(dw)
 
+    def offload_attn_full(self, mesh):
+        """Fused end-to-end attention forward on device (decode path).
+
+        Requires every attention sub-piece already offloaded:
+          --offload-attn-wq-a / --offload-attn-wq-b / --offload-attn-wkv
+          --offload-attn-wo-a / --offload-attn-wo-b
+          --offload-rms-norms (q_norm/kv_norm device-resident)
+          --offload-sparse-attn
+
+        Replaces Attention.forward with DeviceAttention.forward, which
+        consolidates the per-step Q/KV/O paths into a single upload+download.
+        Prefill (start_pos == 0) falls back to the original CPU forward.
+        """
+        self._device_attn_full = []
+        for layer in self.transformer.layers:
+            attn = layer.attn
+            for w_attr in ("wq_a", "wq_b", "wkv", "wo_b"):
+                w = getattr(attn, w_attr)
+                if not isinstance(w, DeviceColLinear):
+                    raise RuntimeError(
+                        f"offload_attn_full requires {w_attr} on device "
+                        f"(use --offload-attn-{w_attr.replace('_', '-')})"
+                    )
+            if not hasattr(self, "_device_sparse_attn"):
+                raise RuntimeError(
+                    "offload_attn_full requires --offload-sparse-attn"
+                )
+            if not hasattr(self, "_device_rms_norms"):
+                raise RuntimeError(
+                    "offload_attn_full requires --offload-rms-norms (q_norm/kv_norm)"
+                )
+            sparse_dev = self._device_sparse_attn[layer.layer_id]
+            # q_norm/kv_norm DeviceRMSNorm instances are appended in the order
+            # (attn_norm, ffn_norm, q_norm, kv_norm) per layer in offload_rms_norms.
+            base = layer.layer_id * 4
+            q_norm_dev = self._device_rms_norms[base + 2]
+            kv_norm_dev = self._device_rms_norms[base + 3]
+
+            # wo_a: take the CPU weight as our authoritative source. This works
+            # whether or not --offload-attn-wo-a was set (DeviceGroupedLinear
+            # does not wipe attn.wo_a.weight).
+            da = DeviceAttention(
+                mesh=mesh,
+                attn=attn,
+                sparse_attn_dev=sparse_dev,
+                q_norm_dev=q_norm_dev,
+                kv_norm_dev=kv_norm_dev,
+                wo_a_cpu_weight=attn.wo_a.weight.detach(),
+                max_seq_len=attn.freqs_cis.shape[0],
+            )
+            # Save the original CPU forward so prefill can fall back.
+            da._orig_forward = attn.forward
+            attn.forward = da.forward
+            self._device_attn_full.append(da)
+
     @torch.inference_mode()
     def step_decode(self, token_id: int, pos: int) -> torch.Tensor:
         """Single decode step. Returns logits [vocab_size]."""
@@ -2372,6 +2755,9 @@ def main():
                         help="Col-parallel shard Indexer.wq_b + weights_proj on 1x4 mesh (per layer)")
     parser.add_argument("--offload-sparse-attn", action="store_true",
                         help="Run sparse_attn (gather+score+masked-softmax+weighted-sum) on 1x4 mesh per layer")
+    parser.add_argument("--offload-attn-full", action="store_true",
+                        help="Fused MLA attention forward on device (decode path only). "
+                             "Requires all attn sub-pieces already offloaded.")
     parser.add_argument("--weights-cache",
                         default=os.environ.get("DS_WEIGHTS_CACHE",
                                                "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
@@ -2407,6 +2793,7 @@ def main():
         or args.offload_compressor_linears
         or args.offload_indexer_linears
         or args.offload_sparse_attn
+        or args.offload_attn_full
     )
     if need_mesh:
         print("[phase] opening 1x4 mesh ...")
@@ -2479,6 +2866,11 @@ def main():
         t0 = time.time()
         model.offload_sparse_attn(mesh)
         print(f"[phase] sparse_attn offloaded in {time.time() - t0:.1f}s")
+    if args.offload_attn_full:
+        print(f"[phase] binding fused DeviceAttention across {n_layers} layers on mesh ...")
+        t0 = time.time()
+        model.offload_attn_full(mesh)
+        print(f"[phase] attn_full offloaded in {time.time() - t0:.1f}s")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")
