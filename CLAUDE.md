@@ -101,6 +101,9 @@ Only these sibling directories are in scope for exploration:
 - `../oasis-ttlang`
 - `../tt-lang-import`
 
+In-repo reference:
+- `./TileKernels` — DeepSeek's reference tilelang kernels for important ops (FP8/FP4 GEMM, sparse attention, HC Sinkhorn, etc.). **Reference only.** Tilelang does not run on Tenstorrent hardware, so these kernels cannot be used as-is. Consult them to understand the intended compute/dataflow, then re-implement in tt-lang for the device.
+
 Rules:
 - Do **not** explore `tt-lang/third_party/` (or any `third_party/` inside these repos). The authoritative copy of `tt-metal` lives at `../tt-metal`, which is more up to date than any vendored copy.
 - Do **not** do global searches across `~` or `~/Developer`. Stay inside this repo and the six paths above.
