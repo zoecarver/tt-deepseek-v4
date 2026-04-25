@@ -2882,6 +2882,15 @@ class DeviceAttention(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._upload_mapper,
         )
+        # Window topk indices [B, S, win] int32. Always present on the
+        # device-indexer path; the per-step values change but shape is
+        # pinned by the model's window_size.
+        self._win_idxs_upload_tt = ttnn.from_torch(
+            torch.zeros(B, 1, self.window_size, dtype=torch.int32),
+            device=self.mesh, dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._upload_mapper,
+        )
 
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         """Single-token forward. Prefill is driven externally as a per-token
@@ -2989,13 +2998,17 @@ class DeviceAttention(nn.Module):
                     cmp_idxs_int = ttnn.typecast(cmp_idxs_tt, dtype=ttnn.int32)
                     cmp_idxs_int = ttnn.add(cmp_idxs_int, offset)
                     win_idxs_torch = topk_idxs.to(torch.int32).contiguous()
-                    win_idxs_tt = ttnn.from_torch(
-                        win_idxs_torch, device=self.mesh, dtype=ttnn.int32,
+                    win_host_mesh = ttnn.from_torch(
+                        win_idxs_torch, dtype=ttnn.int32,
                         layout=ttnn.TILE_LAYOUT,
-                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                        mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+                        mesh_mapper=self._upload_mapper,
                     )
-                    topk_idxs_dev = ttnn.concat([win_idxs_tt, cmp_idxs_int], dim=-1)
+                    ttnn.copy_host_to_device_tensor(
+                        win_host_mesh, self._win_idxs_upload_tt
+                    )
+                    topk_idxs_dev = ttnn.concat(
+                        [self._win_idxs_upload_tt, cmp_idxs_int], dim=-1
+                    )
                     topk_idxs_dev_K = win + k
                     topk_idxs = None
             else:
