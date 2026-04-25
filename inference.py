@@ -530,25 +530,23 @@ class Block(nn.Module):
             self.hc_ffn_scale = nn.Parameter(torch.empty(3))
 
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]):
-        residual = x
         with _phase("block.hc_pre"):
-            x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+            x = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         with _phase("block.norm"):
             x = self.attn_norm(x)
         with _phase("block.attn"):
             x = self.attn(x, start_pos)
         with _phase("block.hc_post"):
-            x = self.hc_post(x, residual, post, comb)
+            x = self.hc_post(x)
 
-        residual = x
         with _phase("block.hc_pre"):
-            x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+            x = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         with _phase("block.norm"):
             x = self.ffn_norm(x)
         with _phase("block.ffn"):
             x = self.ffn(x, input_ids)
         with _phase("block.hc_post"):
-            x = self.hc_post(x, residual, post, comb)
+            x = self.hc_post(x)
         return x
 
 
@@ -1161,13 +1159,6 @@ def _mhc_sinkhorn_eps_mask_tile(hc_mult: int, eps: float) -> torch.Tensor:
     m = torch.zeros(_MHC_TILE, _MHC_TILE, dtype=torch.float32)
     m[:hc_mult, :hc_mult] = eps
     return m
-
-
-def _mhc_unpack_comb_from_sinkhorn(
-    packed: torch.Tensor, num_tokens: int, hc_mult: int,
-) -> torch.Tensor:
-    """Top-left hc x hc per slice from a [num_tokens_pad * TILE, TILE] tensor."""
-    return packed.view(-1, _MHC_TILE, _MHC_TILE)[:num_tokens, :hc_mult, :hc_mult].contiguous()
 
 
 def _compile_mhc_norm_fn_kernel(num_out_tiles: int, K_tiles: int, rms_eps: float, inv_D: float):
@@ -1787,7 +1778,12 @@ class DeviceMHC(nn.Module):
         )
 
     def hc_pre(self, x: torch.Tensor):
-        """[B, S, mhc, hidden] -> (y [B, S, hidden], post [B, S, mhc], comb [B, S, mhc, mhc])."""
+        """[B, S, mhc, hidden] -> y [B, S, hidden].
+
+        post and comb stay on device (stashed for the matching hc_post call);
+        only y, the apply_mix output that downstream norm/attn/ffn need, is
+        downloaded.
+        """
         ttnn = self._ttnn
         B, S, mhc, hidden = x.shape
         if mhc != self.hc_mult or hidden != self.hidden:
@@ -1870,35 +1866,20 @@ class DeviceMHC(nn.Module):
         self._apply_mix_kernel(num_tokens)(
             x_tt, mix_tt, self.scaler_tt, out_tt)
 
-        # Stash device tensors that hc_post needs so it can skip the
-        # residual/post/comb re-uploads. The torch values returned below are
-        # still produced for caller-side shape/dtype contracts and as opaque
-        # markers; hc_post consumes the stashed device tensors directly.
+        # Stash device tensors hc_post consumes directly.
         self._stash_a_tt = a_tt
         self._stash_post_tt = post_tt
         self._stash_comb_sk_tt = comb_sk_out_tt
 
-        # Download what callers need: y (apply_mix output), post (for hc_post),
-        # comb_sk (for hc_post). pre never leaves device.
         out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
-        post_packed = ttnn.to_torch(post_tt, mesh_composer=composer)
-        comb_sk_packed = ttnn.to_torch(comb_sk_out_tt, mesh_composer=composer)
-        post = post_packed[:num_tokens, mhc: 2 * mhc].contiguous()
-        comb_sk = _mhc_unpack_comb_from_sinkhorn(comb_sk_packed, num_tokens, mhc)
         y_flat = _mhc_unpack_apply_mix_out(out_packed, num_tokens, hidden)
-        y = y_flat.view(B, S, hidden).to(out_dtype)
-        post_out = post.view(B, S, mhc).to(out_dtype)
-        comb_out = comb_sk.view(B, S, mhc, mhc).to(out_dtype)
-        return y, post_out, comb_out
+        return y_flat.view(B, S, hidden).to(out_dtype)
 
-    def hc_post(self, x: torch.Tensor, residual: torch.Tensor,
-                post: torch.Tensor, comb: torch.Tensor):
-        """x [B, S, hidden], residual [B, S, mhc, hidden], post [B, S, mhc],
-        comb [B, S, mhc, mhc] -> [B, S, mhc, hidden].
+    def hc_post(self, x: torch.Tensor):
+        """x [B, S, hidden] -> [B, S, mhc, hidden].
 
         residual/post/comb are consumed from device tensors stashed by the
-        matching hc_pre call; the torch values are ignored except for
-        dtype/shape extraction. Only x (post-attn or post-FFN) is uploaded.
+        matching hc_pre call. Only x (post-attn or post-FFN) is uploaded.
         """
         ttnn = self._ttnn
         B, S, hidden = x.shape
@@ -3630,14 +3611,13 @@ class Model:
                     "hc_attn_fn nor hc_ffn_fn"
                 )
 
-            def _device_hc_post(self_layer, x, residual, post, comb,
-                                _active=active):
+            def _device_hc_post(self_layer, x, _active=active):
                 mhc = _active[0]
                 if mhc is None:
                     raise RuntimeError(
                         "DeviceMHC dispatch: hc_post called before hc_pre")
                 _active[0] = None
-                return mhc.hc_post(x, residual, post, comb)
+                return mhc.hc_post(x)
 
             layer.hc_pre = _device_hc_pre.__get__(layer, type(layer))
             layer.hc_post = _device_hc_post.__get__(layer, type(layer))
