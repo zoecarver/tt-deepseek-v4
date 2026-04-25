@@ -3273,17 +3273,15 @@ class DeviceAttention(nn.Module):
         self.kv_cache_tt = None  # allocated on first _decode call
 
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
-        """Decode-only fused forward. Falls back to CPU for prefill."""
-        attn = self.attn
+        """Single-token forward. Prefill is driven externally as a per-token
+        loop, so seqlen is always 1 and start_pos==0 is handled by _decode."""
         bsz, seqlen, _ = x.shape
-        if start_pos == 0 or seqlen != 1:
-            return self._cpu_forward(x, start_pos)
+        if seqlen != 1:
+            raise RuntimeError(
+                f"DeviceAttention expects seqlen=1; got seqlen={seqlen}. "
+                "Prefill must loop one token at a time."
+            )
         return self._decode(x, start_pos)
-
-    def _cpu_forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
-        """Fallback: invoke the original Attention.forward via the saved
-        bound method. The Model wires this in offload_attn_full."""
-        return self._orig_forward(x, start_pos)
 
     def _decode(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         ttnn = self._ttnn
@@ -4046,16 +4044,21 @@ class Model:
             attn = layer.attn
             if not attn.compress_ratio:
                 continue
-            # Eagerly wire compressor/indexer freqs_cis from the Attention's
-            # buffer. CPU Attention.forward / Indexer.forward set these lazily
-            # on first call, but offload runs before any forward.
+            # Eagerly wire compressor/indexer freqs_cis and kv_cache from the
+            # owning module. CPU Attention.forward / Indexer.forward set these
+            # lazily on first call, but with prefill on device the lazy paths
+            # never run.
             if attn.compressor.freqs_cis is None:
                 attn.compressor.freqs_cis = attn.freqs_cis
+            if attn.compressor.kv_cache is None:
+                attn.compressor.kv_cache = attn.kv_cache[:, attn.window_size:]
             if attn.indexer is not None:
                 if attn.indexer.freqs_cis is None:
                     attn.indexer.freqs_cis = attn.freqs_cis
                 if attn.indexer.compressor.freqs_cis is None:
                     attn.indexer.compressor.freqs_cis = attn.indexer.freqs_cis
+                if attn.indexer.compressor.kv_cache is None:
+                    attn.indexer.compressor.kv_cache = attn.indexer.kv_cache
             wkv = attn.compressor.wkv if isinstance(
                 attn.compressor.wkv, DeviceColLinear
             ) else DeviceColLinear(mesh, attn.compressor.wkv.weight)
@@ -4153,17 +4156,11 @@ class Model:
             self._device_wo_b.append(dw)
 
     def offload_attn_full(self, mesh):
-        """Fused end-to-end attention forward on device (decode path).
+        """Fused end-to-end attention forward on device.
 
-        Requires every attention sub-piece already offloaded:
-          --offload-attn-wq-a / --offload-attn-wq-b / --offload-attn-wkv
-          --offload-attn-wo-a / --offload-attn-wo-b
-          --offload-rms-norms (q_norm/kv_norm device-resident)
-          --offload-sparse-attn
-
-        Replaces Attention.forward with DeviceAttention.forward, which
-        consolidates the per-step Q/KV/O paths into a single upload+download.
-        Prefill (start_pos == 0) falls back to the original CPU forward.
+        Replaces Attention.forward with DeviceAttention.forward. Prefill is
+        driven by Model.prefill as a per-token loop through this same path,
+        so DeviceAttention only needs to handle seqlen=1.
         """
         self._device_attn_full = []
         for layer in self.transformer.layers:
@@ -4202,8 +4199,6 @@ class Model:
                 wo_a_cpu_weight=attn.wo_a.weight.detach(),
                 max_seq_len=attn.freqs_cis.shape[0],
             )
-            # Save the original CPU forward so prefill can fall back.
-            da._orig_forward = attn.forward
             attn.forward = da.forward
             self._device_attn_full.append(da)
 
@@ -4285,8 +4280,12 @@ class Model:
 
     @torch.inference_mode()
     def prefill(self, tokens: list[int]) -> torch.Tensor:
-        ids = torch.tensor([tokens], dtype=torch.long)
-        logits = self.transformer.forward(ids, start_pos=0)
+        """Loop the device decode path over every prompt token. Slow per
+        token, but reuses the decode kernels and keeps prefill on device."""
+        logits = None
+        for i, tok in enumerate(tokens):
+            ids = torch.tensor([[tok]], dtype=torch.long)
+            logits = self.transformer.forward(ids, start_pos=i)
         return logits[0]
 
     @torch.inference_mode()
