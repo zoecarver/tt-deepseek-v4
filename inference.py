@@ -936,8 +936,22 @@ class DeviceMoEGate(nn.Module):
         self._weights_tt, self._indices_tt = self._compute_body()
         ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
 
+    def forward_device(self):
+        """Pure-device gate body: assumes self._x_upload_tt is already filled.
+        Returns (weights_tt, indices_tt) device tensors. No host transfers."""
+        ttnn = self._ttnn
+        if self._trace_id is None:
+            self._capture_trace()
+        else:
+            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
+        return self._weights_tt, self._indices_tt
+
     def forward(self, x: torch.Tensor):
-        """x: [M=1, dim] -> (weights [1, topk] float32, indices [1, topk] int64)."""
+        """x: [M=1, dim] -> (weights [1, topk] float32, indices [1, topk] int64).
+
+        Wrapper: uploads x, runs forward_device, downloads (weights, indices).
+        Use forward_device when chaining on device.
+        """
         ttnn = self._ttnn
         M, D = x.shape
         if D != self.dim:
@@ -950,15 +964,12 @@ class DeviceMoEGate(nn.Module):
             mesh_mapper=self._upload_mapper,
         )
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
-        if self._trace_id is None:
-            self._capture_trace()
-        else:
-            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
+        weights_tt, indices_tt = self.forward_device()
 
         # Replicated readback: stack 4 copies on tensor dim 0, take first M rows.
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        weights = ttnn.to_torch(self._weights_tt, mesh_composer=composer)[:M].float()
-        indices = ttnn.to_torch(self._indices_tt, mesh_composer=composer)[:M].long()
+        weights = ttnn.to_torch(weights_tt, mesh_composer=composer)[:M].float()
+        indices = ttnn.to_torch(indices_tt, mesh_composer=composer)[:M].long()
         return weights, indices
 
 
@@ -1974,40 +1985,22 @@ class DeviceMHC(nn.Module):
             device=self.mesh, memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
-    def hc_pre(self, x: torch.Tensor):
-        """[B, S, mhc, hidden] -> y [B, S, hidden].
-
-        post and comb stay on device (stashed for the matching hc_post call);
-        only y, the apply_mix output that downstream norm/attn/ffn need, is
-        downloaded.
-        """
+    def hc_pre_device(self, num_tokens: int, num_tokens_pad: int):
+        """Pure-device hc_pre body: assumes self._a_upload_tt is already
+        filled with the [num_tokens_pad, mhc*hidden] residual layout.
+        Runs norm_fn -> split_mixes -> sinkhorn -> apply_mix and returns
+        the apply_mix output device tensor [num_tokens * TILE, hidden].
+        Stashes a_tt/post_tt/comb_sk_out_tt for the matching hc_post.
+        No host transfers."""
         ttnn = self._ttnn
-        B, S, mhc, hidden = x.shape
-        if mhc != self.hc_mult or hidden != self.hidden:
-            raise ValueError(
-                f"x shape mismatch: got mhc={mhc}, hidden={hidden}; "
-                f"expected mhc={self.hc_mult}, hidden={self.hidden}")
-        out_dtype = x.dtype
-        num_tokens = B * S
-        num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
-
-        # Step 1: pre_norm_fn on device -> mixes_tt [num_tokens_pad, TILE].
-        # norm_fn / split_mixes process 32 tokens per tile, so they keep the
-        # num_tokens_pad sizing. Per-token kernels (sinkhorn, apply_mix, post)
-        # use real num_tokens to avoid 32x over-allocation on decode.
-        a_packed = _mhc_pack_residual(x, num_tokens_pad)
-        host_mesh = ttnn.from_torch(
-            a_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=self._upload_mapper,
-        )
-        ttnn.copy_host_to_device_tensor(host_mesh, self._a_upload_tt)
+        mhc = self.hc_mult
+        hidden = self.hidden
         a_tt = self._a_upload_tt
         mixes_tt = self._mixes_tt
+
         self._norm_fn_kernel(num_tokens_pad // _MHC_TILE)(
             a_tt, self.fn_tt, self.scaler_tt, mixes_tt)
 
-        # Step 2: split_mixes on device -> pre/post/comb_raw (each
-        # [num_tokens_pad, TILE], column-packed sections).
         pre_tt = self._pre_tt
         post_tt = self._post_tt
         comb_tt = self._comb_tt
@@ -2018,13 +2011,6 @@ class DeviceMHC(nn.Module):
             pre_tt, post_tt, comb_tt,
         )
 
-        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-
-        # Step 3: build the sinkhorn input on device. comb_tt has 32 tokens per
-        # tile with each token's flat 4x4 in cols 2*mhc..2*mhc+mhc*mhc. Sinkhorn
-        # expects one tile per token with the 4x4 in the top-left and
-        # PAD_SENTINEL elsewhere. slice -> reshape -> pad -> reshape replaces
-        # the prior CPU repack round-trip.
         comb_sliced = ttnn.slice(
             comb_tt, [0, 2 * mhc], [num_tokens, 2 * mhc + mhc * mhc])
         comb_3d = ttnn.reshape(comb_sliced, [num_tokens, mhc, mhc])
@@ -2041,8 +2027,6 @@ class DeviceMHC(nn.Module):
             comb_sk_out_tt,
         )
 
-        # Step 4: pre_apply_mix on device. mix layout is built from pre_tt via
-        # slice + reshape + pad (col 0 of rows 0..mhc-1 holds pre[t, m]).
         pre_sliced = ttnn.slice(pre_tt, [0, 0], [num_tokens, mhc])
         pre_3d = ttnn.reshape(pre_sliced, [num_tokens, mhc, 1])
         mix_padded = ttnn.pad(
@@ -2052,10 +2036,6 @@ class DeviceMHC(nn.Module):
         )
         mix_tt = ttnn.reshape(mix_padded, [num_tokens * _MHC_TILE, _MHC_TILE])
 
-        # Build apply_mix x layout from the already-uploaded a_tt (the
-        # norm_fn input) instead of re-uploading the residual in a different
-        # shape. a_tt is [num_tokens_pad, mhc*hidden]; we need [num_tokens *
-        # TILE, hidden] with rows 0..mhc-1 of each TILE-block holding x[t,m,:].
         a_sliced = ttnn.slice(a_tt, [0, 0], [num_tokens, mhc * hidden])
         a_3d = ttnn.reshape(a_sliced, [num_tokens, mhc, hidden])
         x_padded = ttnn.pad(
@@ -2068,50 +2048,62 @@ class DeviceMHC(nn.Module):
         self._apply_mix_kernel(num_tokens)(
             x_tt, mix_tt, self.scaler_tt, out_tt)
 
-        # Stash device tensors hc_post consumes directly.
         self._stash_a_tt = a_tt
         self._stash_post_tt = post_tt
         self._stash_comb_sk_tt = comb_sk_out_tt
+        return out_tt
 
+    def hc_pre(self, x: torch.Tensor):
+        """[B, S, mhc, hidden] -> y [B, S, hidden].
+
+        Wrapper: uploads x, runs hc_pre_device, downloads y. Use
+        hc_pre_device directly when the caller already has a device tensor
+        (block_forward_device chain).
+        """
+        ttnn = self._ttnn
+        B, S, mhc, hidden = x.shape
+        if mhc != self.hc_mult or hidden != self.hidden:
+            raise ValueError(
+                f"x shape mismatch: got mhc={mhc}, hidden={hidden}; "
+                f"expected mhc={self.hc_mult}, hidden={self.hidden}")
+        out_dtype = x.dtype
+        num_tokens = B * S
+        num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
+
+        a_packed = _mhc_pack_residual(x, num_tokens_pad)
+        host_mesh = ttnn.from_torch(
+            a_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(host_mesh, self._a_upload_tt)
+
+        out_tt = self.hc_pre_device(num_tokens, num_tokens_pad)
+
+        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
         out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
         y_flat = _mhc_unpack_apply_mix_out(out_packed, num_tokens, hidden)
         return y_flat.view(B, S, hidden).to(out_dtype)
 
-    def hc_post(self, x: torch.Tensor):
-        """x [B, S, hidden] -> [B, S, mhc, hidden].
-
-        residual/post/comb are consumed from device tensors stashed by the
-        matching hc_pre call. Only x (post-attn or post-FFN) is uploaded.
-        """
+    def hc_post_device(self, num_tokens: int):
+        """Pure-device hc_post body: assumes self._x_upload_tt is already
+        filled with the [num_tokens * TILE, hidden] x layout, and the
+        matching hc_pre_device has stashed a/post/comb_sk tensors. Runs
+        the post kernel and returns the output device tensor
+        [num_tokens * TILE, hidden]. Clears the stash afterwards. No host
+        transfers."""
         ttnn = self._ttnn
-        B, S, hidden = x.shape
         mhc = self.hc_mult
-        out_dtype = x.dtype
-        num_tokens = B * S
+        hidden = self.hidden
 
         a_tt_stashed = self._stash_a_tt
         post_tt_stashed = self._stash_post_tt
         comb_sk_tt_stashed = self._stash_comb_sk_tt
         if a_tt_stashed is None or post_tt_stashed is None or comb_sk_tt_stashed is None:
-            raise RuntimeError("hc_post called without matching hc_pre stash")
-        # Forbid reuse: a stash belongs to one hc_pre/hc_post pair.
+            raise RuntimeError("hc_post_device called without matching hc_pre_device stash")
         self._stash_a_tt = None
         self._stash_post_tt = None
         self._stash_comb_sk_tt = None
 
-        x_2d = x.reshape(num_tokens, hidden)
-        x_packed = _mhc_pack_x_bc(x_2d, mhc, num_tokens)
-        host_mesh = ttnn.from_torch(
-            x_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=self._upload_mapper,
-        )
-        ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
-        x_tt = self._x_upload_tt
-
-        # Build res_tt from the stashed a_tt (norm_fn input == hc_pre's
-        # residual, packed [num_tokens_pad, mhc*hidden]). Slice -> reshape ->
-        # pad -> reshape gives [num_tokens * TILE, hidden] with rows 0..mhc-1
-        # of each TILE-block holding residual[t, m, :].
         a_sliced = ttnn.slice(a_tt_stashed, [0, 0], [num_tokens, mhc * hidden])
         a_3d = ttnn.reshape(a_sliced, [num_tokens, mhc, hidden])
         res_padded = ttnn.pad(
@@ -2121,8 +2113,6 @@ class DeviceMHC(nn.Module):
         )
         res_tt = ttnn.reshape(res_padded, [num_tokens * _MHC_TILE, hidden])
 
-        # Build post_tt from stashed split_mixes output. post values live in
-        # cols mhc..2*mhc of post_tt_stashed [num_tokens_pad, TILE].
         post_sliced = ttnn.slice(
             post_tt_stashed, [0, mhc], [num_tokens, 2 * mhc])
         post_3d = ttnn.reshape(post_sliced, [num_tokens, mhc, 1])
@@ -2133,10 +2123,6 @@ class DeviceMHC(nn.Module):
         )
         post_tt = ttnn.reshape(post_padded, [num_tokens * _MHC_TILE, _MHC_TILE])
 
-        # Build comb_tt (transposed) from stashed sinkhorn output. The post
-        # kernel reads only the top-left mhc x mhc of each TILE-block, so
-        # transposing the full TILE x TILE is correct: the new top-left
-        # mhc x mhc is the transpose of the original top-left mhc x mhc.
         comb_3d = ttnn.reshape(
             comb_sk_tt_stashed, [num_tokens, _MHC_TILE, _MHC_TILE])
         comb_T_3d = ttnn.transpose(comb_3d, -2, -1)
@@ -2145,7 +2131,30 @@ class DeviceMHC(nn.Module):
 
         out_tt = self._post_out_tt
         self._post_kernel(num_tokens)(
-            x_tt, res_tt, comb_tt, post_tt, out_tt)
+            self._x_upload_tt, res_tt, comb_tt, post_tt, out_tt)
+        return out_tt
+
+    def hc_post(self, x: torch.Tensor):
+        """x [B, S, hidden] -> [B, S, mhc, hidden].
+
+        Wrapper: uploads x, runs hc_post_device, downloads y. Use
+        hc_post_device directly when the caller already has a device tensor.
+        """
+        ttnn = self._ttnn
+        B, S, hidden = x.shape
+        mhc = self.hc_mult
+        out_dtype = x.dtype
+        num_tokens = B * S
+
+        x_2d = x.reshape(num_tokens, hidden)
+        x_packed = _mhc_pack_x_bc(x_2d, mhc, num_tokens)
+        host_mesh = ttnn.from_torch(
+            x_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
+
+        out_tt = self.hc_post_device(num_tokens)
 
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
         out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
@@ -2254,9 +2263,24 @@ class DeviceSharedExpert(nn.Module):
         self._compute_body()
         ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
 
+    def forward_device(self):
+        """Pure-device shared-expert body: assumes self._x_upload_tt is
+        already filled. Returns the output device tensor self._out_tt.
+        No host transfers."""
+        ttnn = self._ttnn
+        if self._trace_id is None:
+            self._capture_trace()
+        else:
+            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
+        return self._out_tt
+
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """x: [M=1, dim] -> [M=1, dim]. weights matches Expert.forward
-        signature; shared expert is always called with weights=None."""
+        signature; shared expert is always called with weights=None.
+
+        Wrapper: uploads x, runs forward_device, downloads y. Use
+        forward_device when chaining on device.
+        """
         if weights is not None:
             raise ValueError("DeviceSharedExpert does not support per-token `weights`")
         ttnn = self._ttnn
@@ -2271,13 +2295,10 @@ class DeviceSharedExpert(nn.Module):
             mesh_mapper=self._upload_mapper,
         )
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
-        if self._trace_id is None:
-            self._capture_trace()
-        else:
-            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
+        out_tt = self.forward_device()
 
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        y = ttnn.to_torch(self._out_tt, mesh_composer=composer)[:M]
+        y = ttnn.to_torch(out_tt, mesh_composer=composer)[:M]
         return y.to(x.dtype)
 
 
@@ -3970,11 +3991,15 @@ class Model:
         return logits[0]
 
     @torch.inference_mode()
-    def generate(self, tokens: list[int], max_tokens: int = 32, temperature: float = 1.0):
+    def generate(self, tokens: list[int], max_tokens: int = 32,
+                 temperature: float = 1.0, warmup_tokens: int = 0):
+        """Generate up to max_tokens. Phase counters are reset after the
+        first `warmup_tokens` decode steps so steady-state timings don't
+        include first-call JIT compilation / trace capture."""
         with _phase("prefill"):
             logits = self.prefill(tokens)
         pos = len(tokens)
-        for _ in range(max_tokens):
+        for i in range(max_tokens):
             with _phase("sample"):
                 if temperature == 0:
                     nxt = int(logits.argmax().item())
@@ -3985,6 +4010,11 @@ class Model:
             with _phase("decode_step"):
                 logits = self.step_decode(nxt, pos)
             pos += 1
+            if warmup_tokens > 0 and i + 1 == warmup_tokens:
+                _PHASE_ACCUM.clear()
+                _PHASE_COUNTS.clear()
+                print(f"[phase] warmup complete after {warmup_tokens} tokens; "
+                      f"phase counters reset")
 
 
 # ==============================================================================
@@ -4000,6 +4030,10 @@ def main():
                         help="Read prompt from file (bypasses shell quoting). Overrides --prompt.")
     parser.add_argument("--max-seq-len", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument("--warmup-tokens", type=int, default=0,
+                        help="Reset phase counters after this many decode steps "
+                             "so steady-state timings exclude first-call JIT / "
+                             "trace capture overhead.")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--weights-only", action="store_true",
                         help="Stop after loading weights (Phase 1 gate)")
@@ -4076,7 +4110,9 @@ def main():
     print("[phase] generating ...")
     t0 = time.time()
     out_tokens = []
-    for tok in model.generate(tokens, max_tokens=args.max_tokens, temperature=args.temperature):
+    for tok in model.generate(tokens, max_tokens=args.max_tokens,
+                              temperature=args.temperature,
+                              warmup_tokens=args.warmup_tokens):
         out_tokens.append(tok)
         piece = model.tokenizer.decode([tok])
         print(piece, end="", flush=True)
