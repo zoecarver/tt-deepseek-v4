@@ -686,31 +686,47 @@ class DeviceLMHead:
                 mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
             )
 
-    def __call__(self, x_last: torch.Tensor) -> torch.Tensor:
-        # x_last: [B, dim] — unnormalized if norm_tt is set, else normalized.
-        ttnn = self._ttnn
-        x_3d = x_last.to(torch.bfloat16).unsqueeze(1).contiguous()  # [B, 1, dim]
-        x_tt = ttnn.as_tensor(
-            x_3d,
-            device=self.mesh,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
+        # Pre-allocated per-step buffers (B=1, single token).
+        self._x_upload_tt = ttnn.from_torch(
+            torch.zeros(1, 1, dim, dtype=torch.bfloat16),
+            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
         )
+        self._matmul_out_tt = ttnn.from_torch(
+            torch.zeros(1, 1, vocab, dtype=torch.bfloat16),
+            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1)),
+        )
+        self._upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
+
+    def __call__(self, x_last: torch.Tensor) -> torch.Tensor:
+        # x_last: [B=1, dim] — unnormalized if norm_tt is set, else normalized.
+        ttnn = self._ttnn
+        B = x_last.shape[0]
+        if B != 1:
+            raise ValueError(f"DeviceLMHead expects B=1, got B={B}")
+        x_3d = x_last.to(torch.bfloat16).unsqueeze(1).contiguous()  # [1, 1, dim]
+        host_mesh = ttnn.from_torch(
+            x_3d,
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
+        x_tt = self._x_upload_tt
         if self.norm_tt is not None:
-            # ttnn.rms_norm wants 4D input; wrap [B, 1, dim] -> [1, 1, B, dim] -> back.
-            B = x_last.shape[0]
-            x_tt = ttnn.reshape(x_tt, (1, 1, B, self.dim))
+            x_tt = ttnn.reshape(x_tt, (1, 1, 1, self.dim))
             x_tt = ttnn.rms_norm(x_tt, weight=self.norm_tt, epsilon=self.norm_eps)
-            x_tt = ttnn.reshape(x_tt, (B, 1, self.dim))
-        y_tt = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            x_tt = ttnn.reshape(x_tt, (1, 1, self.dim))
+        ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._matmul_out_tt)
         y = ttnn.to_torch(
-            y_tt,
+            self._matmul_out_tt,
             mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(0, -1)),
         )
-        if y.shape[0] != x_last.shape[0]:
-            y = y[: x_last.shape[0]]
+        if y.shape[0] != B:
+            y = y[: B]
         return y[:, 0, :].float()  # [B, vocab]
 
 
@@ -745,6 +761,24 @@ class DeviceColLinear(nn.Module):
             mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1)),
         )
 
+        # Pre-allocated output buffers for the [B=1, S=1, in_dim] decode case.
+        # forward_device runs matmul (sharded out, last dim) followed by
+        # all_gather to replicate. Both buffers are 3D [1, 1, out_dim] in
+        # logical shape; the sharded one splits the last dim across the mesh.
+        zeros = torch.zeros(1, 1, out_dim, dtype=torch.bfloat16)
+        self._matmul_out_tt = ttnn.from_torch(
+            zeros,
+            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1)),
+        )
+        self._gather_out_tt = ttnn.from_torch(
+            zeros,
+            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ttnn = self._ttnn
         B, S, D = x.shape
@@ -768,11 +802,15 @@ class DeviceColLinear(nn.Module):
         return y.to(torch.bfloat16)
 
     def forward_device(self, x_tt) -> "object":
-        """Device-only path. x_tt: replicated input. Returns replicated output
-        (full out_dim on every chip) via all_gather along the sharded axis."""
+        """Device-only path. x_tt: replicated input [1, 1, in_dim]. Returns
+        replicated output [1, 1, out_dim] via all_gather along the sharded
+        axis. Output buffers are pre-allocated; both ops write in place."""
         ttnn = self._ttnn
-        y_sharded = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        return ttnn.all_gather(y_sharded, dim=-1, num_links=1)
+        ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._matmul_out_tt)
+        ttnn.all_gather(self._matmul_out_tt, dim=-1, num_links=1,
+                        output_tensor=self._gather_out_tt)
+        return self._gather_out_tt
 
 
 class DeviceMoEGate(nn.Module):
@@ -822,22 +860,31 @@ class DeviceMoEGate(nn.Module):
         self.w_tt = ttnn.as_tensor(w_kn, **common_rep)
         self.bias_tt = ttnn.as_tensor(b_row, **common_rep)
 
+        # Pre-allocated per-step buffers (M=1).
+        self._x_upload_tt = ttnn.from_torch(
+            torch.zeros(1, dim, dtype=torch.bfloat16), **common_rep)
+        self._raw_tt = ttnn.from_torch(
+            torch.zeros(1, n_experts, dtype=torch.bfloat16), **common_rep)
+        self._upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
+
     def forward(self, x: torch.Tensor):
-        """x: [M, dim] -> (weights [M, topk] float32, indices [M, topk] int64)."""
+        """x: [M=1, dim] -> (weights [1, topk] float32, indices [1, topk] int64)."""
         ttnn = self._ttnn
         M, D = x.shape
         if D != self.dim:
             raise ValueError(f"x last dim {D} mismatch gate dim {self.dim}")
-        x_tt = ttnn.as_tensor(
+        if M != 1:
+            raise ValueError(f"DeviceMoEGate expects M=1, got M={M}")
+        host_mesh = ttnn.from_torch(
             x.to(torch.bfloat16).contiguous(),
-            device=self.mesh,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._upload_mapper,
         )
-        raw_tt = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        scores_tt = ttnn.sqrt(ttnn.softplus(raw_tt))
+        ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
+        x_tt = self._x_upload_tt
+        ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._raw_tt)
+        scores_tt = ttnn.sqrt(ttnn.softplus(self._raw_tt))
         biased_tt = ttnn.add(scores_tt, self.bias_tt)
         _, indices_tt = ttnn.topk(biased_tt, k=self.topk, dim=-1, largest=True, sorted=True)
         gathered_tt = ttnn.gather(scores_tt, dim=-1, index=indices_tt)
@@ -2016,33 +2063,55 @@ class DeviceSharedExpert(nn.Module):
         self.w2_tt = ttnn.as_tensor(
             _weight_to_bf16(cpu_w2).transpose(0, 1).contiguous(), **common_rep)
 
+        # Pre-allocated per-step buffers (M=1, loop-prefill).
+        self._x_upload_tt = ttnn.from_torch(
+            torch.zeros(1, dim, dtype=torch.bfloat16), **common_rep)
+        self._y1_tt = ttnn.from_torch(
+            torch.zeros(1, inter_dim, dtype=torch.bfloat16), **common_rep)
+        self._y3_tt = ttnn.from_torch(
+            torch.zeros(1, inter_dim, dtype=torch.bfloat16), **common_rep)
+        self._silu_tt = ttnn.from_torch(
+            torch.zeros(1, inter_dim, dtype=torch.bfloat16), **common_rep)
+        self._mid_tt = ttnn.from_torch(
+            torch.zeros(1, inter_dim, dtype=torch.bfloat16), **common_rep)
+        self._out_tt = ttnn.from_torch(
+            torch.zeros(1, dim, dtype=torch.bfloat16), **common_rep)
+        self._upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
+
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """x: [M, dim] -> [M, dim]. `weights` kwarg matches Expert.forward signature;
-        shared expert is always called with weights=None."""
+        """x: [M=1, dim] -> [M=1, dim]. weights matches Expert.forward
+        signature; shared expert is always called with weights=None."""
         if weights is not None:
             raise ValueError("DeviceSharedExpert does not support per-token `weights`")
         ttnn = self._ttnn
         M, D = x.shape
         if D != self.dim:
             raise ValueError(f"x last dim {D} != expected {self.dim}")
-        x_tt = ttnn.as_tensor(
+        if M != 1:
+            raise ValueError(f"DeviceSharedExpert expects M=1, got M={M}")
+        host_mesh = ttnn.from_torch(
             x.to(torch.bfloat16).contiguous(),
-            device=self.mesh,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._upload_mapper,
         )
-        y1_tt = ttnn.matmul(x_tt, self.w1_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        y3_tt = ttnn.matmul(x_tt, self.w3_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
+        x_tt = self._x_upload_tt
+        ttnn.matmul(x_tt, self.w1_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._y1_tt)
+        ttnn.matmul(x_tt, self.w3_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._y3_tt)
         if self.swiglu_limit > 0:
-            y1_tt = ttnn.clamp(y1_tt, max=self.swiglu_limit)
-            y3_tt = ttnn.clamp(y3_tt, min=-self.swiglu_limit, max=self.swiglu_limit)
-        mid_tt = ttnn.multiply(ttnn.silu(y1_tt), y3_tt)
-        out_tt = ttnn.matmul(mid_tt, self.w2_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.clamp(self._y1_tt, max=self.swiglu_limit, output_tensor=self._y1_tt)
+            ttnn.clamp(self._y3_tt, min=-self.swiglu_limit, max=self.swiglu_limit,
+                       output_tensor=self._y3_tt)
+        ttnn.silu(self._y1_tt, output_tensor=self._silu_tt)
+        ttnn.multiply(self._silu_tt, self._y3_tt, output_tensor=self._mid_tt)
+        ttnn.matmul(self._mid_tt, self.w2_tt,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._out_tt)
 
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        y = ttnn.to_torch(out_tt, mesh_composer=composer)[:M]
+        y = ttnn.to_torch(self._out_tt, mesh_composer=composer)[:M]
         return y.to(x.dtype)
 
 
