@@ -509,6 +509,72 @@ class MoE(nn.Module):
         y += self.shared_experts(x)
         return y.type_as(x).view(shape)
 
+    def forward_device(self, x_tt, input_ids: torch.Tensor):
+        """Device-in / device-out MoE for the chained block path.
+
+        x_tt: [M, dim] bf16 device tensor (replicated). Must be M=1 (decode).
+        Returns y_tt: [M, dim] bf16 device tensor.
+
+        For non-hash gates: one upload of x feeds both the device gate
+        and the device shared expert (was two from_torch calls before).
+        For hash gates: gate runs on host (vocab lookup), so we only
+        upload x once for the shared expert. In both cases the shared
+        expert output stays on device and is combined with the routed
+        sum via ttnn.add."""
+        shared_dev = self.shared_experts
+        ttnn = shared_dev._ttnn
+        mesh = shared_dev.mesh
+        composer = ttnn.ConcatMesh2dToTensor(
+            mesh, shared_dev.mesh_shape, dims=(1, 0))
+        upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
+
+        M = int(x_tt.shape[0])
+        if M != 1:
+            raise ValueError(
+                f"MoE.forward_device expects M=1 (decode), got M={M}"
+            )
+        if int(x_tt.shape[-1]) != self.dim:
+            raise ValueError(
+                f"x_tt last dim {int(x_tt.shape[-1])} != self.dim {self.dim}"
+            )
+
+        x = ttnn.to_torch(x_tt, mesh_composer=composer)[:M].to(torch.bfloat16)
+        x_host_mesh = ttnn.from_torch(
+            x.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=upload_mapper,
+        )
+
+        if self.gate.hash:
+            weights, indices = self.gate.forward(x.float(), input_ids.flatten())
+        else:
+            gate_dev = self.gate._device_gate
+            ttnn.copy_host_to_device_tensor(x_host_mesh, gate_dev._x_upload_tt)
+            weights_tt, indices_tt = gate_dev.forward_device()
+            weights = ttnn.to_torch(weights_tt, mesh_composer=composer)[:M].float()
+            indices = ttnn.to_torch(indices_tt, mesh_composer=composer)[:M].long()
+
+        ttnn.copy_host_to_device_tensor(x_host_mesh, shared_dev._x_upload_tt)
+        shared_out_tt = shared_dev.forward_device()
+
+        y_routed = torch.zeros(M, self.dim, dtype=torch.float32)
+        counts = torch.bincount(
+            indices.flatten(), minlength=self.n_routed_experts
+        ).tolist()
+        for i in range(self.n_routed_experts):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(indices == i)
+            y_routed[idx] += expert(x[idx], weights[idx, top, None])
+
+        y_routed_tt = ttnn.from_torch(
+            y_routed.to(torch.bfloat16).contiguous(),
+            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=upload_mapper,
+        )
+        return ttnn.add(y_routed_tt, shared_out_tt)
+
 
 class Block(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
@@ -614,14 +680,20 @@ def _block_forward(layer, x, start_pos: int,
     with _phase("block.ffn"):
         ffn_norm_sliced = ttnn.slice(
             ffn_norm_out_tt, [0, 0], [num_tokens, hidden])
-        ffn_norm_bridge = ttnn.reshape(ffn_norm_sliced, [B, S, hidden])
-        composer = ttnn.ConcatMesh2dToTensor(
-            ffn_norm_dn.mesh, ffn_norm_dn.mesh_shape, dims=(1, 0))
-        x_for_moe = ttnn.to_torch(
-            ffn_norm_bridge, mesh_composer=composer)[:B].to(orig_dtype)
-        moe_out = layer.ffn.forward(x_for_moe, input_ids)
+        moe_out_tt = layer.ffn.forward_device(ffn_norm_sliced, input_ids)
     with _phase("block.hc_post"):
-        ffn_post_out_tt = mhc_ffn.hc_post_with_upload_device(moe_out)
+        x_2d = ttnn.reshape(moe_out_tt, [num_tokens, 1, hidden])
+        x_repeated = ttnn.repeat(x_2d, ttnn.Shape([1, mhc, 1]))
+        x_padded = ttnn.pad(
+            x_repeated,
+            padding=[(0, 0), (0, _MHC_TILE - mhc), (0, 0)],
+            value=0.0,
+        )
+        x_post_input = ttnn.reshape(
+            x_padded, [num_tokens * _MHC_TILE, hidden])
+        x_post_input_fp32 = ttnn.typecast(x_post_input, dtype=ttnn.float32)
+        ffn_post_out_tt = mhc_ffn.hc_post_device(
+            num_tokens, x_tt=x_post_input_fp32)
         return _mhc_post_to_a_tt(
             ttnn, ffn_post_out_tt, num_tokens, num_tokens_pad, mhc, hidden)
 
@@ -3957,6 +4029,7 @@ class Model:
                 return _dg(x)
 
             gate.forward = _device_gate_forward.__get__(gate, type(gate))
+            gate._device_gate = dg
             self._device_moe_gates.append(dg)
 
     def offload_attn_wo_b(self, mesh):
