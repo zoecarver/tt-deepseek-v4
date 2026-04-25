@@ -2888,7 +2888,7 @@ class DeviceAttention(nn.Module):
         qr_2d = self._rmsnorm_device(self.q_norm_dev, q_lora_2d, B * S)
         qr_tt = ttnn.reshape(qr_2d, [B, S, self.q_lora_rank])
         # CPU indexer needs qr on host; device indexer keeps qr_tt on device.
-        if device_indexer is None and attn.indexer is not None:
+        if device_indexer is None and getattr(attn, "indexer", None) is not None:
             qr_cpu = self._download_replicated(qr_tt, B, S, self.q_lora_rank)
 
         q_full_tt = attn.wq_b.forward_device(qr_tt)           # [B, S, H*D]
@@ -2951,7 +2951,7 @@ class DeviceAttention(nn.Module):
                     sc_dev = sc_dev[..., :T_active]
                     k = min(device_indexer.index_topk, T_active)
                     compress_topk_idxs = sc_dev.topk(k, dim=-1)[1] + offset
-            elif attn.indexer is not None:
+            elif getattr(attn, "indexer", None) is not None:
                 compress_topk_idxs = attn.indexer(x, qr_cpu, start_pos, offset)
             else:
                 compress_topk_idxs = get_compress_topk_idxs(
@@ -3598,6 +3598,16 @@ class Model:
             attn = layer.attn
             if not attn.compress_ratio:
                 continue
+            # Eagerly wire compressor/indexer freqs_cis from the Attention's
+            # buffer. CPU Attention.forward / Indexer.forward set these lazily
+            # on first call, but offload runs before any forward.
+            if attn.compressor.freqs_cis is None:
+                attn.compressor.freqs_cis = attn.freqs_cis
+            if attn.indexer is not None:
+                if attn.indexer.freqs_cis is None:
+                    attn.indexer.freqs_cis = attn.freqs_cis
+                if attn.indexer.compressor.freqs_cis is None:
+                    attn.indexer.compressor.freqs_cis = attn.indexer.freqs_cis
             wkv = attn.compressor.wkv if isinstance(
                 attn.compressor.wkv, DeviceColLinear
             ) else DeviceColLinear(mesh, attn.compressor.wkv.weight)
@@ -3624,8 +3634,12 @@ class Model:
                 raise RuntimeError(
                     "offload_compressor_indexer requires --offload-indexer-linears"
                 )
-            ix_wkv = DeviceColLinear(mesh, indexer.compressor.wkv.weight)
-            ix_wgate = DeviceColLinear(mesh, indexer.compressor.wgate.weight)
+            ix_wkv = indexer.compressor.wkv if isinstance(
+                indexer.compressor.wkv, DeviceColLinear
+            ) else DeviceColLinear(mesh, indexer.compressor.wkv.weight)
+            ix_wgate = indexer.compressor.wgate if isinstance(
+                indexer.compressor.wgate, DeviceColLinear
+            ) else DeviceColLinear(mesh, indexer.compressor.wgate.weight)
             ix_norm = DeviceRMSNorm(
                 mesh, indexer.compressor.norm.weight, indexer.compressor.norm.eps
             )
