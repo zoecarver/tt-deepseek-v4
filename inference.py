@@ -1100,8 +1100,10 @@ class DeviceRMSNorm(nn.Module):
         self._alloc_decode_tensors()
 
     def _alloc_decode_tensors(self):
-        """Kernel output buffer for the loop-prefill / decode case
-        (num_rows=1, Mpad=TILE). The fused kernel overwrites every tile."""
+        """Kernel output buffer + traced-input buffer for the loop-prefill
+        / decode case (num_rows=1, Mpad=TILE). The fused kernel overwrites
+        every tile of _out_tt; _x_upload_tt is filled via
+        copy_host_to_device_tensor on every forward() call."""
         ttnn = self._ttnn
         self._out_tt = ttnn.zeros(
             shape=(_RMS_TILE, self.hidden),
@@ -1110,6 +1112,28 @@ class DeviceRMSNorm(nn.Module):
             device=self.mesh,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+        self._x_upload_tt = ttnn.from_torch(
+            torch.zeros(_RMS_TILE, self.hidden, dtype=torch.bfloat16),
+            device=self.mesh,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
+        self._trace_id = None
+
+    def _compute_body(self):
+        """Replay-shape: the fused kernel writes _out_tt from _x_upload_tt."""
+        self._kernel(1)(self._x_upload_tt, self.gamma_tt, self.sc_tt, self._out_tt)
+
+    def _capture_trace(self):
+        ttnn = self._ttnn
+        self._compute_body()  # warmup so any lazy host uploads happen first
+        ttnn.synchronize_device(self.mesh)
+        self._trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
+        self._compute_body()
+        ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
 
     def _kernel(self, num_row_tiles: int):
         k = self._kernels.get(num_row_tiles)
@@ -1134,13 +1158,26 @@ class DeviceRMSNorm(nn.Module):
             pad = torch.zeros((Mpad - M, self.hidden), dtype=torch.bfloat16)
             x2 = torch.cat([x2, pad], dim=0)
 
-        rep = dict(
-            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
-        )
-        x_tt = ttnn.as_tensor(x2.contiguous(), **rep)
-        out_tt = self.forward_device(x_tt, M)
+        if Mt == 1:
+            host_mesh = ttnn.from_torch(
+                x2.contiguous(),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                mesh_mapper=self._upload_mapper,
+            )
+            ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
+            if self._trace_id is None:
+                self._capture_trace()
+            else:
+                ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
+            out_tt = self._out_tt
+        else:
+            rep = dict(
+                device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+            )
+            x_tt = ttnn.as_tensor(x2.contiguous(), **rep)
+            out_tt = self.forward_device(x_tt, M)
 
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
         y = ttnn.to_torch(out_tt, mesh_composer=composer)[:M]
