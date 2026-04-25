@@ -2453,37 +2453,53 @@ class DeviceMHC(nn.Module):
         )
 
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        pre_packed = ttnn.to_torch(pre_tt, mesh_composer=composer)
-        post_packed = ttnn.to_torch(post_tt, mesh_composer=composer)
-        comb_packed = ttnn.to_torch(comb_tt, mesh_composer=composer)
-        pre = pre_packed[:num_tokens, :mhc].contiguous()
-        post = post_packed[:num_tokens, mhc: 2 * mhc].contiguous()
-        comb_raw = comb_packed[:num_tokens, 2 * mhc: 2 * mhc + mhc * mhc].view(
-            num_tokens, mhc, mhc).contiguous()
 
-        # Step 3: host repack comb into sinkhorn's per-slice tile layout.
-        comb_for_sk = _mhc_pack_comb_for_sinkhorn(
-            comb_raw, num_tokens, num_tokens, mhc)
-        comb_sk_in_tt = self._rep_tensor(comb_for_sk)
+        # Step 3: build the sinkhorn input on device. comb_tt has 32 tokens per
+        # tile with each token's flat 4x4 in cols 2*mhc..2*mhc+mhc*mhc. Sinkhorn
+        # expects one tile per token with the 4x4 in the top-left and
+        # PAD_SENTINEL elsewhere. slice -> reshape -> pad -> reshape replaces
+        # the prior CPU repack round-trip.
+        comb_sliced = ttnn.slice(
+            comb_tt, [0, 2 * mhc], [num_tokens, 2 * mhc + mhc * mhc])
+        comb_3d = ttnn.reshape(comb_sliced, [num_tokens, mhc, mhc])
+        comb_padded = ttnn.pad(
+            comb_3d,
+            padding=[(0, 0), (0, _MHC_TILE - mhc), (0, _MHC_TILE - mhc)],
+            value=_MHC_PAD_SENTINEL,
+        )
+        comb_sk_in_tt = ttnn.reshape(
+            comb_padded, [num_tokens * _MHC_TILE, _MHC_TILE])
         comb_sk_out_tt = self._zeros((num_tokens * _MHC_TILE, _MHC_TILE))
         self._sinkhorn_kernel(num_tokens)(
             comb_sk_in_tt, self.sk_mask_tt, self.sk_eps_mask_tt, self.scaler_tt,
             comb_sk_out_tt,
         )
-        comb_sk_packed = ttnn.to_torch(comb_sk_out_tt, mesh_composer=composer)
-        comb_sk = _mhc_unpack_comb_from_sinkhorn(comb_sk_packed, num_tokens, mhc)
 
-        # Step 4: pre_apply_mix on device.
+        # Step 4: pre_apply_mix on device. mix layout is built from pre_tt via
+        # slice + reshape + pad (col 0 of rows 0..mhc-1 holds pre[t, m]).
+        pre_sliced = ttnn.slice(pre_tt, [0, 0], [num_tokens, mhc])
+        pre_3d = ttnn.reshape(pre_sliced, [num_tokens, mhc, 1])
+        mix_padded = ttnn.pad(
+            pre_3d,
+            padding=[(0, 0), (0, _MHC_TILE - mhc), (0, _MHC_TILE - 1)],
+            value=0.0,
+        )
+        mix_tt = ttnn.reshape(mix_padded, [num_tokens * _MHC_TILE, _MHC_TILE])
+
         x_3d = x.view(num_tokens, mhc, hidden)
         x_packed = _mhc_pack_x_for_apply_mix(x_3d, num_tokens)
-        mix_packed = _mhc_pack_mix(pre, num_tokens)
         x_tt = self._rep_tensor(x_packed)
-        mix_tt = self._rep_tensor(mix_packed)
         out_tt = self._zeros((num_tokens * _MHC_TILE, hidden))
         self._apply_mix_kernel(num_tokens)(
             x_tt, mix_tt, self.scaler_tt, out_tt)
 
+        # Download what callers need: y (apply_mix output), post (for hc_post),
+        # comb_sk (for hc_post). pre never leaves device.
         out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
+        post_packed = ttnn.to_torch(post_tt, mesh_composer=composer)
+        comb_sk_packed = ttnn.to_torch(comb_sk_out_tt, mesh_composer=composer)
+        post = post_packed[:num_tokens, mhc: 2 * mhc].contiguous()
+        comb_sk = _mhc_unpack_comb_from_sinkhorn(comb_sk_packed, num_tokens, mhc)
         y_flat = _mhc_unpack_apply_mix_out(out_packed, num_tokens, hidden)
         y = y_flat.view(B, S, hidden).to(out_dtype)
         post_out = post.view(B, S, mhc).to(out_dtype)
