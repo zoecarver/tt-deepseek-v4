@@ -311,38 +311,6 @@ def sparse_attn(
     return o.to(q.dtype)
 
 
-def hc_split_sinkhorn(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int = 4,
-    sinkhorn_iters: int = 20,
-    eps: float = 1e-6,
-):
-    """Split + Sinkhorn normalization for hyper-connection mixing.
-    mixes:    [*, (2+hc)*hc]
-    hc_scale: [3]
-    hc_base:  [(2+hc)*hc]
-    Returns (pre [*, hc], post [*, hc], comb [*, hc, hc])."""
-    hc = hc_mult
-    pre_mix = mixes[..., :hc]
-    post_mix = mixes[..., hc:2 * hc]
-    comb_mix = mixes[..., 2 * hc:].view(*mixes.shape[:-1], hc, hc)
-
-    pre = torch.sigmoid(pre_mix * hc_scale[0] + hc_base[:hc]) + eps
-    post = 2 * torch.sigmoid(post_mix * hc_scale[1] + hc_base[hc:2 * hc])
-    comb = comb_mix * hc_scale[2] + hc_base[2 * hc:].view(hc, hc)
-
-    # comb = softmax(comb, -1) + eps
-    comb = F.softmax(comb, dim=-1) + eps
-    # comb = comb / (comb.sum(-2) + eps)
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(sinkhorn_iters - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    return pre, post, comb
-
-
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Walsh-Hadamard transform along the last dim, scaled by 1/sqrt(d).
     Drop-in CPU replacement for fast_hadamard_transform.hadamard_transform.
@@ -420,9 +388,6 @@ class ParallelEmbedding(nn.Module):
         self.vocab_size = vocab_size
         self.dim = dim
         self.weight = nn.Parameter(torch.empty(vocab_size, dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.embedding(x, self.weight)
 
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -947,21 +912,6 @@ class Block(nn.Module):
             self.hc_attn_scale = nn.Parameter(torch.empty(3))
             self.hc_ffn_scale = nn.Parameter(torch.empty(3))
 
-    def hc_pre(self, x, hc_fn, hc_scale, hc_base):
-        shape, dtype = x.size(), x.dtype
-        x = x.flatten(2).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
-        pre, post, comb = hc_split_sinkhorn(
-            mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
-        )
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
-        return y.to(dtype), post, comb
-
-    def hc_post(self, x, residual, post, comb):
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-        return y.type_as(x)
-
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]):
         residual = x
         with _phase("block.hc_pre"):
@@ -993,16 +943,6 @@ class ParallelHead(nn.Module):
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
         self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=torch.float32))
-
-    def get_logits(self, x):
-        return F.linear(x[:, -1].float(), self.weight)
-
-    def forward(self, x: torch.Tensor, hc_fn, hc_scale, hc_base, norm: RMSNorm):
-        with _phase("head.hc_combiner"):
-            x = self.hc_head(x, hc_fn, hc_scale, hc_base)
-        with _phase("head.norm_and_logits"):
-            logits = self.get_logits(norm(x))
-        return logits
 
     def hc_head(self, x, hc_fn, hc_scale, hc_base):
         shape, dtype = x.size(), x.dtype
