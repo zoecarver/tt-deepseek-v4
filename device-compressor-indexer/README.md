@@ -92,16 +92,22 @@ a `solve()` + `__main__` PCC test using `harness.py` and `torch_refs.py`.
 
 In priority order; each lands in `../tt-lang-kernels/<name>.py`:
 
-1. **`compressor_softmax_sum`** — the weighted softmax-then-reduce that fires
-   on every compress event:
+1. **`compressor_softmax_sum_norm`** — fuse the weighted softmax-then-reduce
+   *plus* the RMSNorm that always follows it on every compress event:
    ```
-   y[B, d] = sum_i softmax(score_state[:, i, :], dim=i)[B, i, d] * kv_state[B, i, d]
+   y_unnormed[B, d] = sum_i softmax(score_state[:, i, :], dim=i)[B, i, d] * kv_state[B, i, d]
+   y[B, d] = rmsnorm(y_unnormed, gamma, eps)
    ```
-   This is the same shape as attention-output projection and we already have
-   close models of it in `../tt-lang-kernels/softmax_stage.py` (online softmax
-   over a streamed axis) and `../tt-lang-kernels/attention_matmul.py`
-   (softmax × value). Compose those; one fused kernel replaces ~5 ttnn ops
-   plus the masked-padding workaround.
+   Both ops walk the same `[B, ratio, d]` tile region and the intermediate
+   `y_unnormed` is otherwise written to DRAM and immediately re-read just to
+   normalize. Fused, this is one DRAM read of `kv_state` + `score_state`, an
+   online softmax + accumulate, and an in-tile rsqrt-normalize — and we get
+   to drop the M-tile padding hack the standalone `DeviceRMSNorm` needs at
+   `B=1`. Models exist in `../tt-lang-kernels/softmax_stage.py` (online
+   softmax over a streamed axis), `../tt-lang-kernels/attention_matmul.py`
+   (softmax × value), and `../tt-lang-kernels/rmsnorm.py` (the rsqrt-
+   normalize this would inline). Composing them is the right next kernel
+   to write once the ttnn s0 path passes.
 2. **`compressor_state_shift`** — overlap=True only: `kv_state[:, :ratio] =
    kv_state[:, ratio:]` and the same for `score_state`. ttnn has
    `update_cache_for_token_` per slot but no batched slot-shift. A small

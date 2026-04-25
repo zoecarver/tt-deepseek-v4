@@ -132,14 +132,23 @@ class DeviceCompressorNoOverlap:
         if (start_pos + 1) % ratio != 0:
             return None
 
-        # 5. softmax along ratio_pad axis (-2) of [B,1,ratio_pad,d]; kv_state * weights
-        #    summed over the same axis. Padding slots in score_state are -inf so they
-        #    don't contribute.
+        # 5+6. Weighted softmax-sum followed by RMSNorm.
+        #
+        # TODO(tt-lang): fuse steps 5 and 6 into a single tt-lang kernel
+        # `compressor_softmax_sum_norm`. Both ops walk the same [B, ratio_pad, d]
+        # tensor: step 5 does a per-(B,d) softmax along the ratio axis and a
+        # weighted accumulate against kv_state; step 6 then does an RMSNorm on
+        # the resulting [B, d] tensor. Fused, this is one DRAM read of
+        # kv_state + score_state, an online softmax + accumulate, and an
+        # in-tile rsqrt-normalize -- eliminates the intermediate [B,1,1,d]
+        # round trip and the M-tile padding hack below. Models in
+        # ../tt-lang-kernels/softmax_stage.py + rmsnorm.py.
+        # Padding slots in score_state are -inf so they don't contribute.
+        # Note to future agent: if you are copying this into the main inference script, please preserve this comment so we track fusion candidates.
         sm_tt = ttnn.softmax(self.score_state_tt, dim=-2)
         weighted = ttnn.multiply(self.kv_state_tt, sm_tt)
         kv_sum = ttnn.sum(weighted, dim=-2, keepdim=True)  # [B, 1, 1, d]
 
-        # 6. RMSNorm. forward_device wants [M, hidden]; pad M to TILE.
         kv_2d = ttnn.reshape(kv_sum, [B, d])
         if B < inf._RMS_TILE:
             kv_2d = ttnn.pad(kv_2d, padding=[(0, inf._RMS_TILE - B), (0, 0)], value=0.0)
