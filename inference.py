@@ -538,12 +538,36 @@ def _block_forward(layer, x: torch.Tensor, start_pos: int,
       - layer.attn.forward: DeviceAttention.forward (decode-only)
       - layer.ffn.forward: MoE host loop with device gate / shared expert
     """
+    attn_norm_dn = layer.attn_norm.forward.__self__
+    attn_dev = layer.attn._device_attention
+    ttnn = attn_norm_dn._ttnn
+
     with _phase("block.hc_pre"):
         x = layer.hc_pre(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base)
     with _phase("block.norm"):
-        x = layer.attn_norm.forward(x)
+        B, S, hidden = x.shape
+        x2 = x.reshape(-1, hidden).to(torch.bfloat16).contiguous()
+        M = x2.shape[0]
+        Mpad = -(-M // _RMS_TILE) * _RMS_TILE
+        if M < Mpad:
+            x2 = torch.cat(
+                [x2, torch.zeros((Mpad - M, hidden), dtype=torch.bfloat16)],
+                dim=0,
+            ).contiguous()
+        host_mesh = ttnn.from_torch(
+            x2, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=attn_norm_dn._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(host_mesh, attn_norm_dn._x_upload_tt)
+        norm_out_tt = attn_norm_dn.forward_device(
+            attn_norm_dn._x_upload_tt, M)
     with _phase("block.attn"):
-        x = layer.attn.forward(x, start_pos)
+        sliced = ttnn.slice(norm_out_tt, [0, 0], [M, hidden])
+        bridge_tt = ttnn.reshape(sliced, [B, S, hidden])
+        attn_out_tt = attn_dev.forward_device(bridge_tt, start_pos)
+        composer = ttnn.ConcatMesh2dToTensor(
+            attn_dev.mesh, attn_dev.mesh_shape, dims=(1, 0))
+        x = ttnn.to_torch(attn_out_tt, mesh_composer=composer)[:B].to(x.dtype)
     with _phase("block.hc_post"):
         x = layer.hc_post(x)
 
