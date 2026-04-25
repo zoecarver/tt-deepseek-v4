@@ -2855,8 +2855,8 @@ class DeviceAttention(nn.Module):
         """Allocate the joint MLA kv_cache buffer eagerly so first decode
         does not trigger a host->device transfer. Inherits whatever CPU
         state is in attn.kv_cache at construction time (zeros pre-prefill,
-        prefill state otherwise). Per-call intermediates (q/kv/rotary)
-        still allocate; will be hoisted as their shapes are pinned."""
+        prefill state otherwise). Also hoists the per-step x upload
+        buffer; per-call intermediates (q/kv/rotary) still allocate."""
         ttnn = self._ttnn
         attn = self.attn
         D = self.head_dim
@@ -2873,6 +2873,14 @@ class DeviceAttention(nn.Module):
             device=self.mesh, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+
+        self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
+        self._x_upload_tt = ttnn.from_torch(
+            torch.zeros(B, 1, self.dim, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._upload_mapper,
         )
 
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
@@ -2894,13 +2902,14 @@ class DeviceAttention(nn.Module):
         rd = self.rope_head_dim
         win = self.window_size
 
-        # Single upload of x.
-        x_tt = ttnn.as_tensor(
+        # Single upload of x via the hoisted upload buffer.
+        host_mesh = ttnn.from_torch(
             x.to(torch.bfloat16).contiguous(),
-            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._upload_mapper,
         )
+        ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
+        x_tt = self._x_upload_tt
 
         device_comp = getattr(attn, "_device_compressor", None)
         device_indexer = getattr(attn, "_device_indexer", None)
