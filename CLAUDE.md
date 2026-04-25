@@ -80,6 +80,12 @@ If the last marker is "weights loaded" but not "weights transferred", the proces
 
 Also check the **first ~20 lines of the log** for a message indicating another process holds a lock on the device. A device lock will show up early in the log, not as a hang mid-run, and the fix is to clear the other process rather than reset the device.
 
+The exact log line to grep for is:
+```
+Waiting for lock 'CHIP_IN_USE_1_PCIe' which is currently held by thread TID: <pid>, PID: <pid>
+```
+If you see this, the current run is queued behind a stale process and will not progress until that process is killed. Don't keep waiting — escalate immediately. The blessed fix is `pkill -9 python` inside the docker container; if that command is denied, ask the user to run it themselves and pause the loop.
+
 ### Recovery steps
 
 When a hang is confirmed:
@@ -152,6 +158,7 @@ Ideas for optimization:
 * Look at metal references to see other ideas for highly optimized models.
 * Try things measure perf, if you have a crazy idea try it and revert if it doesn't work.
 * If you can think of a creative way to improve moe routing, great, but lower priority.
+* Currently we use nn.Module, but this might add some overhead, we could restructure to just use vanilla python for classes and functions. This might be a lot cleaner and better and not allow there to be any implicit lifecycle (inits being called too much) or graph building that might add overhead. At some point I'd like you to refactor to just super simple clean python functions that are called in loops and can be organized in classes if you'd like.
 
 ## References
 
