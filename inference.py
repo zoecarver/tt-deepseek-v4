@@ -686,20 +686,27 @@ class DeviceLMHead:
                 mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
             )
 
-        # Pre-allocated per-step buffers (B=1, single token).
+        self._alloc_decode_tensors()
+
+    def _alloc_decode_tensors(self):
+        """Allocate every per-step ttnn tensor this class uses. Called at
+        construction so all decode allocations are co-located here. No ttnn
+        op outside of this method is allowed to allocate a new device
+        tensor; ops must write into pre-allocated outputs instead."""
+        ttnn = self._ttnn
         self._x_upload_tt = ttnn.from_torch(
-            torch.zeros(1, 1, dim, dtype=torch.bfloat16),
-            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            torch.zeros(1, 1, self.dim, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
         self._matmul_out_tt = ttnn.from_torch(
-            torch.zeros(1, 1, vocab, dtype=torch.bfloat16),
-            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            torch.zeros(1, 1, self.vocab, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1)),
+            mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(None, -1)),
         )
-        self._upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
+        self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
 
     def __call__(self, x_last: torch.Tensor) -> torch.Tensor:
         # x_last: [B=1, dim] — unnormalized if norm_tt is set, else normalized.
@@ -760,23 +767,24 @@ class DeviceColLinear(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1)),
         )
+        self._alloc_decode_tensors()
 
-        # Pre-allocated output buffers for the [B=1, S=1, in_dim] decode case.
-        # forward_device runs matmul (sharded out, last dim) followed by
-        # all_gather to replicate. Both buffers are 3D [1, 1, out_dim] in
-        # logical shape; the sharded one splits the last dim across the mesh.
-        zeros = torch.zeros(1, 1, out_dim, dtype=torch.bfloat16)
+    def _alloc_decode_tensors(self):
+        """Pre-allocate per-step output buffers for [B=1, S=1, out_dim]
+        decode. forward_device's matmul + all_gather both write in place."""
+        ttnn = self._ttnn
+        zeros = torch.zeros(1, 1, self.out_dim, dtype=torch.bfloat16)
         self._matmul_out_tt = ttnn.from_torch(
             zeros,
-            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1)),
+            mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(None, -1)),
         )
         self._gather_out_tt = ttnn.from_torch(
             zeros,
-            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -859,13 +867,25 @@ class DeviceMoEGate(nn.Module):
         )
         self.w_tt = ttnn.as_tensor(w_kn, **common_rep)
         self.bias_tt = ttnn.as_tensor(b_row, **common_rep)
+        self._alloc_decode_tensors()
 
-        # Pre-allocated per-step buffers (M=1).
+    def _alloc_decode_tensors(self):
+        """Pre-allocate per-step input/output buffers (M=1). Intermediate
+        ops (softplus/sqrt/add/topk/gather/sum/div/multiply) currently
+        still allocate per-call — to be hoisted in a follow-up batch."""
+        ttnn = self._ttnn
+        common_rep = dict(
+            device=self.mesh,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
         self._x_upload_tt = ttnn.from_torch(
-            torch.zeros(1, dim, dtype=torch.bfloat16), **common_rep)
+            torch.zeros(1, self.dim, dtype=torch.bfloat16), **common_rep)
         self._raw_tt = ttnn.from_torch(
-            torch.zeros(1, n_experts, dtype=torch.bfloat16), **common_rep)
-        self._upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
+            torch.zeros(1, self.n_experts, dtype=torch.bfloat16), **common_rep)
+        self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
 
     def forward(self, x: torch.Tensor):
         """x: [M=1, dim] -> (weights [1, topk] float32, indices [1, topk] int64)."""
@@ -1034,11 +1054,14 @@ class DeviceRMSNorm(nn.Module):
         self.gamma_tt = ttnn.as_tensor(_pack_rms_gamma(g), **rep)
         self.sc_tt = ttnn.as_tensor(
             torch.ones((_RMS_TILE, _RMS_TILE), dtype=torch.bfloat16), **rep)
+        self._alloc_decode_tensors()
 
-        # Pre-allocated kernel output buffer for the loop-prefill / decode
-        # case (num_rows=1, Mpad=TILE). The kernel overwrites every tile.
+    def _alloc_decode_tensors(self):
+        """Kernel output buffer for the loop-prefill / decode case
+        (num_rows=1, Mpad=TILE). The fused kernel overwrites every tile."""
+        ttnn = self._ttnn
         self._out_tt = ttnn.zeros(
-            shape=(_RMS_TILE, hidden),
+            shape=(_RMS_TILE, self.hidden),
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             device=self.mesh,
@@ -1764,9 +1787,14 @@ class DeviceMHC(nn.Module):
         self._stash_post_tt = None
         self._stash_comb_sk_tt = None
 
-        # Per-step output buffers for the tt-lang kernels. Allocated once at
-        # num_tokens=1 (loop-prefill: every step is a single token). The
-        # kernels overwrite every tile they own, so no per-call zeroing.
+        self._alloc_decode_tensors()
+
+    def _alloc_decode_tensors(self):
+        """Per-step output buffers for the tt-lang kernels and upload
+        buffers for the residual / x feeds. Allocated once at num_tokens=1
+        (loop-prefill: every step is a single token). The kernels
+        overwrite every tile they own, so no per-call zeroing."""
+        ttnn = self._ttnn
         num_tokens_pad = _MHC_TILE
         num_tokens = 1
         self._mixes_tt = self._zeros((num_tokens_pad, _MHC_TILE))
@@ -1777,24 +1805,23 @@ class DeviceMHC(nn.Module):
         self._apply_mix_out_tt = self._zeros((num_tokens * _MHC_TILE, self.hidden))
         self._post_out_tt = self._zeros((num_tokens * _MHC_TILE, self.hidden))
 
-        # Pre-allocated upload buffers. hc_pre uploads residual packed as
-        # [num_tokens_pad, mhc*hidden]; hc_post uploads x packed as
-        # [num_tokens * TILE, hidden]. Pinned to num_tokens=1.
+        # Upload buffers. hc_pre uploads residual packed as [num_tokens_pad,
+        # mhc*hidden]; hc_post uploads x packed as [num_tokens * TILE, hidden].
         self._a_upload_tt = ttnn.from_torch(
             torch.zeros(num_tokens_pad, self.hc_mult * self.hidden,
                         dtype=torch.float32),
-            device=mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            device=self.mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
         self._x_upload_tt = ttnn.from_torch(
             torch.zeros(num_tokens * _MHC_TILE, self.hidden,
                         dtype=torch.float32),
-            device=mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            device=self.mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
-        self._upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
+        self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
 
     def _norm_fn_kernel(self, num_out_tiles: int):
         key = ("norm_fn", num_out_tiles)
@@ -2092,21 +2119,32 @@ class DeviceSharedExpert(nn.Module):
             _weight_to_bf16(cpu_w3).transpose(0, 1).contiguous(), **common_rep)
         self.w2_tt = ttnn.as_tensor(
             _weight_to_bf16(cpu_w2).transpose(0, 1).contiguous(), **common_rep)
+        self._alloc_decode_tensors()
 
-        # Pre-allocated per-step buffers (M=1, loop-prefill).
+    def _alloc_decode_tensors(self):
+        """Pre-allocate per-step buffers for the M=1 SwiGLU pipeline. Every
+        ttnn op below feeds output_tensor= / optional_output_tensor=."""
+        ttnn = self._ttnn
+        common_rep = dict(
+            device=self.mesh,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
         self._x_upload_tt = ttnn.from_torch(
-            torch.zeros(1, dim, dtype=torch.bfloat16), **common_rep)
+            torch.zeros(1, self.dim, dtype=torch.bfloat16), **common_rep)
         self._y1_tt = ttnn.from_torch(
-            torch.zeros(1, inter_dim, dtype=torch.bfloat16), **common_rep)
+            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16), **common_rep)
         self._y3_tt = ttnn.from_torch(
-            torch.zeros(1, inter_dim, dtype=torch.bfloat16), **common_rep)
+            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16), **common_rep)
         self._silu_tt = ttnn.from_torch(
-            torch.zeros(1, inter_dim, dtype=torch.bfloat16), **common_rep)
+            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16), **common_rep)
         self._mid_tt = ttnn.from_torch(
-            torch.zeros(1, inter_dim, dtype=torch.bfloat16), **common_rep)
+            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16), **common_rep)
         self._out_tt = ttnn.from_torch(
-            torch.zeros(1, dim, dtype=torch.bfloat16), **common_rep)
-        self._upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
+            torch.zeros(1, self.dim, dtype=torch.bfloat16), **common_rep)
+        self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """x: [M=1, dim] -> [M=1, dim]. weights matches Expert.forward
@@ -3746,6 +3784,41 @@ class Model:
             layer.hc_post = _device_hc_post.__get__(layer, type(layer))
             self._device_mhc.append((mhc_attn, mhc_ffn))
 
+    def _iter_device_modules(self):
+        """Yield every Device* instance the model has constructed. Single
+        source of truth for the orchestrator and any future tracing wiring."""
+        if hasattr(self, "_device_lm_head"):
+            yield self._device_lm_head
+        for attr in ("_device_wq_a", "_device_wq_b", "_device_wkv",
+                     "_device_wo_b", "_device_compressor_linears",
+                     "_device_indexer_linears"):
+            for inst in getattr(self, attr, ()):
+                yield inst
+        for attr in ("_device_rms_norms", "_device_shared_experts",
+                     "_device_moe_gates", "_device_sparse_attn",
+                     "_device_attn_full", "_device_compressors",
+                     "_device_indexers"):
+            for inst in getattr(self, attr, ()):
+                yield inst
+        for pair in getattr(self, "_device_mhc", ()):
+            for inst in pair:
+                yield inst
+
+    def allocate_decode_tensors(self):
+        """Single entry point that re-runs every Device* instance's
+        `_alloc_decode_tensors()`. Each per-step ttnn tensor lives on its
+        owning class and is referenced by every ttnn op inside that class
+        via output_tensor= / optional_output_tensor=. Currently invoked at
+        construction; this orchestrator exists so tracing (which forbids
+        per-call allocations) can re-run it once before begin_trace_capture."""
+        n = 0
+        for mod in self._iter_device_modules():
+            alloc = getattr(mod, "_alloc_decode_tensors", None)
+            if alloc is not None:
+                alloc()
+                n += 1
+        return n
+
     @torch.inference_mode()
     def step_decode(self, token_id: int, pos: int) -> torch.Tensor:
         """Single decode step. Returns logits [vocab_size]."""
@@ -3848,6 +3921,10 @@ def main():
         t0 = time.time()
         method(mesh)
         print(f"[phase] {label} offloaded in {time.time() - t0:.1f}s")
+
+    n_alloc_modules = sum(1 for _ in model._iter_device_modules())
+    print(f"[phase] {n_alloc_modules} device modules registered for "
+          f"Model.allocate_decode_tensors")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")

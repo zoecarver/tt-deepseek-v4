@@ -110,7 +110,7 @@ Model it after nanochat's inference script (see `../nanochat`):
 
 Work proceeds in three phases. Do not skip ahead; each phase is a prerequisite for the next.
 
-### Phase 1: CPU-only
+### Phase 1: CPU-only DONE
 
 Get the model loading and running end-to-end on CPU first. This is the correctness baseline.
 
@@ -118,7 +118,7 @@ Get the model loading and running end-to-end on CPU first. This is the correctne
 - Load the model with `transformers.AutoModelForCausalLM.from_pretrained(..., dtype="auto")`.
 - Run a short generation and confirm the output is coherent text. This is the validation bar for every later phase.
 
-### Phase 2: Offload post-MoE to QB
+### Phase 2: Offload post-MoE to QB DONE
 
 The Quiet Box has **64 GB DRAM across 4 chips**. Weights must be sharded per chip. Use existing sharding references in the sibling repos listed below (do not invent a new sharding scheme).
 
@@ -135,6 +135,23 @@ Loop:
 3. Make one optimization.
 4. If tok/s improves **and** validation still passes, commit. Otherwise revert.
 5. Repeat.
+
+Notes: 
+* optimize however you see fit, ideally by fusing and writing tt-lang kernels. Do not remove tt-lang kernels as mentioned below, even if it improves performance.
+* optimize with galaxy in mind: eventually we are going to move to a galaxy and bring moe routing (expert selection) on device, so focus on the parts after that. Don't worry about wall time, just worry about post-moe decode. Try to focus on distributing work in a way that will scale to 32 cards.
+* make sure you measure the correct thing: enable tracing and only measure post-moe-routing work, don't measure device transfers that will be removed in the future, those are uninteresting. Syncronize the device before measuring perf with prints and time. You can break work out to micro optimize. You can add sleeps if needed to make sure timing is correct. Many kernels are jit'ed and cached, so only measure perf after the first few tokens are generated and only in the hot paths that we are optimizing (not moe routing that's still on host or other device transfers that will be moved).
+* Maybe try doing a longer token generation to see how times amortize.
+* Host operations and tensor transfers to device swing all over the place, so the wall time will vary a lot, don't let this distract you. For example, running inference twice in a row with two tokens generated might be anywhere from 180s to 240s at current wall time.
+
+Ideas for optimization:
+* Make sure everything is on device in the hot path and tensors are allocated ahead of time.
+* Enable tracing (there is a skill for this and some referenced models have tracing enabled)
+* Improve sharding and card utilization: use more of the 4 cards, distribute data more, etc.
+* Move tensors to L1
+* Fuse kernels together and move more to tt-lang, use pipes to mcast and communicate. Try fusing matmul with elementwise kernels.
+* Look at metal references to see other ideas for highly optimized models.
+* Try things measure perf, if you have a crazy idea try it and revert if it doesn't work.
+* If you can think of a creative way to improve moe routing, great, but lower priority.
 
 ## References
 
