@@ -891,9 +891,9 @@ class DeviceMoEGate(nn.Module):
         self._alloc_decode_tensors()
 
     def _alloc_decode_tensors(self):
-        """Pre-allocate per-step input/output buffers (M=1). Intermediate
-        ops (softplus/sqrt/add/topk/gather/sum/div/multiply) currently
-        still allocate per-call — to be hoisted in a follow-up batch."""
+        """Pre-allocate per-step input/output buffers (M=1). The traced
+        compute body allocates intermediates (softplus/sqrt/add/topk/...)
+        on the device side; trace replay reuses the captured addresses."""
         ttnn = self._ttnn
         common_rep = dict(
             device=self.mesh,
@@ -907,6 +907,34 @@ class DeviceMoEGate(nn.Module):
         self._raw_tt = ttnn.from_torch(
             torch.zeros(1, self.n_experts, dtype=torch.bfloat16), **common_rep)
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
+        self._trace_id = None
+        self._weights_tt = None
+        self._indices_tt = None
+
+    def _compute_body(self):
+        """Returns (weights_tt, indices_tt). Called outside trace as warmup
+        and again during begin_trace_capture; on replay the captured
+        op sequence reproduces the same output addresses."""
+        ttnn = self._ttnn
+        x_tt = self._x_upload_tt
+        ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._raw_tt)
+        scores_tt = ttnn.sqrt(ttnn.softplus(self._raw_tt))
+        biased_tt = ttnn.add(scores_tt, self.bias_tt)
+        _, indices_tt = ttnn.topk(biased_tt, k=self.topk, dim=-1, largest=True, sorted=True)
+        gathered_tt = ttnn.gather(scores_tt, dim=-1, index=indices_tt)
+        wsum_tt = ttnn.sum(gathered_tt, dim=-1, keepdim=True)
+        normed_tt = ttnn.div(gathered_tt, wsum_tt)
+        weights_tt = ttnn.multiply(normed_tt, self.route_scale)
+        return weights_tt, indices_tt
+
+    def _capture_trace(self):
+        ttnn = self._ttnn
+        self._weights_tt, self._indices_tt = self._compute_body()  # warmup
+        ttnn.synchronize_device(self.mesh)
+        self._trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
+        self._weights_tt, self._indices_tt = self._compute_body()
+        ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
 
     def forward(self, x: torch.Tensor):
         """x: [M=1, dim] -> (weights [1, topk] float32, indices [1, topk] int64)."""
@@ -922,21 +950,15 @@ class DeviceMoEGate(nn.Module):
             mesh_mapper=self._upload_mapper,
         )
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
-        x_tt = self._x_upload_tt
-        ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    optional_output_tensor=self._raw_tt)
-        scores_tt = ttnn.sqrt(ttnn.softplus(self._raw_tt))
-        biased_tt = ttnn.add(scores_tt, self.bias_tt)
-        _, indices_tt = ttnn.topk(biased_tt, k=self.topk, dim=-1, largest=True, sorted=True)
-        gathered_tt = ttnn.gather(scores_tt, dim=-1, index=indices_tt)
-        wsum_tt = ttnn.sum(gathered_tt, dim=-1, keepdim=True)
-        normed_tt = ttnn.div(gathered_tt, wsum_tt)
-        weights_tt = ttnn.multiply(normed_tt, self.route_scale)
+        if self._trace_id is None:
+            self._capture_trace()
+        else:
+            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
 
         # Replicated readback: stack 4 copies on tensor dim 0, take first M rows.
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        weights = ttnn.to_torch(weights_tt, mesh_composer=composer)[:M].float()
-        indices = ttnn.to_torch(indices_tt, mesh_composer=composer)[:M].long()
+        weights = ttnn.to_torch(self._weights_tt, mesh_composer=composer)[:M].float()
+        indices = ttnn.to_torch(self._indices_tt, mesh_composer=composer)[:M].long()
         return weights, indices
 
 
