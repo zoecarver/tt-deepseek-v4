@@ -2212,6 +2212,13 @@ class DeviceSparseAttn(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
         )
+        self._alloc_decode_tensors()
+
+    def _alloc_decode_tensors(self):
+        """No per-step buffers yet; intermediates (gather/scores/probs)
+        still allocate per-call. Reserved entry point for follow-up
+        hoists once tracing exposes the fixed-shape pattern."""
+        return
 
     def forward(
         self,
@@ -2502,7 +2509,11 @@ class DeviceCompressor(nn.Module):
         self.slot_offset = slot_offset
         self._owns_kv_cache = False
 
-    def _alloc_state(self, B: int):
+    def _alloc_decode_tensors(self, B: int = 1):
+        """Allocate per-step state buffers (kv_state/score_state/kv_cache).
+        Decode runs B=1; the orchestrator calls this with the default.
+        Idempotent — re-running rebinds fresh device buffers from the
+        current CPU state."""
         ttnn = self._ttnn
         comp = self.comp
         d = self.head_dim
@@ -2563,7 +2574,7 @@ class DeviceCompressor(nn.Module):
         rd = self.rope_head_dim
 
         if self.kv_state_front_tt is None:
-            self._alloc_state(B)
+            self._alloc_decode_tensors(B)
 
         kv_tt = self.wkv.forward_device(x_tt)
         score_tt = self.wgate.forward_device(x_tt)
@@ -2698,6 +2709,13 @@ class DeviceIndexer(nn.Module):
         fc = indexer.freqs_cis
         self.cos_full_tt = ttnn.as_tensor(fc.real.to(torch.bfloat16).contiguous(), **rep)
         self.sin_full_tt = ttnn.as_tensor(fc.imag.to(torch.bfloat16).contiguous(), **rep)
+        self._alloc_decode_tensors()
+
+    def _alloc_decode_tensors(self):
+        """No per-step buffers yet; q/cos/sin slices and score temporaries
+        still allocate per-call. Reserved entry point for the future
+        `indexer_score_reduce` fused kernel."""
+        return
 
     def forward_device_score(self, x_tt, qr_tt, B: int, start_pos: int):
         ttnn = self._ttnn
@@ -2810,12 +2828,11 @@ class DeviceAttention(nn.Module):
         ).transpose(1, 2).contiguous()  # [G, in, R]
         self.wo_a_w_tt = ttnn.as_tensor(w_g, **rep)
 
-        # Persistent device-side joint MLA kv_cache. Lazy-allocated on first
-        # decode call so it inherits the post-prefill CPU cache. Shape on
-        # device: [1, 1, kv_cache_size_pad, head_dim] (B=1, num_heads=1) so
-        # ttnn.kv_cache.update_cache_for_token_ can write a single slot. We
-        # pad the seq dim up to a tile boundary; padding slots are never
-        # addressed by topk_idxs and remain zero.
+        # Persistent device-side joint MLA kv_cache. Shape on device:
+        # [1, 1, kv_cache_size_pad, head_dim] (B=1, num_heads=1) so
+        # ttnn.kv_cache.update_cache_for_token_ can write a single slot. The
+        # seq dim is padded up to a tile boundary; padding slots are never
+        # addressed by topk_idxs and stay zero.
         kv_shape = tuple(attn.kv_cache.shape)
         if len(kv_shape) != 3:
             raise ValueError(
@@ -2831,7 +2848,32 @@ class DeviceAttention(nn.Module):
             )
         self.kv_cache_size = kv_shape[1]
         self.kv_cache_size_pad = -(-self.kv_cache_size // 32) * 32
-        self.kv_cache_tt = None  # allocated on first _decode call
+        self.kv_cache_tt = None
+        self._alloc_decode_tensors()
+
+    def _alloc_decode_tensors(self, B: int = 1):
+        """Allocate the joint MLA kv_cache buffer eagerly so first decode
+        does not trigger a host->device transfer. Inherits whatever CPU
+        state is in attn.kv_cache at construction time (zeros pre-prefill,
+        prefill state otherwise). Per-call intermediates (q/kv/rotary)
+        still allocate; will be hoisted as their shapes are pinned."""
+        ttnn = self._ttnn
+        attn = self.attn
+        D = self.head_dim
+        cache_3d = attn.kv_cache[:B].to(torch.bfloat16).contiguous()
+        if self.kv_cache_size_pad != self.kv_cache_size:
+            pad = torch.zeros(
+                B, self.kv_cache_size_pad - self.kv_cache_size, D,
+                dtype=torch.bfloat16,
+            )
+            cache_3d = torch.cat([cache_3d, pad], dim=1)
+        cache_4d = cache_3d.view(B, 1, self.kv_cache_size_pad, D)
+        self.kv_cache_tt = ttnn.as_tensor(
+            cache_4d,
+            device=self.mesh, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
 
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         """Single-token forward. Prefill is driven externally as a per-token
@@ -2964,53 +3006,31 @@ class DeviceAttention(nn.Module):
             attn.kv_cache[:B, start_pos % win] = kv_cpu.squeeze(1)
             if self.compress_ratio:
                 attn.compressor(x, start_pos)
-            if self.kv_cache_tt is None:
-                cache_3d = attn.kv_cache[:B].to(torch.bfloat16).contiguous()
-                if self.kv_cache_size_pad != self.kv_cache_size:
-                    pad = torch.zeros(
-                        B, self.kv_cache_size_pad - self.kv_cache_size, D,
-                        dtype=torch.bfloat16,
-                    )
-                    cache_3d = torch.cat([cache_3d, pad], dim=1)
-                cache_4d = cache_3d.view(B, 1, self.kv_cache_size_pad, D)
-                self.kv_cache_tt = ttnn.as_tensor(cache_4d, **common_rep)
-            else:
-                window_slot = (
-                    attn.kv_cache[:B, start_pos % win]
+            window_slot = (
+                attn.kv_cache[:B, start_pos % win]
+                .to(torch.bfloat16)
+                .contiguous()
+                .view(B, 1, 1, D)
+            )
+            window_slot_tt = ttnn.as_tensor(window_slot, **common_rep)
+            ttnn.kv_cache.update_cache_for_token_(
+                self.kv_cache_tt, window_slot_tt, start_pos % win, 0
+            )
+            if self.compress_ratio and (start_pos + 1) % self.compress_ratio == 0:
+                comp_idx = win + start_pos // self.compress_ratio
+                comp_slot = (
+                    attn.kv_cache[:B, comp_idx]
                     .to(torch.bfloat16)
                     .contiguous()
                     .view(B, 1, 1, D)
                 )
-                window_slot_tt = ttnn.as_tensor(window_slot, **common_rep)
+                comp_slot_tt = ttnn.as_tensor(comp_slot, **common_rep)
                 ttnn.kv_cache.update_cache_for_token_(
-                    self.kv_cache_tt, window_slot_tt, start_pos % win, 0
+                    self.kv_cache_tt, comp_slot_tt, comp_idx, 0
                 )
-                if self.compress_ratio and (start_pos + 1) % self.compress_ratio == 0:
-                    comp_idx = win + start_pos // self.compress_ratio
-                    comp_slot = (
-                        attn.kv_cache[:B, comp_idx]
-                        .to(torch.bfloat16)
-                        .contiguous()
-                        .view(B, 1, 1, D)
-                    )
-                    comp_slot_tt = ttnn.as_tensor(comp_slot, **common_rep)
-                    ttnn.kv_cache.update_cache_for_token_(
-                        self.kv_cache_tt, comp_slot_tt, comp_idx, 0
-                    )
         else:
             # Device path: write window slot directly from kv_tt; compressor
             # writes compress slot at win + comp_idx into the same buffer.
-            if self.kv_cache_tt is None:
-                cache_3d = attn.kv_cache[:B].to(torch.bfloat16).contiguous()
-                if self.kv_cache_size_pad != self.kv_cache_size:
-                    pad = torch.zeros(
-                        B, self.kv_cache_size_pad - self.kv_cache_size, D,
-                        dtype=torch.bfloat16,
-                    )
-                    cache_3d = torch.cat([cache_3d, pad], dim=1)
-                cache_4d = cache_3d.view(B, 1, self.kv_cache_size_pad, D)
-                self.kv_cache_tt = ttnn.as_tensor(cache_4d, **common_rep)
-                device_comp.bind_kv_cache_tt(self.kv_cache_tt, slot_offset=win)
             kv_4d = ttnn.reshape(kv_tt, [B, 1, 1, D])
             ttnn.kv_cache.update_cache_for_token_(
                 self.kv_cache_tt, kv_4d, start_pos % win, 0
@@ -3589,6 +3609,7 @@ class Model:
                 wgate_dev=wgate,
                 norm_dev=norm_dev,
             )
+            dc.bind_kv_cache_tt(da.kv_cache_tt, slot_offset=da.window_size)
             attn._device_compressor = dc
             self._device_compressors.append(dc)
 
