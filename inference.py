@@ -1706,6 +1706,19 @@ class DeviceMHC(nn.Module):
         self._stash_post_tt = None
         self._stash_comb_sk_tt = None
 
+        # Per-step output buffers for the tt-lang kernels. Allocated once at
+        # num_tokens=1 (loop-prefill: every step is a single token). The
+        # kernels overwrite every tile they own, so no per-call zeroing.
+        num_tokens_pad = _MHC_TILE
+        num_tokens = 1
+        self._mixes_tt = self._zeros((num_tokens_pad, _MHC_TILE))
+        self._pre_tt = self._zeros((num_tokens_pad, _MHC_TILE))
+        self._post_tt = self._zeros((num_tokens_pad, _MHC_TILE))
+        self._comb_tt = self._zeros((num_tokens_pad, _MHC_TILE))
+        self._comb_sk_out_tt = self._zeros((num_tokens * _MHC_TILE, _MHC_TILE))
+        self._apply_mix_out_tt = self._zeros((num_tokens * _MHC_TILE, self.hidden))
+        self._post_out_tt = self._zeros((num_tokens * _MHC_TILE, self.hidden))
+
     def _norm_fn_kernel(self, num_out_tiles: int):
         key = ("norm_fn", num_out_tiles)
         k = self._kernels.get(key)
@@ -1800,15 +1813,15 @@ class DeviceMHC(nn.Module):
         # use real num_tokens to avoid 32x over-allocation on decode.
         a_packed = _mhc_pack_residual(x, num_tokens_pad)
         a_tt = self._rep_tensor(a_packed)
-        mixes_tt = self._zeros((num_tokens_pad, _MHC_TILE))
+        mixes_tt = self._mixes_tt
         self._norm_fn_kernel(num_tokens_pad // _MHC_TILE)(
             a_tt, self.fn_tt, self.scaler_tt, mixes_tt)
 
         # Step 2: split_mixes on device -> pre/post/comb_raw (each
         # [num_tokens_pad, TILE], column-packed sections).
-        pre_tt = self._zeros((num_tokens_pad, _MHC_TILE))
-        post_tt = self._zeros((num_tokens_pad, _MHC_TILE))
-        comb_tt = self._zeros((num_tokens_pad, _MHC_TILE))
+        pre_tt = self._pre_tt
+        post_tt = self._post_tt
+        comb_tt = self._comb_tt
         self._split_mixes_kernel(num_tokens_pad // _MHC_TILE)(
             mixes_tt, self.split_scale_tt, self.split_base_tt,
             self.split_pre_mask_tt, self.split_pre_eps_tt,
@@ -1833,7 +1846,7 @@ class DeviceMHC(nn.Module):
         )
         comb_sk_in_tt = ttnn.reshape(
             comb_padded, [num_tokens * _MHC_TILE, _MHC_TILE])
-        comb_sk_out_tt = self._zeros((num_tokens * _MHC_TILE, _MHC_TILE))
+        comb_sk_out_tt = self._comb_sk_out_tt
         self._sinkhorn_kernel(num_tokens)(
             comb_sk_in_tt, self.sk_mask_tt, self.sk_eps_mask_tt, self.scaler_tt,
             comb_sk_out_tt,
@@ -1862,7 +1875,7 @@ class DeviceMHC(nn.Module):
             value=0.0,
         )
         x_tt = ttnn.reshape(x_padded, [num_tokens * _MHC_TILE, hidden])
-        out_tt = self._zeros((num_tokens * _MHC_TILE, hidden))
+        out_tt = self._apply_mix_out_tt
         self._apply_mix_kernel(num_tokens)(
             x_tt, mix_tt, self.scaler_tt, out_tt)
 
@@ -1935,7 +1948,7 @@ class DeviceMHC(nn.Module):
         comb_tt = ttnn.reshape(
             comb_T_3d, [num_tokens * _MHC_TILE, _MHC_TILE])
 
-        out_tt = self._zeros((num_tokens * _MHC_TILE, hidden))
+        out_tt = self._post_out_tt
         self._post_kernel(num_tokens)(
             x_tt, res_tt, comb_tt, post_tt, out_tt)
 
