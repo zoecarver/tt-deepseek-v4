@@ -2286,19 +2286,7 @@ class DeviceSparseAttn(nn.Module):
         ttnn = self._ttnn
         cond = ttnn.lt(idxs_int_tt, 0)
         cond_4d = ttnn.reshape(cond, [B, S, 1, K])
-        ninf_tt = ttnn.from_torch(
-            torch.full((B, S, 1, K), float("-inf"), dtype=torch.bfloat16),
-            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
-        )
-        zero_tt = ttnn.from_torch(
-            torch.zeros((B, S, 1, K), dtype=torch.bfloat16),
-            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
-        )
-        valid_tt = ttnn.where(cond_4d, ninf_tt, zero_tt)
+        valid_tt = ttnn.where(cond_4d, float("-inf"), 0.0)
         safe = ttnn.clamp(idxs_int_tt, min=0)
         safe = ttnn.reshape(safe, [B, S * K])
         safe = ttnn.typecast(safe, dtype=ttnn.uint32)
