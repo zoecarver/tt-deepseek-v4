@@ -43,6 +43,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -252,6 +253,107 @@ def _shard_dump(
     del host_tt
 
 
+def _process_one_weight(
+    state: dict,
+    layer: int,
+    wname: str,
+    *,
+    mesh,
+    rows: int,
+    cols: int,
+    n_experts: int,
+    dim: int,
+    inter_dim: int,
+    layer_dir: Path,
+    profile: bool = False,
+) -> dict:
+    """Pipeline for one (layer, wname): stack -> lattice -> shard -> dump
+    for both weight and scale. Pure-host until dump_tensor; thread-safe to
+    run multiple wnames in parallel within a layer."""
+    ws = _shape_for(wname, dim=dim, inter_dim=inter_dim)
+    K, N = ws.K, ws.N
+    t0 = time.perf_counter()
+
+    packed, scales = _stack_layer_weights(state, layer, wname, n_experts)
+    if packed.shape != (n_experts, N, K // 2):
+        raise ValueError(
+            f"layer {layer} {wname}.weight stack shape "
+            f"{tuple(packed.shape)} != expected {(n_experts, N, K // 2)}"
+        )
+    if scales.shape != (n_experts, N, K // FP4_BLOCK_K):
+        raise ValueError(
+            f"layer {layer} {wname}.scale stack shape "
+            f"{tuple(scales.shape)} != expected "
+            f"{(n_experts, N, K // FP4_BLOCK_K)}"
+        )
+    t_stack = time.perf_counter()
+
+    lat_nk = _bulk_fp4_to_bfp4_lattice_bf16(packed)
+    del packed
+    lat_kn = lat_nk.transpose(-2, -1).contiguous()
+    del lat_nk
+    t_lat = time.perf_counter()
+
+    # Split _shard_dump into from_torch + dump_tensor for finer timing.
+    if profile:
+        E = n_experts
+        per_chip = E // (rows * cols)
+        reshaped = lat_kn.view(rows, cols, per_chip, K, N).contiguous()
+        del lat_kn
+        host_tt = ttnn.from_torch(
+            reshaped, dtype=ttnn.bfloat4_b, layout=ttnn.TILE_LAYOUT,
+            device=None, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, (rows, cols), dims=(0, 1)),
+        )
+        del reshaped
+        t_w_ft = time.perf_counter()
+        out_path = layer_dir / f"{wname}.tensorbin"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        ttnn.dump_tensor(str(out_path), host_tt)
+        del host_tt
+        t_w_dump = time.perf_counter()
+    else:
+        _shard_dump(
+            lat_kn,
+            mesh=mesh, rows=rows, cols=cols,
+            out_path=layer_dir / f"{wname}.tensorbin",
+            target_dtype=ttnn.bfloat4_b,
+        )
+        t_w_ft = t_w_dump = time.perf_counter()
+
+    scale_kn = _bulk_e8m0_to_bf16_compact(scales, K=K, N=N)
+    del scales
+    t_scale_lat = time.perf_counter()
+    _shard_dump(
+        scale_kn,
+        mesh=mesh, rows=rows, cols=cols,
+        out_path=layer_dir / f"{wname}_scale.tensorbin",
+        target_dtype=ttnn.bfloat16,
+    )
+
+    dt = time.perf_counter() - t0
+    wsize = (layer_dir / f"{wname}.tensorbin").stat().st_size
+    ssize = (layer_dir / f"{wname}_scale.tensorbin").stat().st_size
+    if profile:
+        print(f"  layer {layer:>3d} {wname:<3s}  K={K:<5d} N={N:<5d}  "
+              f"stack={t_stack-t0:.1f}s  lat={t_lat-t_stack:.1f}s  "
+              f"w_ft={t_w_ft-t_lat:.1f}s  w_dump={t_w_dump-t_w_ft:.1f}s  "
+              f"s_lat={t_scale_lat-t_w_dump:.1f}s  s_dump={time.perf_counter()-t_scale_lat:.1f}s  "
+              f"total={dt:.1f}s",
+              flush=True)
+    else:
+        print(f"  layer {layer:>3d} {wname:<3s}  K={K:<5d} N={N:<5d}  "
+              f"wbytes={wsize:>10d}  sbytes={ssize:>10d}  ({dt:.1f}s)",
+              flush=True)
+    return {
+        "wname": wname,
+        "weight": f"{wname}.tensorbin",
+        "scale":  f"{wname}_scale.tensorbin",
+        "K": K, "N": N,
+        "weight_bytes": wsize, "scale_bytes": ssize,
+    }
+
+
 def _process_layer(
     state: dict,
     layer: int,
@@ -263,66 +365,39 @@ def _process_layer(
     dim: int,
     inter_dim: int,
     layer_dir: Path,
+    workers: int,
+    profile: bool = False,
 ) -> dict:
     """Build and dump the 6 .tensorbin files for one MoE layer. Returns a
-    summary dict for the manifest."""
+    summary dict for the manifest. With workers>1, runs w1/w3/w2 concurrently
+    on a thread pool (host pipeline is independent across the three)."""
     summary: dict = {"layer": layer, "files": {}}
-    for wname in ("w1", "w3", "w2"):
-        ws = _shape_for(wname, dim=dim, inter_dim=inter_dim)
-        K, N = ws.K, ws.N
-        t0 = time.perf_counter()
-
-        packed, scales = _stack_layer_weights(state, layer, wname, n_experts)
-        if packed.shape != (n_experts, N, K // 2):
-            raise ValueError(
-                f"layer {layer} {wname}.weight stack shape "
-                f"{tuple(packed.shape)} != expected "
-                f"{(n_experts, N, K // 2)}"
+    wnames = ("w1", "w3", "w2")
+    if workers <= 1:
+        results = [
+            _process_one_weight(
+                state, layer, w,
+                mesh=mesh, rows=rows, cols=cols, n_experts=n_experts,
+                dim=dim, inter_dim=inter_dim, layer_dir=layer_dir,
+                profile=profile,
             )
-        if scales.shape != (n_experts, N, K // FP4_BLOCK_K):
-            raise ValueError(
-                f"layer {layer} {wname}.scale stack shape "
-                f"{tuple(scales.shape)} != expected "
-                f"{(n_experts, N, K // FP4_BLOCK_K)}"
-            )
-
-        # Lattice gather: [E, N, K/2] -> [E, N, K] bf16. One op for all 256 experts.
-        lat_nk = _bulk_fp4_to_bfp4_lattice_bf16(packed)
-        del packed
-        # Matmul order [E, K, N]
-        lat_kn = lat_nk.transpose(-2, -1).contiguous()
-        del lat_nk
-
-        # Dump weight as bfp4_b sharded.
-        _shard_dump(
-            lat_kn,
-            mesh=mesh, rows=rows, cols=cols,
-            out_path=layer_dir / f"{wname}.tensorbin",
-            target_dtype=ttnn.bfloat4_b,
-        )
-
-        # Scale: [E, N, Kb] e8m0 -> [E, Kb, N] bf16 compact, then dump as bf16 sharded.
-        scale_kn = _bulk_e8m0_to_bf16_compact(scales, K=K, N=N)
-        del scales
-        _shard_dump(
-            scale_kn,
-            mesh=mesh, rows=rows, cols=cols,
-            out_path=layer_dir / f"{wname}_scale.tensorbin",
-            target_dtype=ttnn.bfloat16,
-        )
-
-        dt = time.perf_counter() - t0
-        wsize = (layer_dir / f"{wname}.tensorbin").stat().st_size
-        ssize = (layer_dir / f"{wname}_scale.tensorbin").stat().st_size
-        print(f"  layer {layer:>3d} {wname:<3s}  K={K:<5d} N={N:<5d}  "
-              f"wbytes={wsize:>10d}  sbytes={ssize:>10d}  ({dt:.1f}s)",
-              flush=True)
-        summary["files"][wname] = {
-            "weight": f"{wname}.tensorbin",
-            "scale":  f"{wname}_scale.tensorbin",
-            "K": K, "N": N,
-            "weight_bytes": wsize, "scale_bytes": ssize,
-        }
+            for w in wnames
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(wnames))) as ex:
+            futures = [
+                ex.submit(
+                    _process_one_weight, state, layer, w,
+                    mesh=mesh, rows=rows, cols=cols, n_experts=n_experts,
+                    dim=dim, inter_dim=inter_dim, layer_dir=layer_dir,
+                    profile=profile,
+                )
+                for w in wnames
+            ]
+            results = [f.result() for f in futures]
+    for r in results:
+        wname = r.pop("wname")
+        summary["files"][wname] = r
     return summary
 
 
@@ -430,6 +505,14 @@ def main():
                    help="At end, load back and PCC-check one expert per layer.")
     p.add_argument("--limit-layers", type=int, default=0,
                    help="If >0, only process this many layers (for testing).")
+    p.add_argument("--workers", type=int, default=3,
+                   help="Threads per layer (1=serial w1->w3->w2; 3=full intra-layer parallel).")
+    p.add_argument("--profile", action="store_true",
+                   help="Print fine-grained per-stage timing for each (layer, wname).")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip layers whose 6 .tensorbin files all already exist "
+                        "(checked by file presence, not size). Manifest is "
+                        "rebuilt from disk for skipped layers.")
     args = p.parse_args()
 
     state_path = Path(args.state_dict)
@@ -482,6 +565,28 @@ def main():
             _validate_layer_keys(state, L, args.n_experts)
             layer_dir = out_dir / f"layer_{L:03d}"
             layer_dir.mkdir(parents=True, exist_ok=True)
+            expected_files = [
+                f"{w}{suf}.tensorbin"
+                for w in ("w1", "w3", "w2")
+                for suf in ("", "_scale")
+            ]
+            if args.resume and all((layer_dir / f).is_file() for f in expected_files):
+                summary = {"layer": L, "files": {}}
+                for w in ("w1", "w3", "w2"):
+                    ws = _shape_for(w, dim=args.dim, inter_dim=args.inter_dim)
+                    summary["files"][w] = {
+                        "weight": f"{w}.tensorbin",
+                        "scale":  f"{w}_scale.tensorbin",
+                        "K": ws.K, "N": ws.N,
+                        "weight_bytes": (layer_dir / f"{w}.tensorbin").stat().st_size,
+                        "scale_bytes":  (layer_dir / f"{w}_scale.tensorbin").stat().st_size,
+                    }
+                summary["walltime_s"] = 0.0
+                manifest["layers"].append(summary)
+                with open(out_dir / "manifest.json", "w") as f:
+                    json.dump(manifest, f, indent=2)
+                print(f"[layer {L}] skipped (resume; cache hit)", flush=True)
+                continue
             t0 = time.perf_counter()
             summary = _process_layer(
                 state, L,
@@ -490,6 +595,8 @@ def main():
                 n_experts=args.n_experts,
                 dim=args.dim, inter_dim=args.inter_dim,
                 layer_dir=layer_dir,
+                workers=args.workers,
+                profile=args.profile,
             )
             summary["walltime_s"] = round(time.perf_counter() - t0, 2)
             manifest["layers"].append(summary)
@@ -500,19 +607,25 @@ def main():
                   flush=True)
 
         if args.validate:
-            print("\n[validate] one expert per layer", flush=True)
-            for L in layers[: max(1, len(layers) // 4)]:
-                pcc = _validate_one_expert(
-                    state, mesh=mesh,
-                    rows=args.mesh_rows, cols=args.mesh_cols,
-                    layer=L, expert_idx=0, wname="w1",
-                    dim=args.dim, inter_dim=args.inter_dim,
-                    cache_dir=out_dir,
-                )
-                print(f"  layer {L} expert 0 w1: PCC={pcc:.6f}", flush=True)
-                if pcc < 0.999:
-                    raise AssertionError(
-                        f"layer {L} expert 0 w1: PCC {pcc:.6f} < 0.999")
+            # Sample first/middle/last layer × {w1, w3, w2} × first/last expert.
+            # load_tensor is ~0.3s/file, so this stays well under a minute.
+            print("\n[validate] sampling layers x weights x experts", flush=True)
+            sample_layers = sorted({layers[0], layers[len(layers)//2], layers[-1]})
+            sample_experts = (0, args.n_experts - 1)
+            for L in sample_layers:
+                for wname in ("w1", "w3", "w2"):
+                    for E in sample_experts:
+                        pcc = _validate_one_expert(
+                            state, mesh=mesh,
+                            rows=args.mesh_rows, cols=args.mesh_cols,
+                            layer=L, expert_idx=E, wname=wname,
+                            dim=args.dim, inter_dim=args.inter_dim,
+                            cache_dir=out_dir,
+                        )
+                        print(f"  layer {L:>3d} expert {E:>3d} {wname}: PCC={pcc:.6f}", flush=True)
+                        if pcc < 0.999:
+                            raise AssertionError(
+                                f"layer {L} expert {E} {wname}: PCC {pcc:.6f} < 0.999")
 
         print(f"\n[done] total wall {time.perf_counter()-wall0:.1f}s", flush=True)
     finally:
