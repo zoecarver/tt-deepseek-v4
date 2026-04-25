@@ -539,35 +539,63 @@ def _block_forward(layer, x: torch.Tensor, start_pos: int,
       - layer.ffn.forward: MoE host loop with device gate / shared expert
     """
     mhc_attn = layer._device_mhc_attn
+    mhc_ffn = layer._device_mhc_ffn
     attn_norm_dn = layer.attn_norm.forward.__self__
+    ffn_norm_dn = layer.ffn_norm.forward.__self__
     attn_dev = layer.attn._device_attention
     ttnn = attn_norm_dn._ttnn
-    B, S, _, hidden = x.shape
+    B, S, mhc, hidden = x.shape
     orig_dtype = x.dtype
+    num_tokens = B * S
+    num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
 
     with _phase("block.hc_pre"):
         hc_out_fp32 = mhc_attn.hc_pre_with_upload(x)
     with _phase("block.norm"):
         norm_in = ttnn.typecast(hc_out_fp32, dtype=ttnn.bfloat16)
-        norm_out_tt = attn_norm_dn.forward_device(norm_in, B * S)
+        norm_out_tt = attn_norm_dn.forward_device(norm_in, num_tokens)
     with _phase("block.attn"):
-        sliced = ttnn.slice(norm_out_tt, [0, 0], [B * S, hidden])
+        sliced = ttnn.slice(norm_out_tt, [0, 0], [num_tokens, hidden])
         bridge_tt = ttnn.reshape(sliced, [B, S, hidden])
         attn_out_tt = attn_dev.forward_device(bridge_tt, start_pos)
-        composer = ttnn.ConcatMesh2dToTensor(
-            attn_dev.mesh, attn_dev.mesh_shape, dims=(1, 0))
-        x = ttnn.to_torch(attn_out_tt, mesh_composer=composer)[:B].to(orig_dtype)
     with _phase("block.hc_post"):
-        x = mhc_attn.hc_post(x)
+        x_2d = ttnn.reshape(attn_out_tt, [num_tokens, 1, hidden])
+        x_repeated = ttnn.repeat(x_2d, ttnn.Shape([1, mhc, 1]))
+        x_padded = ttnn.pad(
+            x_repeated,
+            padding=[(0, 0), (0, _MHC_TILE - mhc), (0, 0)],
+            value=0.0,
+        )
+        x_post_input = ttnn.reshape(
+            x_padded, [num_tokens * _MHC_TILE, hidden])
+        x_post_input_fp32 = ttnn.typecast(x_post_input, dtype=ttnn.float32)
+        post_out_tt = mhc_attn.hc_post_device(num_tokens, x_tt=x_post_input_fp32)
 
     with _phase("block.hc_pre"):
-        x = layer.hc_pre(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
+        post_3d = ttnn.reshape(post_out_tt, [num_tokens, _MHC_TILE, hidden])
+        post_sliced = ttnn.slice(post_3d, [0, 0, 0], [num_tokens, mhc, hidden])
+        post_flat = ttnn.reshape(post_sliced, [num_tokens, mhc * hidden])
+        a_input_tt = ttnn.pad(
+            post_flat,
+            padding=[(0, num_tokens_pad - num_tokens), (0, 0)],
+            value=0.0,
+        )
+        ffn_hc_out_fp32 = mhc_ffn.hc_pre_device(
+            num_tokens, num_tokens_pad, a_tt=a_input_tt)
     with _phase("block.norm"):
-        x = layer.ffn_norm.forward(x)
+        ffn_norm_in = ttnn.typecast(ffn_hc_out_fp32, dtype=ttnn.bfloat16)
+        ffn_norm_out_tt = ffn_norm_dn.forward_device(ffn_norm_in, num_tokens)
     with _phase("block.ffn"):
-        x = layer.ffn.forward(x, input_ids)
+        ffn_norm_sliced = ttnn.slice(
+            ffn_norm_out_tt, [0, 0], [num_tokens, hidden])
+        ffn_norm_bridge = ttnn.reshape(ffn_norm_sliced, [B, S, hidden])
+        composer = ttnn.ConcatMesh2dToTensor(
+            ffn_norm_dn.mesh, ffn_norm_dn.mesh_shape, dims=(1, 0))
+        x_for_moe = ttnn.to_torch(
+            ffn_norm_bridge, mesh_composer=composer)[:B].to(orig_dtype)
+        x = layer.ffn.forward(x_for_moe, input_ids)
     with _phase("block.hc_post"):
-        x = layer.hc_post(x)
+        x = mhc_ffn.hc_post(x)
     return x
 
 
@@ -2006,17 +2034,19 @@ class DeviceMHC(nn.Module):
             device=self.mesh, memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
-    def hc_pre_device(self, num_tokens: int, num_tokens_pad: int):
-        """Pure-device hc_pre body: assumes self._a_upload_tt is already
-        filled with the [num_tokens_pad, mhc*hidden] residual layout.
-        Runs norm_fn -> split_mixes -> sinkhorn -> apply_mix and returns
-        the apply_mix output device tensor [num_tokens * TILE, hidden].
-        Stashes a_tt/post_tt/comb_sk_out_tt for the matching hc_post.
-        No host transfers."""
+    def hc_pre_device(self, num_tokens: int, num_tokens_pad: int,
+                      a_tt=None):
+        """Pure-device hc_pre body. If a_tt is None, reads from
+        self._a_upload_tt. Otherwise uses the provided device tensor
+        (must be [num_tokens_pad, mhc*hidden] fp32 TILE_LAYOUT). Runs
+        norm_fn -> split_mixes -> sinkhorn -> apply_mix and returns the
+        apply_mix output device tensor [num_tokens * TILE, hidden].
+        Stashes a_tt/post_tt/comb_sk_out_tt for the matching hc_post."""
         ttnn = self._ttnn
         mhc = self.hc_mult
         hidden = self.hidden
-        a_tt = self._a_upload_tt
+        if a_tt is None:
+            a_tt = self._a_upload_tt
         mixes_tt = self._mixes_tt
 
         self._norm_fn_kernel(num_tokens_pad // _MHC_TILE)(
@@ -2125,10 +2155,12 @@ class DeviceMHC(nn.Module):
         y_flat = _mhc_unpack_apply_mix_out(out_packed, num_tokens, hidden)
         return y_flat.view(B, S, hidden).to(out_dtype)
 
-    def hc_post_device(self, num_tokens: int):
-        """Pure-device hc_post body: assumes self._x_upload_tt is already
-        filled with the [num_tokens * TILE, hidden] x layout, and the
-        matching hc_pre_device has stashed a/post/comb_sk tensors. Runs
+    def hc_post_device(self, num_tokens: int, x_tt=None):
+        """Pure-device hc_post body. If x_tt is None, reads from
+        self._x_upload_tt. Otherwise uses the provided device tensor
+        (must be [num_tokens * TILE, hidden] fp32 TILE_LAYOUT with rows
+        0..mhc-1 of each block holding the x copy). The matching
+        hc_pre_device must have stashed a/post/comb_sk tensors. Runs
         the post kernel and returns the output device tensor
         [num_tokens * TILE, hidden]. Clears the stash afterwards. No host
         transfers."""
@@ -2170,9 +2202,11 @@ class DeviceMHC(nn.Module):
         comb_tt = ttnn.reshape(
             comb_T_3d, [num_tokens * _MHC_TILE, _MHC_TILE])
 
+        if x_tt is None:
+            x_tt = self._x_upload_tt
         out_tt = self._post_out_tt
         self._post_kernel(num_tokens)(
-            self._x_upload_tt, res_tt, comb_tt, post_tt, out_tt)
+            x_tt, res_tt, comb_tt, post_tt, out_tt)
         return out_tt
 
     def hc_post(self, x: torch.Tensor):
