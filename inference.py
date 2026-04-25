@@ -4392,64 +4392,12 @@ def main():
     parser.add_argument("--weights-only", action="store_true",
                         help="Stop after loading weights (Phase 1 gate)")
     parser.add_argument("--verbose-load", action="store_true")
-    parser.add_argument("--offload-lm-head", action="store_true",
-                        help="Shard lm_head across a 1x4 Blackhole mesh (Phase 2)")
-    parser.add_argument("--offload-attn-wq-b", action="store_true",
-                        help="Shard wq_b (Q-LoRA up) across the 1x4 mesh (Phase 2)")
-    parser.add_argument("--offload-attn-wq-a", action="store_true",
-                        help="Shard wq_a (Q-LoRA down) across the 1x4 mesh (Phase 2)")
-    parser.add_argument("--offload-attn-wkv", action="store_true",
-                        help="Shard wkv (KV-with-MQA down) across the 1x4 mesh (Phase 2)")
-    parser.add_argument("--offload-attn-wo-a", action="store_true",
-                        help="Block-diagonal per-group shard wo_a across the 1x4 mesh (Phase 2)")
-    parser.add_argument("--offload-attn-wo-b", action="store_true",
-                        help="Row-parallel shard wo_b across the 1x4 mesh (Phase 2)")
-    parser.add_argument("--offload-moe-gate", action="store_true",
-                        help="Replicate MoE gate on 1x4 mesh (sqrtsoftplus); non-hash layers only")
-    parser.add_argument("--offload-moe-shared-expert", action="store_true",
-                        help="Replicate MoE shared-expert SwiGLU on 1x4 mesh (all layers)")
-    parser.add_argument("--offload-rms-norms", action="store_true",
-                        help="Run attn_norm/ffn_norm/q_norm/kv_norm via tt-lang rmsnorm kernel on 1x4 mesh")
-    parser.add_argument("--offload-embedding", action="store_true",
-                        help="Replicate token embedding on 1x4 mesh (ttnn.embedding)")
-    parser.add_argument("--offload-compressor-linears", action="store_true",
-                        help="Col-parallel shard Compressor.wkv + wgate on 1x4 mesh (per layer)")
-    parser.add_argument("--offload-indexer-linears", action="store_true",
-                        help="Col-parallel shard Indexer.wq_b + weights_proj on 1x4 mesh (per layer)")
-    parser.add_argument("--offload-sparse-attn", action="store_true",
-                        help="Run sparse_attn (gather+score+masked-softmax+weighted-sum) on 1x4 mesh per layer")
-    parser.add_argument("--offload-attn-full", action="store_true",
-                        help="Fused MLA attention forward on device (decode path only). "
-                             "Requires all attn sub-pieces already offloaded.")
-    parser.add_argument("--offload-mhc", action="store_true",
-                        help="Run Block.hc_pre / hc_post on 1x4 mesh via tt-lang fused kernels "
-                             "(pre_norm_fn + pre_apply_mix + post). Sinkhorn stays CPU.")
-    parser.add_argument("--offload-compressor-indexer", action="store_true",
-                        help="Run Compressor + Indexer decode paths on device with "
-                             "device-resident state buffers (kv_state, score_state, kv_cache). "
-                             "Requires --offload-attn-full and --offload-indexer-linears.")
-    parser.add_argument("--all-on-device", action="store_true",
-                        help="Enable every --offload-* flag. Convenience switch for "
-                             "running the full device path.")
     parser.add_argument("--weights-cache",
                         default=os.environ.get("DS_WEIGHTS_CACHE",
                                                "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
                         help="Path to pickled state_dict cache. First run populates it; "
                              "subsequent runs mmap it (set to empty string to disable).")
     args = parser.parse_args()
-
-    if args.all_on_device:
-        for flag in (
-            "offload_lm_head",
-            "offload_attn_wq_a", "offload_attn_wq_b", "offload_attn_wkv",
-            "offload_attn_wo_a", "offload_attn_wo_b",
-            "offload_moe_gate", "offload_moe_shared_expert",
-            "offload_rms_norms", "offload_embedding",
-            "offload_compressor_linears", "offload_indexer_linears",
-            "offload_sparse_attn", "offload_attn_full",
-            "offload_mhc", "offload_compressor_indexer",
-        ):
-            setattr(args, flag, True)
 
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(min(32, os.cpu_count() or 8))
@@ -4464,111 +4412,37 @@ def main():
     model.load_weights(verbose=args.verbose_load, cache_path=args.weights_cache or None)
     print(f"[phase] weights loaded in {time.time() - t0:.1f}s")
 
-    mesh = None
-    need_mesh = (
-        args.offload_lm_head
-        or args.offload_attn_wq_a
-        or args.offload_attn_wq_b
-        or args.offload_attn_wkv
-        or args.offload_attn_wo_a
-        or args.offload_attn_wo_b
-        or args.offload_moe_gate
-        or args.offload_moe_shared_expert
-        or args.offload_rms_norms
-        or args.offload_embedding
-        or args.offload_compressor_linears
-        or args.offload_indexer_linears
-        or args.offload_sparse_attn
-        or args.offload_attn_full
-        or args.offload_mhc
-        or args.offload_compressor_indexer
-    )
-    if need_mesh:
-        print("[phase] opening 1x4 mesh ...")
-        t0 = time.time()
-        mesh = _open_mesh(shape=(1, 4))
-        print(f"[phase] mesh opened in {time.time() - t0:.1f}s")
-    if args.offload_lm_head:
-        print("[phase] sharding lm_head on mesh ...")
-        t0 = time.time()
-        model.offload_lm_head(mesh)
-        print(f"[phase] lm_head offloaded in {time.time() - t0:.1f}s")
+    print("[phase] opening 1x4 mesh ...")
+    t0 = time.time()
+    mesh = _open_mesh(shape=(1, 4))
+    print(f"[phase] mesh opened in {time.time() - t0:.1f}s")
+
     n_layers = len(model.transformer.layers)
-    if args.offload_attn_wq_a:
-        print(f"[phase] sharding wq_a across {n_layers} layers on mesh ...")
+    print("[phase] sharding lm_head on mesh ...")
+    t0 = time.time()
+    model.offload_lm_head(mesh)
+    print(f"[phase] lm_head offloaded in {time.time() - t0:.1f}s")
+    for label, method in (
+        ("wq_a", model.offload_attn_wq_a),
+        ("wq_b", model.offload_attn_wq_b),
+        ("wkv", model.offload_attn_wkv),
+        ("wo_a", model.offload_attn_wo_a),
+        ("wo_b", model.offload_attn_wo_b),
+        ("moe_gate", model.offload_moe_gate),
+        ("moe_shared_expert", model.offload_moe_shared_expert),
+        ("rms_norms", model.offload_rms_norms),
+        ("embedding", model.offload_embedding),
+        ("compressor_linears", model.offload_compressor_linears),
+        ("indexer_linears", model.offload_indexer_linears),
+        ("sparse_attn", model.offload_sparse_attn),
+        ("attn_full", model.offload_attn_full),
+        ("mhc", model.offload_mhc),
+        ("compressor_indexer", model.offload_compressor_indexer),
+    ):
+        print(f"[phase] offloading {label} on mesh ...")
         t0 = time.time()
-        model.offload_attn_wq_a(mesh)
-        print(f"[phase] wq_a offloaded in {time.time() - t0:.1f}s")
-    if args.offload_attn_wq_b:
-        print(f"[phase] sharding wq_b across {n_layers} layers on mesh ...")
-        t0 = time.time()
-        model.offload_attn_wq_b(mesh)
-        print(f"[phase] wq_b offloaded in {time.time() - t0:.1f}s")
-    if args.offload_attn_wkv:
-        print(f"[phase] sharding wkv across {n_layers} layers on mesh ...")
-        t0 = time.time()
-        model.offload_attn_wkv(mesh)
-        print(f"[phase] wkv offloaded in {time.time() - t0:.1f}s")
-    if args.offload_attn_wo_a:
-        print(f"[phase] grouped-sharding wo_a across {n_layers} layers on mesh ...")
-        t0 = time.time()
-        model.offload_attn_wo_a(mesh)
-        print(f"[phase] wo_a offloaded in {time.time() - t0:.1f}s")
-    if args.offload_attn_wo_b:
-        print(f"[phase] row-sharding wo_b across {n_layers} layers on mesh ...")
-        t0 = time.time()
-        model.offload_attn_wo_b(mesh)
-        print(f"[phase] wo_b offloaded in {time.time() - t0:.1f}s")
-    if args.offload_moe_gate:
-        print(f"[phase] replicating MoE gates across {n_layers} layers on mesh ...")
-        t0 = time.time()
-        model.offload_moe_gate(mesh)
-        print(f"[phase] moe_gate offloaded in {time.time() - t0:.1f}s")
-    if args.offload_moe_shared_expert:
-        print(f"[phase] replicating MoE shared experts across {n_layers} layers on mesh ...")
-        t0 = time.time()
-        model.offload_moe_shared_expert(mesh)
-        print(f"[phase] moe_shared_expert offloaded in {time.time() - t0:.1f}s")
-    if args.offload_rms_norms:
-        print(f"[phase] binding tt-lang rmsnorm across {n_layers} layers (attn/ffn/q/kv) ...")
-        t0 = time.time()
-        model.offload_rms_norms(mesh)
-        print(f"[phase] rms_norms offloaded in {time.time() - t0:.1f}s")
-    if args.offload_embedding:
-        print(f"[phase] replicating embedding on mesh ...")
-        t0 = time.time()
-        model.offload_embedding(mesh)
-        print(f"[phase] embedding offloaded in {time.time() - t0:.1f}s")
-    if args.offload_compressor_linears:
-        print(f"[phase] sharding Compressor wkv+wgate across layers on mesh ...")
-        t0 = time.time()
-        model.offload_compressor_linears(mesh)
-        print(f"[phase] compressor_linears offloaded in {time.time() - t0:.1f}s")
-    if args.offload_indexer_linears:
-        print(f"[phase] sharding Indexer wq_b+weights_proj across layers on mesh ...")
-        t0 = time.time()
-        model.offload_indexer_linears(mesh)
-        print(f"[phase] indexer_linears offloaded in {time.time() - t0:.1f}s")
-    if args.offload_sparse_attn:
-        print(f"[phase] binding device sparse_attn across {n_layers} layers on mesh ...")
-        t0 = time.time()
-        model.offload_sparse_attn(mesh)
-        print(f"[phase] sparse_attn offloaded in {time.time() - t0:.1f}s")
-    if args.offload_attn_full:
-        print(f"[phase] binding fused DeviceAttention across {n_layers} layers on mesh ...")
-        t0 = time.time()
-        model.offload_attn_full(mesh)
-        print(f"[phase] attn_full offloaded in {time.time() - t0:.1f}s")
-    if args.offload_mhc:
-        print(f"[phase] binding DeviceMHC across {n_layers} layers on mesh ...")
-        t0 = time.time()
-        model.offload_mhc(mesh)
-        print(f"[phase] mhc offloaded in {time.time() - t0:.1f}s")
-    if args.offload_compressor_indexer:
-        print(f"[phase] binding DeviceCompressor + DeviceIndexer across {n_layers} layers on mesh ...")
-        t0 = time.time()
-        model.offload_compressor_indexer(mesh)
-        print(f"[phase] compressor_indexer offloaded in {time.time() - t0:.1f}s")
+        method(mesh)
+        print(f"[phase] {label} offloaded in {time.time() - t0:.1f}s")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")
@@ -4600,8 +4474,7 @@ def main():
     print("\n[timing] per-phase breakdown (inclusive; sort by total):")
     print(_phase_report())
 
-    if mesh is not None:
-        _close_mesh(mesh)
+    _close_mesh(mesh)
 
 
 if __name__ == "__main__":
