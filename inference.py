@@ -299,17 +299,6 @@ def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int
     return matrix.unsqueeze(0).expand(bsz, -1, -1)
 
 
-@lru_cache(2)
-def get_compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int):
-    if start_pos > 0:
-        matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
-    else:
-        matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
-        mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-        matrix = torch.where(mask, -1, matrix + offset)
-    return matrix.unsqueeze(0).expand(bsz, -1, -1)
-
-
 class Compressor(nn.Module):
     def __init__(self, args: ModelArgs, compress_ratio: int = 4, head_dim: int = 512, rotate: bool = False):
         super().__init__()
@@ -3008,15 +2997,32 @@ class DeviceAttention(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._upload_mapper,
         )
-        # Window topk indices [B, S, win] int32. Always present on the
-        # device-indexer path; the per-step values change but shape is
-        # pinned by the model's window_size.
+        # Window topk indices [B, S, win] int32. The per-step values
+        # change but shape is pinned by the model's window_size.
         self._win_idxs_upload_tt = ttnn.from_torch(
             torch.zeros(B, 1, self.window_size, dtype=torch.int32),
             device=self.mesh, dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._upload_mapper,
         )
+        # Compress topk index ramp: precomputed [win, win+1, ..., win+max_T-1]
+        # as int32 TILE on device, where max_T = max_seq_len // compress_ratio.
+        # Slice to [0:T_active] each step to get the compress slot indices
+        # without any host arithmetic. Only allocated when compress_ratio is
+        # set (layers without a compressor never reach the slice).
+        if self.compress_ratio:
+            max_T = self.max_seq_len // self.compress_ratio
+            ramp = (
+                torch.arange(0, max_T, dtype=torch.int32) + self.window_size
+            ).view(1, 1, max_T).expand(B, 1, max_T).contiguous()
+            self._compress_idxs_ramp_tt = ttnn.from_torch(
+                ramp, device=self.mesh, dtype=ttnn.int32,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=self._upload_mapper,
+            )
+        else:
+            self._compress_idxs_ramp_tt = None
 
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         """Single-token forward. Prefill is driven externally as a per-token
@@ -3042,21 +3048,19 @@ class DeviceAttention(nn.Module):
         )
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
 
-        out_tt = self.forward_device(self._x_upload_tt, start_pos, x_cpu=x)
+        out_tt = self.forward_device(self._x_upload_tt, start_pos)
 
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
         out = ttnn.to_torch(out_tt, mesh_composer=composer)[:B]
         return out.to(x.dtype)
 
-    def forward_device(self, x_tt, start_pos: int,
-                       x_cpu: Optional[torch.Tensor] = None):
+    def forward_device(self, x_tt, start_pos: int):
         """Pure-device attention body. x_tt is the pre-uploaded
         [B, 1, dim] device tensor; returns out_tt [B, 1, dim] device
         tensor. Caller is responsible for upload/download.
 
-        x_cpu is required only when the CPU-fallback compressor path is
-        active (attn._device_compressor is None); on the device-everything
-        path it can be None.
+        Requires offload_compressor_indexer: attn._device_compressor and
+        (when compress_ratio is set) attn._device_indexer must be bound.
         """
         ttnn = self._ttnn
         attn = self.attn
@@ -3068,11 +3072,11 @@ class DeviceAttention(nn.Module):
 
         device_comp = getattr(attn, "_device_compressor", None)
         device_indexer = getattr(attn, "_device_indexer", None)
-        if device_comp is None and x_cpu is None:
-            raise ValueError(
-                "DeviceAttention.forward_device requires x_cpu when "
-                "the CPU-fallback compressor path is active "
-                "(attn._device_compressor is None)."
+        if self.compress_ratio and device_comp is None:
+            raise RuntimeError(
+                "DeviceAttention.forward_device requires "
+                "attn._device_compressor when compress_ratio is set; "
+                "run offload_compressor_indexer."
             )
 
         # Q path: wq_a -> q_norm -> wq_b -> per-head rsqrt-norm -> rotary.
@@ -3115,32 +3119,35 @@ class DeviceAttention(nn.Module):
         kv_rope_only = ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D])
         kv_tt = ttnn.concat([kv_nope_q, kv_rope_only], dim=-1)
 
-        # CPU side still needs kv on host when the compressor is CPU-resident.
-        # Device path keeps kv_tt on device for both window-slot and compress-
-        # slot writes (no round-trip).
-        if device_comp is None:
-            kv_cpu = self._download_replicated(kv_tt, B, S, D).to(x_cpu.dtype)
-
+        # Build the topk index tensor. Window indices are still produced on
+        # host (task: move on device). Compress indices live on device:
+        #  * device_indexer present: device-side score reduce -> ttnn.topk.
+        #  * device_indexer absent (compress_ratio in {2, 128, ...}): slice
+        #    the precomputed [win, win+1, ..., win+max_T-1] ramp on device.
+        # When compress_ratio is 0 (no compressor at all), topk stays on
+        # host and is uploaded via sparse_attn_dev._upload_topk.
         topk_idxs = get_window_topk_idxs(win, B, S, start_pos)
-        topk_idxs_dev = None  # int32 TILE [B, S, K] if device path, else None
+        topk_idxs_dev = None
         topk_idxs_dev_K = None
         if self.compress_ratio:
-            offset = win
-            if device_indexer is not None:
-                # Device indexer: runs inner compressor + score reduce on
-                # device, then ttnn.topk on device. When T_active > 0 we keep
-                # the indices fully on device through typecast+add+concat to
-                # avoid the small but synchronizing CPU round-trip.
-                score_tt = device_indexer.forward_device_score(
-                    x_tt, qr_tt, B, start_pos
-                )
-                end_pos = start_pos + 1
-                T_active = end_pos // self.compress_ratio
-                if T_active == 0:
-                    compress_topk_idxs = get_compress_topk_idxs(
-                        self.compress_ratio, B, S, start_pos, offset)
-                    topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
-                else:
+            win_idxs_torch = topk_idxs.to(torch.int32).contiguous()
+            win_host_mesh = ttnn.from_torch(
+                win_idxs_torch, dtype=ttnn.int32,
+                layout=ttnn.TILE_LAYOUT,
+                mesh_mapper=self._upload_mapper,
+            )
+            ttnn.copy_host_to_device_tensor(
+                win_host_mesh, self._win_idxs_upload_tt
+            )
+            T_active = (start_pos + 1) // self.compress_ratio
+            if T_active == 0:
+                topk_idxs_dev = self._win_idxs_upload_tt
+                topk_idxs_dev_K = win
+            else:
+                if device_indexer is not None:
+                    score_tt = device_indexer.forward_device_score(
+                        x_tt, qr_tt, B, start_pos
+                    )
                     k = min(device_indexer.index_topk, T_active)
                     score_valid_tt = ttnn.slice(
                         score_tt, [0, 0, 0], [B, S, T_active])
@@ -3148,67 +3155,29 @@ class DeviceAttention(nn.Module):
                         score_valid_tt, k=k, dim=-1,
                         largest=True, sorted=True)
                     cmp_idxs_int = ttnn.typecast(cmp_idxs_tt, dtype=ttnn.int32)
-                    cmp_idxs_int = ttnn.add(cmp_idxs_int, offset)
-                    win_idxs_torch = topk_idxs.to(torch.int32).contiguous()
-                    win_host_mesh = ttnn.from_torch(
-                        win_idxs_torch, dtype=ttnn.int32,
-                        layout=ttnn.TILE_LAYOUT,
-                        mesh_mapper=self._upload_mapper,
+                    cmp_idxs_int = ttnn.add(cmp_idxs_int, win)
+                else:
+                    cmp_idxs_int = ttnn.slice(
+                        self._compress_idxs_ramp_tt,
+                        [0, 0, 0], [B, S, T_active],
                     )
-                    ttnn.copy_host_to_device_tensor(
-                        win_host_mesh, self._win_idxs_upload_tt
-                    )
-                    topk_idxs_dev = ttnn.concat(
-                        [self._win_idxs_upload_tt, cmp_idxs_int], dim=-1
-                    )
-                    topk_idxs_dev_K = win + k
-                    topk_idxs = None
-            else:
-                compress_topk_idxs = get_compress_topk_idxs(
-                    self.compress_ratio, B, S, start_pos, offset)
-                topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+                    k = T_active
+                topk_idxs_dev = ttnn.concat(
+                    [self._win_idxs_upload_tt, cmp_idxs_int], dim=-1
+                )
+                topk_idxs_dev_K = win + k
+            topk_idxs = None
         if topk_idxs is not None:
             topk_idxs = topk_idxs.int()
 
-        # KV cache update.
-        common_rep = dict(
-            device=self.mesh, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        # KV cache update: write window slot from kv_tt; the device compressor
+        # (when compress_ratio is set) writes compress slot at win + comp_idx
+        # into the same buffer.
+        kv_4d = ttnn.reshape(kv_tt, [B, 1, 1, D])
+        ttnn.kv_cache.update_cache_for_token_(
+            self.kv_cache_tt, kv_4d, start_pos % win, 0
         )
-        if device_comp is None:
-            attn.kv_cache[:B, start_pos % win] = kv_cpu.squeeze(1)
-            if self.compress_ratio:
-                attn.compressor(x_cpu, start_pos)
-            window_slot = (
-                attn.kv_cache[:B, start_pos % win]
-                .to(torch.bfloat16)
-                .contiguous()
-                .view(B, 1, 1, D)
-            )
-            window_slot_tt = ttnn.as_tensor(window_slot, **common_rep)
-            ttnn.kv_cache.update_cache_for_token_(
-                self.kv_cache_tt, window_slot_tt, start_pos % win, 0
-            )
-            if self.compress_ratio and (start_pos + 1) % self.compress_ratio == 0:
-                comp_idx = win + start_pos // self.compress_ratio
-                comp_slot = (
-                    attn.kv_cache[:B, comp_idx]
-                    .to(torch.bfloat16)
-                    .contiguous()
-                    .view(B, 1, 1, D)
-                )
-                comp_slot_tt = ttnn.as_tensor(comp_slot, **common_rep)
-                ttnn.kv_cache.update_cache_for_token_(
-                    self.kv_cache_tt, comp_slot_tt, comp_idx, 0
-                )
-        else:
-            # Device path: write window slot directly from kv_tt; compressor
-            # writes compress slot at win + comp_idx into the same buffer.
-            kv_4d = ttnn.reshape(kv_tt, [B, 1, 1, D])
-            ttnn.kv_cache.update_cache_for_token_(
-                self.kv_cache_tt, kv_4d, start_pos % win, 0
-            )
+        if self.compress_ratio:
             device_comp.forward_device(x_tt, B, start_pos)
 
         kv_full_tt = ttnn.reshape(self.kv_cache_tt, [self.kv_cache_size_pad, D])
@@ -3286,14 +3255,6 @@ class DeviceAttention(nn.Module):
             cos = ttnn.reshape(cos, [1, S, rd_half])
             sin = ttnn.reshape(sin, [1, S, rd_half])
         return cos, sin
-
-    def _download_replicated(self, t_tt, *expected_shape):
-        """Read back a replicated tensor (chip 0's copy via concat-on-dim0
-        composer trick used elsewhere in this file)."""
-        ttnn = self._ttnn
-        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        t = ttnn.to_torch(t_tt, mesh_composer=composer)
-        return t[:expected_shape[0]] if expected_shape else t
 
 
 def _open_mesh(shape=(1, 4), trace_region_size: int = 100_000_000):
@@ -3734,17 +3695,18 @@ class Model:
         """Replace every Attention.compressor and Attention.indexer with
         DeviceCompressor + DeviceIndexer instances.
 
-        Requires --offload-attn-full (DeviceAttention._decode is what dispatches
-        to the device versions) and --offload-indexer-linears (we share the
-        already-on-device wq_b / weights_proj). Per layer:
+        Per layer (ordering invariant: offload_attn_full and
+        offload_indexer_linears must run first):
           - attn._device_compressor: DeviceCompressor for attn.compressor.
             Bound to attn._device_attention.kv_cache_tt at first decode.
           - attn._device_indexer (when ratio=4): DeviceIndexer wrapping
             attn.indexer with its own DeviceCompressor (rotate=True).
+        Layers with compress_ratio not in {0, 4} have a compressor but no
+        indexer; the indexer wiring is skipped for those layers.
         """
         if not hasattr(self, "_device_attn_full") or not self._device_attn_full:
             raise RuntimeError(
-                "offload_compressor_indexer requires --offload-attn-full"
+                "offload_compressor_indexer must run after offload_attn_full"
             )
         self._device_compressors = []
         self._device_indexers = []
@@ -3792,7 +3754,8 @@ class Model:
                 continue
             if not isinstance(indexer.wq_b, DeviceColLinear):
                 raise RuntimeError(
-                    "offload_compressor_indexer requires --offload-indexer-linears"
+                    "offload_compressor_indexer must run after "
+                    "offload_indexer_linears"
                 )
             ix_wkv = indexer.compressor.wkv if isinstance(
                 indexer.compressor.wkv, DeviceColLinear
@@ -3878,16 +3841,17 @@ class Model:
                 w = getattr(attn, w_attr)
                 if not isinstance(w, DeviceColLinear):
                     raise RuntimeError(
-                        f"offload_attn_full requires {w_attr} on device "
-                        f"(use --offload-attn-{w_attr.replace('_', '-')})"
+                        f"offload_attn_full must run after "
+                        f"offload_attn_{w_attr}"
                     )
             if not hasattr(self, "_device_sparse_attn"):
                 raise RuntimeError(
-                    "offload_attn_full requires --offload-sparse-attn"
+                    "offload_attn_full must run after offload_sparse_attn"
                 )
             if not hasattr(self, "_device_rms_norms"):
                 raise RuntimeError(
-                    "offload_attn_full requires --offload-rms-norms (q_norm/kv_norm)"
+                    "offload_attn_full must run after offload_rms_norms "
+                    "(q_norm / kv_norm)"
                 )
             sparse_dev = self._device_sparse_attn[layer.layer_id]
             # q_norm/kv_norm DeviceRMSNorm instances are appended in the order
