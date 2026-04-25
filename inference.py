@@ -3306,7 +3306,8 @@ class DeviceAttention(nn.Module):
             offset = win
             if device_indexer is not None:
                 # Device indexer: runs inner compressor + score reduce on
-                # device, then host topk. (Topk fusion is README candidate #4.)
+                # device, then ttnn.topk on device. Only the small [B, S, k]
+                # indices come back to CPU for the offset add + concat.
                 score_tt = device_indexer.forward_device_score(
                     x_tt, qr_tt, B, start_pos
                 )
@@ -3316,12 +3317,14 @@ class DeviceAttention(nn.Module):
                     compress_topk_idxs = get_compress_topk_idxs(
                         self.compress_ratio, B, S, start_pos, offset)
                 else:
-                    sc_dev = self._download_replicated(
-                        score_tt, B, S, score_tt.shape[-1]
-                    )
-                    sc_dev = sc_dev[..., :T_active]
                     k = min(device_indexer.index_topk, T_active)
-                    compress_topk_idxs = sc_dev.topk(k, dim=-1)[1] + offset
+                    score_valid_tt = ttnn.slice(
+                        score_tt, [0, 0, 0], [B, S, T_active])
+                    _, idxs_tt = ttnn.topk(
+                        score_valid_tt, k=k, dim=-1,
+                        largest=True, sorted=True)
+                    idxs_cpu = self._download_replicated(idxs_tt, B, S, k)
+                    compress_topk_idxs = idxs_cpu.long() + offset
             elif getattr(attn, "indexer", None) is not None:
                 compress_topk_idxs = attn.indexer(x, qr_cpu, start_pos, offset)
             else:
