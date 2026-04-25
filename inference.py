@@ -2380,23 +2380,23 @@ class DeviceMHC(nn.Module):
             self._kernels[key] = k
         return k
 
-    def _apply_mix_kernel(self, num_tokens_pad: int):
-        key = ("apply_mix", num_tokens_pad)
+    def _apply_mix_kernel(self, num_tokens: int):
+        key = ("apply_mix", num_tokens)
         k = self._kernels.get(key)
         if k is None:
             k = _compile_mhc_apply_mix_kernel(
-                num_tokens=num_tokens_pad,
+                num_tokens=num_tokens,
                 h_tiles=self.hidden // _MHC_TILE,
             )
             self._kernels[key] = k
         return k
 
-    def _post_kernel(self, num_tokens_pad: int):
-        key = ("post", num_tokens_pad)
+    def _post_kernel(self, num_tokens: int):
+        key = ("post", num_tokens)
         k = self._kernels.get(key)
         if k is None:
             k = _compile_mhc_post_kernel(
-                num_tokens=num_tokens_pad,
+                num_tokens=num_tokens,
                 h_tiles=self.hidden // _MHC_TILE,
             )
             self._kernels[key] = k
@@ -2431,6 +2431,9 @@ class DeviceMHC(nn.Module):
         num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
 
         # Step 1: pre_norm_fn on device -> mixes_tt [num_tokens_pad, TILE].
+        # norm_fn / split_mixes process 32 tokens per tile, so they keep the
+        # num_tokens_pad sizing. Per-token kernels (sinkhorn, apply_mix, post)
+        # use real num_tokens to avoid 32x over-allocation on decode.
         a_packed = _mhc_pack_residual(x, num_tokens_pad)
         a_tt = self._rep_tensor(a_packed)
         mixes_tt = self._zeros((num_tokens_pad, _MHC_TILE))
@@ -2460,10 +2463,10 @@ class DeviceMHC(nn.Module):
 
         # Step 3: host repack comb into sinkhorn's per-slice tile layout.
         comb_for_sk = _mhc_pack_comb_for_sinkhorn(
-            comb_raw, num_tokens, num_tokens_pad, mhc)
+            comb_raw, num_tokens, num_tokens, mhc)
         comb_sk_in_tt = self._rep_tensor(comb_for_sk)
-        comb_sk_out_tt = self._zeros((num_tokens_pad * _MHC_TILE, _MHC_TILE))
-        self._sinkhorn_kernel(num_tokens_pad)(
+        comb_sk_out_tt = self._zeros((num_tokens * _MHC_TILE, _MHC_TILE))
+        self._sinkhorn_kernel(num_tokens)(
             comb_sk_in_tt, self.sk_mask_tt, self.sk_eps_mask_tt, self.scaler_tt,
             comb_sk_out_tt,
         )
@@ -2472,12 +2475,12 @@ class DeviceMHC(nn.Module):
 
         # Step 4: pre_apply_mix on device.
         x_3d = x.view(num_tokens, mhc, hidden)
-        x_packed = _mhc_pack_x_for_apply_mix(x_3d, num_tokens_pad)
-        mix_packed = _mhc_pack_mix(pre, num_tokens_pad)
+        x_packed = _mhc_pack_x_for_apply_mix(x_3d, num_tokens)
+        mix_packed = _mhc_pack_mix(pre, num_tokens)
         x_tt = self._rep_tensor(x_packed)
         mix_tt = self._rep_tensor(mix_packed)
-        out_tt = self._zeros((num_tokens_pad * _MHC_TILE, hidden))
-        self._apply_mix_kernel(num_tokens_pad)(
+        out_tt = self._zeros((num_tokens * _MHC_TILE, hidden))
+        self._apply_mix_kernel(num_tokens)(
             x_tt, mix_tt, self.scaler_tt, out_tt)
 
         out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
@@ -2496,19 +2499,19 @@ class DeviceMHC(nn.Module):
         mhc = self.hc_mult
         out_dtype = x.dtype
         num_tokens = B * S
-        num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
 
         x_2d = x.reshape(num_tokens, hidden)
         res_3d = residual.reshape(num_tokens, mhc, hidden)
         post_2d = post.reshape(num_tokens, mhc)
         comb_3d = comb.reshape(num_tokens, mhc, mhc)
 
-        x_tt = self._rep_tensor(_mhc_pack_x_bc(x_2d, mhc, num_tokens_pad))
-        res_tt = self._rep_tensor(_mhc_pack_residual_for_post(res_3d, num_tokens_pad))
-        comb_tt = self._rep_tensor(_mhc_pack_comb_T(comb_3d, num_tokens_pad))
-        post_tt = self._rep_tensor(_mhc_pack_post_mix(post_2d, num_tokens_pad))
-        out_tt = self._zeros((num_tokens_pad * _MHC_TILE, hidden))
-        self._post_kernel(num_tokens_pad)(
+        # Per-token kernel uses real num_tokens (one TILE-row block per token).
+        x_tt = self._rep_tensor(_mhc_pack_x_bc(x_2d, mhc, num_tokens))
+        res_tt = self._rep_tensor(_mhc_pack_residual_for_post(res_3d, num_tokens))
+        comb_tt = self._rep_tensor(_mhc_pack_comb_T(comb_3d, num_tokens))
+        post_tt = self._rep_tensor(_mhc_pack_post_mix(post_2d, num_tokens))
+        out_tt = self._zeros((num_tokens * _MHC_TILE, hidden))
+        self._post_kernel(num_tokens)(
             x_tt, res_tt, comb_tt, post_tt, out_tt)
 
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
