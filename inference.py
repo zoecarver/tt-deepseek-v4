@@ -988,6 +988,16 @@ class DeviceRMSNorm(nn.Module):
         self.sc_tt = ttnn.as_tensor(
             torch.ones((_RMS_TILE, _RMS_TILE), dtype=torch.bfloat16), **rep)
 
+        # Pre-allocated kernel output buffer for the loop-prefill / decode
+        # case (num_rows=1, Mpad=TILE). The kernel overwrites every tile.
+        self._out_tt = ttnn.zeros(
+            shape=(_RMS_TILE, hidden),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.mesh,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
     def _kernel(self, num_row_tiles: int):
         k = self._kernels.get(num_row_tiles)
         if k is None:
@@ -1029,17 +1039,18 @@ class DeviceRMSNorm(nn.Module):
         is responsible for any padding and for slicing rows back to num_rows.
 
         num_rows is the unpadded row count and only selects the kernel
-        variant (M_tiles = ceil(num_rows / TILE)).
+        variant (M_tiles = ceil(num_rows / TILE)). Loop-prefill keeps
+        num_rows == 1 in the hot path; the pre-allocated [TILE, hidden]
+        output buffer is reused across calls.
         """
-        ttnn = self._ttnn
         Mt = -(-num_rows // _RMS_TILE)
-        out_tt = ttnn.zeros(
-            shape=tuple(x_tt.shape),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=self.mesh,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
+        if Mt != 1:
+            raise RuntimeError(
+                f"DeviceRMSNorm.forward_device: num_rows={num_rows} requires "
+                f"Mt={Mt} tiles, but the pre-allocated output buffer is sized "
+                f"for Mt=1. Loop-prefill keeps num_rows=1; lift the buffer "
+                f"sizing if multi-row decode is reintroduced.")
+        out_tt = self._out_tt
         self._kernel(Mt)(x_tt, self.gamma_tt, self.sc_tt, out_tt)
         return out_tt
 
