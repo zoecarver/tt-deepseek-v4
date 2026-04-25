@@ -1629,6 +1629,11 @@ class DeviceRMSNorm(nn.Module):
 # ============================================================================
 
 _MHC_TILE = 32
+# Softmax-sentinel for sinkhorn kernel: exp(PAD_SENTINEL - row_max) underflows
+# to 0 in fp32 so padded cells don't leak into the normalization.
+_MHC_PAD_SENTINEL = -1e4
+# Fixed by the V4-Flash hc_split_sinkhorn reference (post = 2 * sigmoid(...)).
+_MHC_POST_MULT = 2.0
 
 
 def _mhc_pack_residual(residual: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
@@ -1709,6 +1714,98 @@ def _mhc_unpack_apply_mix_out(packed: torch.Tensor, num_tokens: int, h: int) -> 
 def _mhc_unpack_post_out(packed: torch.Tensor, num_tokens: int, mhc: int, h: int) -> torch.Tensor:
     """[num_tokens_pad * TILE, h] -> [num_tokens, mhc, h] (rows 0..mhc-1 of each block)."""
     return packed.view(-1, _MHC_TILE, h)[:num_tokens, :mhc, :].contiguous()
+
+
+def _mhc_broadcast_row_to_tile(row: torch.Tensor) -> torch.Tensor:
+    """Tile a [TILE] row to [TILE, TILE] by repeating it across all TILE rows."""
+    return row.unsqueeze(0).expand(_MHC_TILE, _MHC_TILE).contiguous()
+
+
+def _mhc_build_split_constant_tiles(
+    hc_scale: torch.Tensor, hc_base: torch.Tensor, hc_mult: int,
+    post_mult: float, pre_eps: float,
+):
+    """Build the six [TILE, TILE] fp32 constant tiles for the split_mixes kernel.
+
+    Returns (scale_tile, base_tile, pre_mask, pre_eps_tile, post_mult_mask, comb_mask).
+    Each tile's rows are identical; a row has `mhc_mult3` valid cols with zeros
+    in the rest. Matches tt-lang-kernels/pre_split_mixes.make_constant_tiles.
+    """
+    mhc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+    sc = hc_scale.to(torch.float32)
+    scale_vec = torch.cat([
+        sc[0].expand(hc_mult),
+        sc[1].expand(hc_mult),
+        sc[2].expand(hc_mult * hc_mult),
+    ])
+
+    scale_row = torch.zeros(_MHC_TILE, dtype=torch.float32)
+    scale_row[:mhc_mult3] = scale_vec
+    base_row = torch.zeros(_MHC_TILE, dtype=torch.float32)
+    base_row[:mhc_mult3] = hc_base.to(torch.float32)[:mhc_mult3]
+
+    pre_mask_row = torch.zeros(_MHC_TILE, dtype=torch.float32)
+    pre_mask_row[:hc_mult] = 1.0
+    pre_eps_row = torch.zeros(_MHC_TILE, dtype=torch.float32)
+    pre_eps_row[:hc_mult] = pre_eps
+    post_mult_mask_row = torch.zeros(_MHC_TILE, dtype=torch.float32)
+    post_mult_mask_row[hc_mult: 2 * hc_mult] = post_mult
+    comb_mask_row = torch.zeros(_MHC_TILE, dtype=torch.float32)
+    comb_mask_row[2 * hc_mult: mhc_mult3] = 1.0
+
+    return (
+        _mhc_broadcast_row_to_tile(scale_row),
+        _mhc_broadcast_row_to_tile(base_row),
+        _mhc_broadcast_row_to_tile(pre_mask_row),
+        _mhc_broadcast_row_to_tile(pre_eps_row),
+        _mhc_broadcast_row_to_tile(post_mult_mask_row),
+        _mhc_broadcast_row_to_tile(comb_mask_row),
+    )
+
+
+def _mhc_sinkhorn_mask_tile(hc_mult: int) -> torch.Tensor:
+    """[TILE, TILE] with 1s in the top-left hc_mult x hc_mult region, 0s elsewhere."""
+    m = torch.zeros(_MHC_TILE, _MHC_TILE, dtype=torch.float32)
+    m[:hc_mult, :hc_mult] = 1.0
+    return m
+
+
+def _mhc_sinkhorn_eps_mask_tile(hc_mult: int, eps: float) -> torch.Tensor:
+    """[TILE, TILE] with `eps` in the top-left hc_mult x hc_mult region, 0s elsewhere.
+
+    Adds eps only inside the valid region so the padded sentinel cells stay pad.
+    """
+    m = torch.zeros(_MHC_TILE, _MHC_TILE, dtype=torch.float32)
+    m[:hc_mult, :hc_mult] = eps
+    return m
+
+
+def _mhc_pack_comb_for_sinkhorn(
+    comb: torch.Tensor, num_tokens: int, num_tokens_pad: int, hc_mult: int,
+) -> torch.Tensor:
+    """[num_tokens, hc, hc] -> [num_tokens_pad * TILE, TILE] fp32.
+
+    Each hc x hc slice sits in the top-left of its own 32x32 tile; the rest of
+    the tile is `_MHC_PAD_SENTINEL` so softmax pad cells underflow. Padded
+    slices (tokens >= num_tokens) get zeros in the valid region so softmax is
+    still well-defined there even though the output is discarded.
+    """
+    if comb.shape != (num_tokens, hc_mult, hc_mult):
+        raise ValueError(
+            f"comb shape {tuple(comb.shape)} != expected ({num_tokens}, {hc_mult}, {hc_mult})")
+    out = torch.full(
+        (num_tokens_pad, _MHC_TILE, _MHC_TILE),
+        _MHC_PAD_SENTINEL, dtype=torch.float32)
+    out[:num_tokens, :hc_mult, :hc_mult] = comb.to(torch.float32)
+    out[num_tokens:, :hc_mult, :hc_mult] = 0.0
+    return out.reshape(num_tokens_pad * _MHC_TILE, _MHC_TILE).contiguous()
+
+
+def _mhc_unpack_comb_from_sinkhorn(
+    packed: torch.Tensor, num_tokens: int, hc_mult: int,
+) -> torch.Tensor:
+    """Inverse of _mhc_pack_comb_for_sinkhorn: top-left hc x hc per slice."""
+    return packed.view(-1, _MHC_TILE, _MHC_TILE)[:num_tokens, :hc_mult, :hc_mult].contiguous()
 
 
 def _compile_mhc_norm_fn_kernel(num_out_tiles: int, K_tiles: int, rms_eps: float, inv_D: float):
@@ -1883,6 +1980,218 @@ def _compile_mhc_apply_mix_kernel(num_tokens: int, h_tiles: int):
     return apply_mix_kernel
 
 
+def _compile_mhc_split_mixes_kernel(num_tiles: int):
+    """Inlined from tt-lang-kernels/pre_split_mixes.py.
+
+    Per-token elementwise split of `mixes[t, :mhc_mult3]` into three sections,
+    each preserving the [num_tokens_pad, TILE] layout:
+      - pre_out[t, :mhc]              = sigmoid(in * scale + base) + pre_eps
+      - post_out[t, mhc:2*mhc]        = sigmoid(in * scale + base) * post_mult
+      - comb_out[t, 2*mhc:2*mhc+mhc*mhc] = (in * scale + base) raw (no softmax)
+
+    Constants `scale`/`base`/masks are each [TILE, TILE] with every row
+    identical so the row-broadcasted elementwise ops all see the same values.
+    """
+
+    @ttl.operation(grid="auto")
+    def split_mixes_kernel(
+        input_mixes, scale_tile, base_tile,
+        pre_mask, pre_eps_tile, post_mult_mask, comb_mask,
+        pre_out, post_out, comb_out,
+    ):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        tiles_per_core = -(-num_tiles // total_cores)
+
+        in_dfb = ttl.make_dataflow_buffer_like(input_mixes, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scale_tile, shape=(1, 1), block_count=1)
+        base_dfb = ttl.make_dataflow_buffer_like(base_tile, shape=(1, 1), block_count=1)
+        prem_dfb = ttl.make_dataflow_buffer_like(pre_mask, shape=(1, 1), block_count=1)
+        preeps_dfb = ttl.make_dataflow_buffer_like(pre_eps_tile, shape=(1, 1), block_count=1)
+        postmm_dfb = ttl.make_dataflow_buffer_like(post_mult_mask, shape=(1, 1), block_count=1)
+        combm_dfb = ttl.make_dataflow_buffer_like(comb_mask, shape=(1, 1), block_count=1)
+
+        sig_dfb = ttl.make_dataflow_buffer_like(input_mixes, shape=(1, 1), block_count=2)
+
+        pre_out_dfb = ttl.make_dataflow_buffer_like(pre_out, shape=(1, 1), block_count=2)
+        post_out_dfb = ttl.make_dataflow_buffer_like(post_out, shape=(1, 1), block_count=2)
+        comb_out_dfb = ttl.make_dataflow_buffer_like(comb_out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            sc = sc_dfb.wait()
+            base = base_dfb.wait()
+            prem = prem_dfb.wait()
+            preeps = preeps_dfb.wait()
+            postmm = postmm_dfb.wait()
+            combm = combm_dfb.wait()
+
+            for local_i in range(tiles_per_core):
+                global_i = core_idx * tiles_per_core + local_i
+                if global_i < num_tiles:
+                    inp = in_dfb.wait()
+                    sig_dfb.reserve().store(ttl.math.sigmoid(inp * sc + base))
+                    comb_out_dfb.reserve().store((inp * sc + base) * combm)
+
+                    sig = sig_dfb.wait()
+                    pre_out_dfb.reserve().store(sig * prem + preeps)
+                    post_out_dfb.reserve().store(sig * postmm)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            ttl.copy(scale_tile[0, 0], sc_dfb.reserve()).wait()
+            ttl.copy(base_tile[0, 0], base_dfb.reserve()).wait()
+            ttl.copy(pre_mask[0, 0], prem_dfb.reserve()).wait()
+            ttl.copy(pre_eps_tile[0, 0], preeps_dfb.reserve()).wait()
+            ttl.copy(post_mult_mask[0, 0], postmm_dfb.reserve()).wait()
+            ttl.copy(comb_mask[0, 0], combm_dfb.reserve()).wait()
+            for local_i in range(tiles_per_core):
+                global_i = core_idx * tiles_per_core + local_i
+                if global_i < num_tiles:
+                    ttl.copy(input_mixes[global_i, 0], in_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_i in range(tiles_per_core):
+                global_i = core_idx * tiles_per_core + local_i
+                if global_i < num_tiles:
+                    ttl.copy(pre_out_dfb.wait(), pre_out[global_i, 0]).wait()
+                    ttl.copy(post_out_dfb.wait(), post_out[global_i, 0]).wait()
+                    ttl.copy(comb_out_dfb.wait(), comb_out[global_i, 0]).wait()
+
+    return split_mixes_kernel
+
+
+def _compile_mhc_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
+    """Inlined from tt-lang-kernels/sinkhorn.py.
+
+    Per-slice iterative normalize (softmax -> mask+eps -> col-norm ->
+    (repeat-1) alternating row/col norms). Each 32x32 tile holds one 4x4 slice
+    in its top-left, with `_MHC_PAD_SENTINEL` elsewhere so softmax pad cells
+    underflow. Uses the scaler-style reduce/broadcast pattern; broadcasts and
+    state carry full-tile shape.
+
+    Compiler bug workaround: `options="--no-ttl-reduce-full-fp32"` — see
+    tt-lang-kernels README on fp32 reduce(dim=1) returning zeros.
+    """
+
+    @ttl.operation(grid="auto", options="--no-ttl-reduce-full-fp32")
+    def sinkhorn_kernel(x, mask, eps_mask, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        slices_per_core = -(-num_slices // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        m_dfb = ttl.make_dataflow_buffer_like(mask, shape=(1, 1), block_count=1)
+        em_dfb = ttl.make_dataflow_buffer_like(eps_mask, shape=(1, 1), block_count=1)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        state_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        state_copy_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        exp_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            sc = sc_dfb.wait()
+            m = m_dfb.wait()
+            em = em_dfb.wait()
+
+            for local_i in range(slices_per_core):
+                global_i = core_idx * slices_per_core + local_i
+                if global_i < num_slices:
+                    # Row softmax: state := softmax(x, dim=-1)
+                    x_in = x_dfb.wait()
+                    red_dfb.reserve().store(ttl.math.reduce_max(x_in, sc, dims=[1]))
+                    rmx = bc_dfb.reserve()
+                    rmx.store(ttl.math.broadcast(red_dfb.wait(), rmx, dims=[1]))
+                    exp_dfb.reserve().store(ttl.math.exp(x_in - bc_dfb.wait()))
+
+                    ex = exp_dfb.wait()
+                    red_dfb.reserve().store(ttl.math.reduce_sum(ex, sc, dims=[1]))
+                    state_copy_dfb.reserve().store(ex)
+                    rinv = bc_dfb.reserve()
+                    rinv.store(ttl.math.broadcast(ttl.math.recip(red_dfb.wait()), rinv, dims=[1]))
+                    state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                    # Mask + eps: state := state * mask + eps_mask
+                    state_copy_dfb.reserve().store(state_dfb.wait() * m + em)
+                    state_dfb.reserve().store(state_copy_dfb.wait())
+
+                    # First col-normalize: state := state / (col_sum + eps)
+                    s = state_dfb.wait()
+                    red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[0]))
+                    state_copy_dfb.reserve().store(s)
+                    cinv = bc_dfb.reserve()
+                    csum = red_dfb.wait()
+                    cinv.store(ttl.math.broadcast(
+                        ttl.math.recip(csum + ttl.math.fill(csum, eps)),
+                        cinv, dims=[0]))
+                    state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                    for _ in range(repeat - 1):
+                        s = state_dfb.wait()
+                        red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[1]))
+                        state_copy_dfb.reserve().store(s)
+                        rinv = bc_dfb.reserve()
+                        rsum = red_dfb.wait()
+                        rinv.store(ttl.math.broadcast(
+                            ttl.math.recip(rsum + ttl.math.fill(rsum, eps)),
+                            rinv, dims=[1]))
+                        state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                        s = state_dfb.wait()
+                        red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[0]))
+                        state_copy_dfb.reserve().store(s)
+                        cinv = bc_dfb.reserve()
+                        csum = red_dfb.wait()
+                        cinv.store(ttl.math.broadcast(
+                            ttl.math.recip(csum + ttl.math.fill(csum, eps)),
+                            cinv, dims=[0]))
+                        state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                    out_dfb.reserve().store(state_dfb.wait())
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            ttl.copy(mask[0, 0], m_dfb.reserve()).wait()
+            ttl.copy(eps_mask[0, 0], em_dfb.reserve()).wait()
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for local_i in range(slices_per_core):
+                global_i = core_idx * slices_per_core + local_i
+                if global_i < num_slices:
+                    ttl.copy(x[global_i, 0], x_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_i in range(slices_per_core):
+                global_i = core_idx * slices_per_core + local_i
+                if global_i < num_slices:
+                    ttl.copy(out_dfb.wait(), out[global_i, 0]).wait()
+
+    return sinkhorn_kernel
+
+
 def _compile_mhc_post_kernel(num_tokens: int, h_tiles: int):
     """Inlined from tt-lang-kernels/post.py.
 
@@ -1964,20 +2273,22 @@ class DeviceMHC(nn.Module):
 
     Pipeline (per Block.hc_pre call):
       1. pre_norm_fn: [num_tokens, D] @ fn^T * inv_rms -> mixes [num_tokens, mhc_mult3]
-      2. CPU split + sinkhorn: mixes -> (pre, post, comb)
-      3. pre_apply_mix: x[num_tokens, mhc, h] reduced by pre[num_tokens, mhc, 1] -> y[num_tokens, h]
+      2. split_mixes (device): mixes -> (pre_raw, post, comb_raw), all in
+         [num_tokens_pad, TILE] column-packed layout.
+      3. Host round-trip on comb: unpack to [num_tokens, mhc, mhc], re-pack into
+         the sinkhorn per-slice tile layout (4x4 in top-left, PAD_SENTINEL
+         elsewhere). pre and post also come back with comb on the same read.
+      4. sinkhorn (device): iterative softmax/normalize -> comb [num_tokens, mhc, mhc]
+      5. pre_apply_mix (device): x[num_tokens, mhc, h] reduced by pre[num_tokens, mhc, 1].
 
     Pipeline (per Block.hc_post call):
       1. post: x[num_tokens, h] * post_mix + comb^T @ residual -> [num_tokens, mhc, h]
 
-    Sinkhorn lives on CPU because it's a tight iterative loop on a tiny tensor
-    ([num_tokens, mhc, mhc]); the device split_mixes kernel would only save a
-    trivial elementwise op while requiring a host round-trip anyway for the
-    iterative normalization.
-
-    Decode pads num_tokens to TILE rows (1 token -> 32 padded rows) so the
-    kernels' tiles-per-core math holds. Padded rows hold zeros and contribute
-    nothing to the read-back range.
+    The host repack between split_mixes and sinkhorn bridges two incompatible
+    tile layouts (`[num_tokens_pad, TILE]` vs `[num_tokens_pad*TILE, TILE]`).
+    A future device repack kernel could replace it without changing either
+    endpoint. Decode pads num_tokens to TILE rows so the kernels'
+    tiles-per-core math holds; padded rows hold zeros and contribute nothing.
     """
 
     def __init__(self, mesh, hc_fn: torch.Tensor, hc_scale: torch.Tensor,
@@ -2002,9 +2313,6 @@ class DeviceMHC(nn.Module):
         self.norm_eps = float(norm_eps)
         self.hc_eps = float(hc_eps)
         self.sinkhorn_iters = int(sinkhorn_iters)
-        # CPU copies of hc_scale/hc_base for the split + sinkhorn step.
-        self.hc_scale_cpu = hc_scale.detach().to(torch.float32).cpu()
-        self.hc_base_cpu = hc_base.detach().to(torch.float32).cpu()
 
         rep = dict(
             device=mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
@@ -2017,6 +2325,26 @@ class DeviceMHC(nn.Module):
         self.scaler_tt = ttnn.as_tensor(
             torch.ones((_MHC_TILE, _MHC_TILE), dtype=torch.float32), **rep)
 
+        # split_mixes constant tiles (all [TILE, TILE] fp32, row-broadcast).
+        (scale_tile, base_tile, pre_mask_tile, pre_eps_tile,
+         post_mult_mask_tile, comb_mask_tile) = _mhc_build_split_constant_tiles(
+            hc_scale.detach().to(torch.float32).cpu(),
+            hc_base.detach().to(torch.float32).cpu(),
+            self.hc_mult, _MHC_POST_MULT, self.hc_eps,
+        )
+        self.split_scale_tt = ttnn.as_tensor(scale_tile, **rep)
+        self.split_base_tt = ttnn.as_tensor(base_tile, **rep)
+        self.split_pre_mask_tt = ttnn.as_tensor(pre_mask_tile, **rep)
+        self.split_pre_eps_tt = ttnn.as_tensor(pre_eps_tile, **rep)
+        self.split_post_mult_mask_tt = ttnn.as_tensor(post_mult_mask_tile, **rep)
+        self.split_comb_mask_tt = ttnn.as_tensor(comb_mask_tile, **rep)
+
+        # sinkhorn constant tiles.
+        self.sk_mask_tt = ttnn.as_tensor(
+            _mhc_sinkhorn_mask_tile(self.hc_mult), **rep)
+        self.sk_eps_mask_tt = ttnn.as_tensor(
+            _mhc_sinkhorn_eps_mask_tile(self.hc_mult, self.hc_eps), **rep)
+
         self._kernels: dict = {}
 
     def _norm_fn_kernel(self, num_out_tiles: int):
@@ -2028,6 +2356,26 @@ class DeviceMHC(nn.Module):
                 K_tiles=self.D // _MHC_TILE,
                 rms_eps=self.norm_eps,
                 inv_D=1.0 / self.D,
+            )
+            self._kernels[key] = k
+        return k
+
+    def _split_mixes_kernel(self, num_out_tiles: int):
+        key = ("split_mixes", num_out_tiles)
+        k = self._kernels.get(key)
+        if k is None:
+            k = _compile_mhc_split_mixes_kernel(num_tiles=num_out_tiles)
+            self._kernels[key] = k
+        return k
+
+    def _sinkhorn_kernel(self, num_slices: int):
+        key = ("sinkhorn", num_slices, self.sinkhorn_iters)
+        k = self._kernels.get(key)
+        if k is None:
+            k = _compile_mhc_sinkhorn_kernel(
+                num_slices=num_slices,
+                repeat=self.sinkhorn_iters,
+                eps=self.hc_eps,
             )
             self._kernels[key] = k
         return k
@@ -2082,29 +2430,50 @@ class DeviceMHC(nn.Module):
         num_tokens = B * S
         num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
 
-        # Step 1: pre_norm_fn on device.
+        # Step 1: pre_norm_fn on device -> mixes_tt [num_tokens_pad, TILE].
         a_packed = _mhc_pack_residual(x, num_tokens_pad)
         a_tt = self._rep_tensor(a_packed)
         mixes_tt = self._zeros((num_tokens_pad, _MHC_TILE))
         self._norm_fn_kernel(num_tokens_pad // _MHC_TILE)(
             a_tt, self.fn_tt, self.scaler_tt, mixes_tt)
 
-        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        mixes_packed = ttnn.to_torch(mixes_tt, mesh_composer=composer)
-        # Take chip 0's row range (replicated across chips), unpack to [num_tokens, mhc_mult3].
-        mixes = mixes_packed[:num_tokens, :self.mhc_mult3].reshape(B, S, self.mhc_mult3)
-
-        # Step 2: CPU split + sinkhorn.
-        pre, post, comb = hc_split_sinkhorn(
-            mixes, self.hc_scale_cpu, self.hc_base_cpu,
-            self.hc_mult, self.sinkhorn_iters, self.hc_eps,
+        # Step 2: split_mixes on device -> pre/post/comb_raw (each
+        # [num_tokens_pad, TILE], column-packed sections).
+        pre_tt = self._zeros((num_tokens_pad, _MHC_TILE))
+        post_tt = self._zeros((num_tokens_pad, _MHC_TILE))
+        comb_tt = self._zeros((num_tokens_pad, _MHC_TILE))
+        self._split_mixes_kernel(num_tokens_pad // _MHC_TILE)(
+            mixes_tt, self.split_scale_tt, self.split_base_tt,
+            self.split_pre_mask_tt, self.split_pre_eps_tt,
+            self.split_post_mult_mask_tt, self.split_comb_mask_tt,
+            pre_tt, post_tt, comb_tt,
         )
 
-        # Step 3: pre_apply_mix on device.
+        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
+        pre_packed = ttnn.to_torch(pre_tt, mesh_composer=composer)
+        post_packed = ttnn.to_torch(post_tt, mesh_composer=composer)
+        comb_packed = ttnn.to_torch(comb_tt, mesh_composer=composer)
+        pre = pre_packed[:num_tokens, :mhc].contiguous()
+        post = post_packed[:num_tokens, mhc: 2 * mhc].contiguous()
+        comb_raw = comb_packed[:num_tokens, 2 * mhc: 2 * mhc + mhc * mhc].view(
+            num_tokens, mhc, mhc).contiguous()
+
+        # Step 3: host repack comb into sinkhorn's per-slice tile layout.
+        comb_for_sk = _mhc_pack_comb_for_sinkhorn(
+            comb_raw, num_tokens, num_tokens_pad, mhc)
+        comb_sk_in_tt = self._rep_tensor(comb_for_sk)
+        comb_sk_out_tt = self._zeros((num_tokens_pad * _MHC_TILE, _MHC_TILE))
+        self._sinkhorn_kernel(num_tokens_pad)(
+            comb_sk_in_tt, self.sk_mask_tt, self.sk_eps_mask_tt, self.scaler_tt,
+            comb_sk_out_tt,
+        )
+        comb_sk_packed = ttnn.to_torch(comb_sk_out_tt, mesh_composer=composer)
+        comb_sk = _mhc_unpack_comb_from_sinkhorn(comb_sk_packed, num_tokens, mhc)
+
+        # Step 4: pre_apply_mix on device.
         x_3d = x.view(num_tokens, mhc, hidden)
         x_packed = _mhc_pack_x_for_apply_mix(x_3d, num_tokens_pad)
-        mix_packed = _mhc_pack_mix(
-            pre.reshape(num_tokens, mhc), num_tokens_pad)
+        mix_packed = _mhc_pack_mix(pre, num_tokens_pad)
         x_tt = self._rep_tensor(x_packed)
         mix_tt = self._rep_tensor(mix_packed)
         out_tt = self._zeros((num_tokens_pad * _MHC_TILE, hidden))
@@ -2114,7 +2483,9 @@ class DeviceMHC(nn.Module):
         out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
         y_flat = _mhc_unpack_apply_mix_out(out_packed, num_tokens, hidden)
         y = y_flat.view(B, S, hidden).to(out_dtype)
-        return y, post, comb
+        post_out = post.view(B, S, mhc).to(out_dtype)
+        comb_out = comb_sk.view(B, S, mhc, mhc).to(out_dtype)
+        return y, post_out, comb_out
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor,
                 post: torch.Tensor, comb: torch.Tensor):
