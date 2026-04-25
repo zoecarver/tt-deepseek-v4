@@ -2347,6 +2347,12 @@ class DeviceMHC(nn.Module):
 
         self._kernels: dict = {}
 
+        # Device tensors stashed by hc_pre and consumed by the matching
+        # hc_post call. None when no hc_pre has run yet.
+        self._stash_a_tt = None
+        self._stash_post_tt = None
+        self._stash_comb_sk_tt = None
+
     def _norm_fn_kernel(self, num_out_tiles: int):
         key = ("norm_fn", num_out_tiles)
         k = self._kernels.get(key)
@@ -2502,6 +2508,14 @@ class DeviceMHC(nn.Module):
         self._apply_mix_kernel(num_tokens)(
             x_tt, mix_tt, self.scaler_tt, out_tt)
 
+        # Stash device tensors that hc_post needs so it can skip the
+        # residual/post/comb re-uploads. The torch values returned below are
+        # still produced for caller-side shape/dtype contracts and as opaque
+        # markers; hc_post consumes the stashed device tensors directly.
+        self._stash_a_tt = a_tt
+        self._stash_post_tt = post_tt
+        self._stash_comb_sk_tt = comb_sk_out_tt
+
         # Download what callers need: y (apply_mix output), post (for hc_post),
         # comb_sk (for hc_post). pre never leaves device.
         out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
@@ -2518,23 +2532,66 @@ class DeviceMHC(nn.Module):
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor,
                 post: torch.Tensor, comb: torch.Tensor):
         """x [B, S, hidden], residual [B, S, mhc, hidden], post [B, S, mhc],
-        comb [B, S, mhc, mhc] -> [B, S, mhc, hidden]."""
+        comb [B, S, mhc, mhc] -> [B, S, mhc, hidden].
+
+        residual/post/comb are consumed from device tensors stashed by the
+        matching hc_pre call; the torch values are ignored except for
+        dtype/shape extraction. Only x (post-attn or post-FFN) is uploaded.
+        """
         ttnn = self._ttnn
         B, S, hidden = x.shape
         mhc = self.hc_mult
         out_dtype = x.dtype
         num_tokens = B * S
 
-        x_2d = x.reshape(num_tokens, hidden)
-        res_3d = residual.reshape(num_tokens, mhc, hidden)
-        post_2d = post.reshape(num_tokens, mhc)
-        comb_3d = comb.reshape(num_tokens, mhc, mhc)
+        a_tt_stashed = self._stash_a_tt
+        post_tt_stashed = self._stash_post_tt
+        comb_sk_tt_stashed = self._stash_comb_sk_tt
+        if a_tt_stashed is None or post_tt_stashed is None or comb_sk_tt_stashed is None:
+            raise RuntimeError("hc_post called without matching hc_pre stash")
+        # Forbid reuse: a stash belongs to one hc_pre/hc_post pair.
+        self._stash_a_tt = None
+        self._stash_post_tt = None
+        self._stash_comb_sk_tt = None
 
-        # Per-token kernel uses real num_tokens (one TILE-row block per token).
+        x_2d = x.reshape(num_tokens, hidden)
         x_tt = self._rep_tensor(_mhc_pack_x_bc(x_2d, mhc, num_tokens))
-        res_tt = self._rep_tensor(_mhc_pack_residual_for_post(res_3d, num_tokens))
-        comb_tt = self._rep_tensor(_mhc_pack_comb_T(comb_3d, num_tokens))
-        post_tt = self._rep_tensor(_mhc_pack_post_mix(post_2d, num_tokens))
+
+        # Build res_tt from the stashed a_tt (norm_fn input == hc_pre's
+        # residual, packed [num_tokens_pad, mhc*hidden]). Slice -> reshape ->
+        # pad -> reshape gives [num_tokens * TILE, hidden] with rows 0..mhc-1
+        # of each TILE-block holding residual[t, m, :].
+        a_sliced = ttnn.slice(a_tt_stashed, [0, 0], [num_tokens, mhc * hidden])
+        a_3d = ttnn.reshape(a_sliced, [num_tokens, mhc, hidden])
+        res_padded = ttnn.pad(
+            a_3d,
+            padding=[(0, 0), (0, _MHC_TILE - mhc), (0, 0)],
+            value=0.0,
+        )
+        res_tt = ttnn.reshape(res_padded, [num_tokens * _MHC_TILE, hidden])
+
+        # Build post_tt from stashed split_mixes output. post values live in
+        # cols mhc..2*mhc of post_tt_stashed [num_tokens_pad, TILE].
+        post_sliced = ttnn.slice(
+            post_tt_stashed, [0, mhc], [num_tokens, 2 * mhc])
+        post_3d = ttnn.reshape(post_sliced, [num_tokens, mhc, 1])
+        post_padded = ttnn.pad(
+            post_3d,
+            padding=[(0, 0), (0, _MHC_TILE - mhc), (0, _MHC_TILE - 1)],
+            value=0.0,
+        )
+        post_tt = ttnn.reshape(post_padded, [num_tokens * _MHC_TILE, _MHC_TILE])
+
+        # Build comb_tt (transposed) from stashed sinkhorn output. The post
+        # kernel reads only the top-left mhc x mhc of each TILE-block, so
+        # transposing the full TILE x TILE is correct: the new top-left
+        # mhc x mhc is the transpose of the original top-left mhc x mhc.
+        comb_3d = ttnn.reshape(
+            comb_sk_tt_stashed, [num_tokens, _MHC_TILE, _MHC_TILE])
+        comb_T_3d = ttnn.transpose(comb_3d, -2, -1)
+        comb_tt = ttnn.reshape(
+            comb_T_3d, [num_tokens * _MHC_TILE, _MHC_TILE])
+
         out_tt = self._zeros((num_tokens * _MHC_TILE, hidden))
         self._post_kernel(num_tokens)(
             x_tt, res_tt, comb_tt, post_tt, out_tt)
@@ -4246,14 +4303,20 @@ class Model:
 
             attn_fn_id = id(layer.hc_attn_fn)
             ffn_fn_id = id(layer.hc_ffn_fn)
+            # active[0] holds the DeviceMHC instance whose stash the next
+            # hc_post call must consume. hc_pre sets it; hc_post reads + clears.
+            active = [None]
 
             def _device_hc_pre(self_layer, x, hc_fn, hc_scale, hc_base,
                                _attn=mhc_attn, _ffn=mhc_ffn,
-                               _attn_id=attn_fn_id, _ffn_id=ffn_fn_id):
+                               _attn_id=attn_fn_id, _ffn_id=ffn_fn_id,
+                               _active=active):
                 fid = id(hc_fn)
                 if fid == _attn_id:
+                    _active[0] = _attn
                     return _attn.hc_pre(x)
                 if fid == _ffn_id:
+                    _active[0] = _ffn
                     return _ffn.hc_pre(x)
                 raise RuntimeError(
                     "DeviceMHC dispatch: hc_fn identity matches neither "
@@ -4261,8 +4324,13 @@ class Model:
                 )
 
             def _device_hc_post(self_layer, x, residual, post, comb,
-                                _mhc=mhc_attn):
-                return _mhc.hc_post(x, residual, post, comb)
+                                _active=active):
+                mhc = _active[0]
+                if mhc is None:
+                    raise RuntimeError(
+                        "DeviceMHC dispatch: hc_post called before hc_pre")
+                _active[0] = None
+                return mhc.hc_post(x, residual, post, comb)
 
             layer.hc_pre = _device_hc_pre.__get__(layer, type(layer))
             layer.hc_post = _device_hc_post.__get__(layer, type(layer))
