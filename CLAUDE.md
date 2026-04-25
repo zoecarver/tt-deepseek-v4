@@ -167,3 +167,5 @@ ttnn has a number of CCLs for cross-chip scatter/gather that you can use (ttnn s
 When setting timeouts, make them 1-2 minutes. The model should take 2-4 minutes end to end to load weights and produce token predictions. If you have to poll a few times per run, that is better then waiting 10+ mins for a run that fails early.
 
 Do not automatically fall back to cpu if imports are not available, just error and exit. We should trust this will only be run on a device with ttnn and ttlang set up.
+
+IMPORTANT regarding optimization: you are NOT allowed to remove tt-lang kernels or move logic from tt-lang to ttnn or host. If you think that you need to stop using a tt-lang kernel for some reason, pause and ask the user. You are allowed to (and encouraged to) move more to tt-lang (from host or ttnn), fuse tt-lang kernels, and optimize tt-lang kernels. Similarly, if you need to move logic from device to host (eg from ttnn/ttlang to torch), you must stop and ask the user. Even if this is a short term gain, it will not bear out eventually once all logic is on device and traced.

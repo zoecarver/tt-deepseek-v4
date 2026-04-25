@@ -42,8 +42,6 @@ rank = 0
 block_size = 128
 fp4_block_size = 32
 default_dtype = torch.bfloat16
-scale_fmt: Optional[str] = "ue8m0"
-scale_dtype = torch.float32
 
 
 # Per-phase wall-time accumulators. Populated by _phase() context manager; printed
@@ -101,78 +99,6 @@ _FP4_VALUES = torch.tensor(
 )
 
 
-def _round_to_pow2(x: torch.Tensor) -> torch.Tensor:
-    """Round positive float tensor up to the next power of 2 (for ue8m0 scale format)."""
-    # bit trick: mantissa != 0 => exponent + 1
-    u = x.float().view(torch.int32)
-    exp = ((u >> 23) & 0xFF)
-    man = u & ((1 << 23) - 1)
-    exp = exp - 127 + (man != 0).to(torch.int32)
-    return torch.ldexp(torch.ones_like(x, dtype=torch.float32), exp)
-
-
-def act_quant(
-    x: torch.Tensor,
-    block_size: int = 128,
-    scale_fmt: Optional[str] = None,
-    scale_dtype: torch.dtype = torch.float32,
-    inplace: bool = False,
-):
-    """Block-wise FP8 quantization along the last dim.
-
-    inplace=True  -> quantize+dequantize back into x (bf16 simulation of FP8).
-    inplace=False -> return (y_fp8, scales).
-    """
-    N = x.size(-1)
-    assert N % block_size == 0, f"last dim {N} must be divisible by block_size {block_size}"
-
-    orig_shape = x.shape
-    z = x.contiguous().view(-1, N // block_size, block_size)
-    amax = z.float().abs().amax(dim=-1).clamp_min(1e-4)
-    fp8_max = 448.0
-    s = amax / fp8_max
-    if scale_fmt == "ue8m0":
-        s = _round_to_pow2(s)
-    y = (z.float() / s.unsqueeze(-1)).clamp(-fp8_max, fp8_max)
-    y_fp8 = y.to(torch.float8_e4m3fn)
-
-    if inplace:
-        # dequantize back into x in its original dtype
-        deq = (y_fp8.to(torch.float32) * s.unsqueeze(-1)).to(x.dtype)
-        x.copy_(deq.view(orig_shape))
-        return x
-
-    # y shape: [..., N] in fp8; scales shape: [..., N//block_size]
-    y_out = y_fp8.view(orig_shape)
-    s_out = s.to(scale_dtype).view(*orig_shape[:-1], N // block_size)
-    return y_out, s_out
-
-
-def fp4_act_quant(x: torch.Tensor, block_size: int = 32, inplace: bool = False):
-    """Block-wise FP4 quantization. Power-of-2 scale (ue8m0). inplace does QAT simulation."""
-    N = x.size(-1)
-    assert N % block_size == 0
-    orig_shape = x.shape
-    z = x.contiguous().view(-1, N // block_size, block_size)
-    amax = z.float().abs().amax(dim=-1).clamp_min(6 * (2**-126))
-    fp4_max = 6.0
-    s = _round_to_pow2(amax / fp4_max)
-    # quantize-dequantize via table lookup to nearest FP4 value
-    scaled = (z.float() / s.unsqueeze(-1)).clamp(-fp4_max, fp4_max)
-    values = _FP4_VALUES.to(scaled.device)
-    # find nearest fp4 value
-    diff = (scaled.unsqueeze(-1) - values).abs()
-    idx = diff.argmin(dim=-1)
-    quant = values[idx]
-    if inplace:
-        deq = (quant * s.unsqueeze(-1)).to(x.dtype)
-        x.copy_(deq.view(orig_shape))
-        return x
-    # Pack two FP4 values per byte: low = even index, high = odd
-    # But for CPU impl we just keep quant*s as bf16 since we never use the packed form in compute
-    raise NotImplementedError("non-inplace fp4_act_quant not needed on CPU path")
-
-
 def _dequant_fp8_weight(w_fp8: torch.Tensor, scale: torch.Tensor, group_size: int = 128) -> torch.Tensor:
     """Dequantize an FP8 weight [N, K] with per-[group,group] scale to bf16."""
     N, K = w_fp8.shape
@@ -212,124 +138,6 @@ def _dequant_fp4_weight(w_fp4: torch.Tensor, scale: torch.Tensor, block_size: in
     return (vals * s).to(torch.bfloat16)
 
 
-def _quant_act_fp8(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize activation x (any dtype) to FP8 per-block along K (last) dim.
-    Returns (x_fp8, scales [..., K//block]).
-    """
-    N = x.size(-1)
-    orig_shape = x.shape
-    z = x.contiguous().view(-1, N // block_size, block_size)
-    amax = z.float().abs().amax(dim=-1).clamp_min(1e-4)
-    fp8_max = 448.0
-    s = amax / fp8_max
-    y = (z.float() / s.unsqueeze(-1)).clamp(-fp8_max, fp8_max)
-    y_fp8 = y.to(torch.float8_e4m3fn).view(orig_shape)
-    s_out = s.view(*orig_shape[:-1], N // block_size)
-    return y_fp8, s_out
-
-
-def fp8_gemm(
-    a: torch.Tensor,
-    a_s: torch.Tensor,
-    b: torch.Tensor,
-    b_s: torch.Tensor,
-    scale_dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """C[M,N] = A_fp8[M,K] @ B_fp8[N,K].T with per-block scales on both sides.
-    CPU fallback: dequantize both to bf16 then use F.linear.
-    """
-    K = a.size(-1)
-    M = a.numel() // K
-    a_flat = a.view(M, K)
-    a_s_flat = a_s.view(M, -1)
-    # dequantize A: [M,K] from fp8 * scales [M, K//block]
-    a_deq = a_flat.to(torch.float32)
-    a_scale = a_s_flat.to(torch.float32).repeat_interleave(block_size, dim=1)[:, :K]
-    a_deq = a_deq * a_scale
-    b_deq = _dequant_fp8_weight(b, b_s, group_size=block_size)
-    out = F.linear(a_deq.to(b_deq.dtype), b_deq)
-    return out.view(*a.size()[:-1], b.size(0)).to(torch.get_default_dtype())
-
-
-def fp4_gemm(
-    a: torch.Tensor,
-    a_s: torch.Tensor,
-    b: torch.Tensor,
-    b_s: torch.Tensor,
-    scale_dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """C[M,N] = A_fp8[M,K] @ B_fp4[N,K].T. CPU fallback: dequant both, F.linear."""
-    K = a.size(-1)
-    M = a.numel() // K
-    a_flat = a.view(M, K)
-    a_s_flat = a_s.view(M, -1)
-    a_scale = a_s_flat.to(torch.float32).repeat_interleave(block_size, dim=1)[:, :K]
-    a_deq = a_flat.to(torch.float32) * a_scale
-    b_deq = _dequant_fp4_weight(b, b_s, block_size=fp4_block_size)
-    out = F.linear(a_deq.to(b_deq.dtype), b_deq)
-    return out.view(*a.size()[:-1], b.size(0)).to(torch.get_default_dtype())
-
-
-def sparse_attn(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_idxs: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    """Sparse multi-head attention.
-    q:         [b, s, h, d]
-    kv:        [b, n, d]
-    attn_sink: [h]  (learned extra softmax "null" slot)
-    topk_idxs: [b, s, topk] int32, -1 means masked.
-    Returns o: [b, s, h, d].
-    """
-    b, s, h, d = q.shape
-    topk = topk_idxs.size(-1)
-    # Gather kv at top-k idxs (masked positions -> zeros, score -> -inf)
-    safe_idxs = topk_idxs.clamp_min(0).long()
-    # kv_gather: [b, s, topk, d]
-    kv_gather = torch.gather(
-        kv.unsqueeze(1).expand(b, s, kv.size(1), d),
-        2,
-        safe_idxs.unsqueeze(-1).expand(b, s, topk, d),
-    )
-    valid = (topk_idxs >= 0).to(q.dtype)  # [b,s,topk]
-
-    # scores: [b, s, h, topk]
-    scores = torch.einsum("bshd,bskd->bshk", q.float(), kv_gather.float()) * softmax_scale
-    # mask invalid positions
-    scores = scores + (valid.log().unsqueeze(2))  # log(0)= -inf for masked
-    # include attn_sink: we treat it as extra slot with value 0 vector, score = attn_sink[h]
-    sink_scores = attn_sink.view(1, 1, h, 1).expand(b, s, h, 1).float()
-    full_scores = torch.cat([scores, sink_scores], dim=-1)
-    probs = F.softmax(full_scores, dim=-1)
-    # drop the sink slot's contribution by indexing first topk probs only (sink value is 0 so contributes 0)
-    probs = probs[..., :topk]
-    # weighted sum
-    o = torch.einsum("bshk,bskd->bshd", probs, kv_gather.float())
-    return o.to(q.dtype)
-
-
-def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    """Walsh-Hadamard transform along the last dim, scaled by 1/sqrt(d).
-    Drop-in CPU replacement for fast_hadamard_transform.hadamard_transform.
-    """
-    d = x.size(-1)
-    assert (d & (d - 1)) == 0 and d > 0, f"last dim {d} must be a power of 2"
-    scale = d ** -0.5
-    shape = x.shape
-    y = x.contiguous().view(-1, d).float()
-    h = 1
-    while h < d:
-        y = y.view(-1, d // (2 * h), 2, h)
-        a = y[:, :, 0, :]
-        b = y[:, :, 1, :]
-        y = torch.stack([a + b, a - b], dim=2).view(-1, d)
-        h *= 2
-    return (y * scale).view(shape).to(x.dtype)
-
-
 # ==============================================================================
 # ARCHITECTURE (adapted from deepseek inference/model.py, CPU-safe)
 # ==============================================================================
@@ -340,9 +148,7 @@ class ModelArgs:
     max_batch_size: int = 1
     max_seq_len: int = 4096
     dtype: Literal["bf16", "fp8"] = "fp8"
-    scale_fmt: Literal[None, "ue8m0"] = "ue8m0"
     expert_dtype: Literal[None, "fp4", "fp8"] = "fp4"
-    scale_dtype: Literal["fp32", "fp8"] = "fp8"
     vocab_size: int = 129280
     dim: int = 4096
     moe_inter_dim: int = 2048
@@ -482,20 +288,6 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
-    y = x
-    x_c = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
-    if inverse:
-        freqs_cis = freqs_cis.conj()
-    if x_c.ndim == 3:
-        freqs_cis = freqs_cis.view(1, x_c.size(1), x_c.size(-1))
-    else:
-        freqs_cis = freqs_cis.view(1, x_c.size(1), 1, x_c.size(-1))
-    x_c = torch.view_as_real(x_c * freqs_cis).flatten(-2)
-    y.copy_(x_c)
-    return y
-
-
 @lru_cache(1)
 def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int):
     if start_pos >= window_size - 1:
@@ -555,79 +347,6 @@ class Compressor(nn.Module):
         )
         self.freqs_cis: Optional[torch.Tensor] = None
 
-    def overlap_transform(self, tensor: torch.Tensor, value=0):
-        b, s, _, _ = tensor.size()
-        ratio, d = self.compress_ratio, self.head_dim
-        new_tensor = tensor.new_full((b, s, 2 * ratio, d), value)
-        new_tensor[:, :, ratio:] = tensor[:, :, :, d:]
-        new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
-        return new_tensor
-
-    def forward(self, x: torch.Tensor, start_pos: int):
-        assert self.kv_cache is not None
-        bsz, seqlen, _ = x.size()
-        ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
-        dtype = x.dtype
-        x = x.float()
-        kv = self.wkv(x)
-        score = self.wgate(x)
-        if start_pos == 0:
-            should_compress = seqlen >= ratio
-            remainder = seqlen % ratio
-            cutoff = seqlen - remainder
-            offset = ratio if overlap else 0
-            if overlap and cutoff >= ratio:
-                self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio:cutoff]
-                self.score_state[:bsz, :ratio] = score[:, cutoff - ratio:cutoff] + self.ape
-            if remainder > 0:
-                kv, self.kv_state[:bsz, offset:offset + remainder] = kv.split([cutoff, remainder], dim=1)
-                self.score_state[:bsz, offset:offset + remainder] = score[:, cutoff:] + self.ape[:remainder]
-                score = score[:, :cutoff]
-            kv = kv.unflatten(1, (-1, ratio))
-            score = score.unflatten(1, (-1, ratio)) + self.ape
-            if overlap:
-                kv = self.overlap_transform(kv, 0)
-                score = self.overlap_transform(score, float("-inf"))
-            kv = (kv * score.softmax(dim=2)).sum(dim=2)
-        else:
-            should_compress = (start_pos + 1) % self.compress_ratio == 0
-            score += self.ape[start_pos % ratio]
-            if overlap:
-                self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
-                self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
-                if should_compress:
-                    kv_state = torch.cat([self.kv_state[:bsz, :ratio, :d], self.kv_state[:bsz, ratio:, d:]], dim=1)
-                    score_state = torch.cat(
-                        [self.score_state[:bsz, :ratio, :d], self.score_state[:bsz, ratio:, d:]], dim=1
-                    )
-                    kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
-                    self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
-                    self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
-            else:
-                self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)
-                self.score_state[:bsz, start_pos % ratio] = score.squeeze(1)
-                if should_compress:
-                    kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
-        if not should_compress:
-            return
-        kv = self.norm(kv.to(dtype))
-        if start_pos == 0:
-            freqs_cis = self.freqs_cis[:cutoff:ratio]
-        else:
-            freqs_cis = self.freqs_cis[start_pos + 1 - self.compress_ratio].unsqueeze(0)
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
-        if self.rotate:
-            kv = rotate_activation(kv)
-            fp4_act_quant(kv, fp4_block_size, True)
-        else:
-            act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
-        if start_pos == 0:
-            self.kv_cache[:bsz, :seqlen // ratio] = kv
-        else:
-            self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
-        return kv
-
-
 class Indexer(nn.Module):
     def __init__(self, args: ModelArgs, compress_ratio: int = 4):
         super().__init__()
@@ -649,37 +368,6 @@ class Indexer(nn.Module):
             persistent=False,
         )
         self.freqs_cis: Optional[torch.Tensor] = None
-
-    def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int):
-        bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
-        ratio = self.compress_ratio
-        rd = self.rope_head_dim
-        end_pos = start_pos + seqlen
-        if self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache
-            self.compressor.freqs_cis = self.freqs_cis
-        q = self.wq_b(qr)
-        q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
-        q = rotate_activation(q)
-        # QAT sim on CPU: quantize+dequant q in place
-        fp4_act_quant(q, fp4_block_size, True)
-        self.compressor(x, start_pos)
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
-        index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, :end_pos // ratio])
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
-        if start_pos == 0:
-            mask = torch.arange(seqlen // ratio).repeat(seqlen, 1) >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-            index_score += torch.where(mask, float("-inf"), 0)
-        topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
-        if start_pos == 0:
-            mask = topk_idxs >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
-            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
-        else:
-            topk_idxs += offset
-        return topk_idxs
-
 
 class Attention(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
@@ -730,70 +418,6 @@ class Attention(nn.Module):
             args.beta_fast, args.beta_slow,
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
-
-    def forward(self, x: torch.Tensor, start_pos: int):
-        bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
-        win = self.window_size
-        ratio = self.compress_ratio
-        rd = self.rope_head_dim
-        if self.compress_ratio and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache[:, win:]
-            self.compressor.freqs_cis = self.freqs_cis
-            if self.indexer is not None:
-                self.indexer.freqs_cis = self.freqs_cis
-        qr = q = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
-        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
-        kv = self.wkv(x)
-        kv = self.kv_norm(kv)
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
-        act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
-        topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos)
-        if self.compress_ratio:
-            offset = kv.size(1) if start_pos == 0 else win
-            if self.indexer is not None:
-                compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
-            else:
-                compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
-            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
-        topk_idxs = topk_idxs.int()
-        if start_pos == 0:
-            if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv
-            else:
-                cutoff = seqlen % win
-                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[:, -win:].split(
-                    [win - cutoff, cutoff], dim=1
-                )
-            if self.compress_ratio:
-                if (kv_compress := self.compressor(x, start_pos)) is not None:
-                    kv = torch.cat([kv, kv_compress], dim=1)
-            o = self._sparse_attn(q, kv, topk_idxs)
-        else:
-            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
-            if self.compress_ratio:
-                self.compressor(x, start_pos)
-            o = self._sparse_attn(q, self.kv_cache[:bsz], topk_idxs)
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
-        o = o.view(bsz, seqlen, self.n_local_groups, -1)
-        o = self._wo_a_grouped(o)
-        x = self.wo_b(o.flatten(2))
-        return x
-
-    def _sparse_attn(self, q: torch.Tensor, kv: torch.Tensor, topk_idxs: torch.Tensor) -> torch.Tensor:
-        """Default CPU path; offload_sparse_attn swaps for a device path."""
-        return sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
-
-    def _wo_a_grouped(self, o: torch.Tensor) -> torch.Tensor:
-        """Block-diagonal per-group linear: [B,S,G,D] -> [B,S,G,R].
-
-        Default CPU path; offload_attn_wo_a swaps this for a device path.
-        """
-        w = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        return torch.einsum("bsgd,grd->bsgr", o.to(w.dtype), w)
-
 
 class Gate(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
@@ -961,10 +585,8 @@ class ParallelHead(nn.Module):
 
 class Transformer(nn.Module):
     def __init__(self, args: ModelArgs):
-        global default_dtype, scale_fmt, scale_dtype
+        global default_dtype
         default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
-        scale_fmt = "ue8m0" if args.scale_dtype == "fp8" else args.scale_fmt
-        scale_dtype = torch.float8_e8m0fnu if args.scale_dtype == "fp8" else torch.float32
         super().__init__()
         self.args = args
         self.max_seq_len = args.max_seq_len
@@ -3308,9 +2930,6 @@ class DeviceAttention(nn.Module):
         q_lora_2d = ttnn.reshape(q_lora_tt, [B * S, self.q_lora_rank])
         qr_2d = self._rmsnorm_device(self.q_norm_dev, q_lora_2d, B * S)
         qr_tt = ttnn.reshape(qr_2d, [B, S, self.q_lora_rank])
-        # CPU indexer needs qr on host; device indexer keeps qr_tt on device.
-        if device_indexer is None and getattr(attn, "indexer", None) is not None:
-            qr_cpu = self._download_replicated(qr_tt, B, S, self.q_lora_rank)
 
         q_full_tt = attn.wq_b.forward_device(qr_tt)           # [B, S, H*D]
         q_tt = ttnn.reshape(q_full_tt, [B, S, H, D])
@@ -3389,9 +3008,6 @@ class DeviceAttention(nn.Module):
                     topk_idxs_dev = ttnn.concat([win_idxs_tt, cmp_idxs_int], dim=-1)
                     topk_idxs_dev_K = win + k
                     topk_idxs = None
-            elif getattr(attn, "indexer", None) is not None:
-                compress_topk_idxs = attn.indexer(x, qr_cpu, start_pos, offset)
-                topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
             else:
                 compress_topk_idxs = get_compress_topk_idxs(
                     self.compress_ratio, B, S, start_pos, offset)
@@ -3639,9 +3255,7 @@ class Model:
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             dtype=cfg.get("dtype", "fp8"),
-            scale_fmt=cfg.get("scale_fmt", "ue8m0"),
             expert_dtype=cfg.get("expert_dtype", "fp4"),
-            scale_dtype="fp8",
             vocab_size=cfg["vocab_size"],
             dim=cfg["dim"],
             moe_inter_dim=cfg["moe_inter_dim"],
