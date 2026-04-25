@@ -707,6 +707,30 @@ class DeviceLMHead:
             mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(None, -1)),
         )
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
+        self._trace_id = None
+
+    def _compute_body(self):
+        """Pure-device norm + matmul. Reads `_x_upload_tt`, writes
+        `_matmul_out_tt`. Called once outside trace as warmup, then again
+        inside `begin_trace_capture` / `end_trace_capture`."""
+        ttnn = self._ttnn
+        x_tt = self._x_upload_tt
+        if self.norm_tt is not None:
+            x_tt = ttnn.reshape(x_tt, (1, 1, 1, self.dim))
+            x_tt = ttnn.rms_norm(x_tt, weight=self.norm_tt, epsilon=self.norm_eps)
+            x_tt = ttnn.reshape(x_tt, (1, 1, self.dim))
+        ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._matmul_out_tt)
+
+    def _capture_trace(self):
+        """Warmup outside trace (lets ttnn.rms_norm do its lazy host upload),
+        then record the same op sequence into a replayable trace."""
+        ttnn = self._ttnn
+        self._compute_body()
+        ttnn.synchronize_device(self.mesh)
+        self._trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
+        self._compute_body()
+        ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
 
     def __call__(self, x_last: torch.Tensor) -> torch.Tensor:
         # x_last: [B=1, dim] — unnormalized if norm_tt is set, else normalized.
@@ -721,13 +745,10 @@ class DeviceLMHead:
             mesh_mapper=self._upload_mapper,
         )
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
-        x_tt = self._x_upload_tt
-        if self.norm_tt is not None:
-            x_tt = ttnn.reshape(x_tt, (1, 1, 1, self.dim))
-            x_tt = ttnn.rms_norm(x_tt, weight=self.norm_tt, epsilon=self.norm_eps)
-            x_tt = ttnn.reshape(x_tt, (1, 1, self.dim))
-        ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    optional_output_tensor=self._matmul_out_tt)
+        if self._trace_id is None:
+            self._capture_trace()
+        else:
+            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
         y = ttnn.to_torch(
             self._matmul_out_tt,
             mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(0, -1)),
