@@ -2394,6 +2394,9 @@ def _device_act_quant_block(ttnn, x_tt, block_size: int,
       s = amax / fp8_max
       out = clamp(z/s, -fp8_max, fp8_max) * s
       return out reshaped back
+
+    TODO: top tt-lang kernel candidate. All elementwise + one reduce on a
+    [..., nb, block] reshape; fuses cleanly into a single compute body.
     """
     orig_shape = list(x_tt.shape)
     N = orig_shape[-1]
