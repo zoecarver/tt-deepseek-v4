@@ -2413,6 +2413,30 @@ def _device_act_quant_block(ttnn, x_tt, block_size: int,
     return ttnn.reshape(out, orig_shape)
 
 
+def _sylvester_hadamard(d: int) -> torch.Tensor:
+    """Sylvester-construction Hadamard matrix H_d of size [d, d] with +/-1
+    entries. Symmetric. Matches the natural-order butterfly produced by
+    rotate_activation."""
+    if d <= 0 or (d & (d - 1)) != 0:
+        raise ValueError(f"d {d} must be a positive power of 2")
+    H = torch.tensor([[1.0]])
+    n = 1
+    while n < d:
+        H = torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)
+        n *= 2
+    return H
+
+
+def _device_rotate_activation(ttnn, x_tt, h_tt):
+    """Walsh-Hadamard transform along last dim, scaled by 1/sqrt(d).
+
+    h_tt is a precomputed device tensor of shape [d, d] holding H_d/sqrt(d).
+    Single matmul replaces the 7-stage butterfly (for d=128) and broadcasts
+    over arbitrary leading dims.
+    """
+    return ttnn.matmul(x_tt, h_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+
 class DeviceAttention(nn.Module):
     """Fused MLA attention forward on a 1xN mesh (decode path device-resident).
 
