@@ -2381,6 +2381,35 @@ def _device_q_rsqrt_norm(ttnn, q_tt, eps: float):
     return ttnn.multiply(q_tt, inv)
 
 
+def _device_act_quant_block(ttnn, x_tt, block_size: int,
+                            fp8_max: float = 448.0, eps: float = 1e-4):
+    """Block-wise act_quant along last dim, bf16 round-trip.
+
+    Mirrors CPU `act_quant(..., inplace=True)` without the fp8 e4m3 cast
+    (bf16 precision policy). Algorithm stays on device so a future fp8
+    emulation kernel can slot in here.
+
+      z = reshape(x, [..., N/block, block])
+      amax = max(|z|, -1).clamp(min=eps)
+      s = amax / fp8_max
+      out = clamp(z/s, -fp8_max, fp8_max) * s
+      return out reshaped back
+    """
+    orig_shape = list(x_tt.shape)
+    N = orig_shape[-1]
+    if N % block_size != 0:
+        raise ValueError(f"last dim {N} must be divisible by block_size {block_size}")
+    nb = N // block_size
+    blocked = ttnn.reshape(x_tt, orig_shape[:-1] + [nb, block_size])
+    amax = ttnn.max(ttnn.abs(blocked), dim=-1, keepdim=True)
+    amax = ttnn.maximum(amax, eps)
+    s = ttnn.multiply(amax, 1.0 / fp8_max)
+    y = ttnn.divide(blocked, s)
+    y = ttnn.clamp(y, -fp8_max, fp8_max)
+    out = ttnn.multiply(y, s)
+    return ttnn.reshape(out, orig_shape)
+
+
 class DeviceAttention(nn.Module):
     """Fused MLA attention forward on a 1xN mesh (decode path device-resident).
 
@@ -2537,10 +2566,21 @@ class DeviceAttention(nn.Module):
         kv_rope = _device_apply_rotary_interleaved(ttnn, kv_rope, cos_kv, sin_kv, inverse=False)
         kv_tt = ttnn.concat([kv_nope, kv_rope], dim=-1)
 
-        # Round-trip kv to CPU for in-place act_quant and CPU side effects
-        # (kv_cache update, compressor, indexer).
+        # Device-side act_quant on the nope region (bf16 round-trip; no fp8
+        # cast under the bf16-everywhere precision policy). After this, kv_tt
+        # mirrors what CPU `act_quant(..., inplace=True)` would produce in bf16.
+        kv_nope_q = _device_act_quant_block(
+            ttnn,
+            ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd]),
+            block_size=64,
+        )
+        kv_rope_only = ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D])
+        kv_tt = ttnn.concat([kv_nope_q, kv_rope_only], dim=-1)
+
+        # Still download kv for CPU side effects (kv_cache update, compressor,
+        # indexer are CPU-resident). Those round-trips go away once task #22
+        # moves Compressor + Indexer onto device.
         kv_cpu = self._download_replicated(kv_tt, B, S, D).to(x.dtype)
-        act_quant(kv_cpu[..., :-rd], 64, scale_fmt, scale_dtype, True)
 
         topk_idxs = get_window_topk_idxs(win, B, S, start_pos)
         if self.compress_ratio:
