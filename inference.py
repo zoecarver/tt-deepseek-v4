@@ -519,21 +519,40 @@ class Block(nn.Module):
             self.hc_ffn_scale = nn.Parameter(torch.empty(3))
 
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]):
-        return _block_forward(self, x, start_pos, input_ids)
+        B, S, mhc, hidden = x.shape
+        mhc_attn = self._device_mhc_attn
+        ttnn = mhc_attn._ttnn
+        num_tokens = B * S
+        num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
+        a_packed = _mhc_pack_residual(x, num_tokens_pad)
+        host_mesh = ttnn.from_torch(
+            a_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=mhc_attn._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(host_mesh, mhc_attn._a_upload_tt)
+        out_tt = _block_forward(self, mhc_attn._a_upload_tt, start_pos,
+                                input_ids, B, S, mhc, hidden, x.dtype)
+        composer = ttnn.ConcatMesh2dToTensor(
+            mhc_attn.mesh, mhc_attn.mesh_shape, dims=(1, 0))
+        out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
+        y = _mhc_unpack_a_tt(out_packed, num_tokens, mhc, hidden)
+        return y.view(B, S, mhc, hidden).to(x.dtype)
 
 
-def _block_forward(layer, x: torch.Tensor, start_pos: int,
-                   input_ids: Optional[torch.Tensor]):
+def _block_forward(layer, x, start_pos: int,
+                   input_ids: Optional[torch.Tensor],
+                   B: int, S: int, mhc: int, hidden: int,
+                   orig_dtype):
     """Vanilla block forward. Calls the bound (device or CPU) sub-modules
     directly so the chain is one flat sequence of explicit calls — no
     nn.Module.__call__ traversal between phases.
 
-    Layout transitions: x at entry is [B, S, mhc, hidden]; hc_pre flattens
-    to [B, S, hidden]; hc_post un-flattens back. attn / norm / ffn operate
-    on [B, S, hidden].
+    x is the residual stream as a device tensor in hc_pre_device input
+    format: [num_tokens_pad, mhc*hidden] fp32. Returns the same format
+    (output of hc_post → packed for the next layer's hc_pre).
 
     Method dispatch follows the offload-time bindings:
-      - layer.hc_pre / layer.hc_post: bound DeviceMHC dispatch closures
+      - layer._device_mhc_attn / layer._device_mhc_ffn: DeviceMHC instances
       - layer.attn_norm.forward / layer.ffn_norm.forward: DeviceRMSNorm
       - layer.attn.forward: DeviceAttention.forward (decode-only)
       - layer.ffn.forward: MoE host loop with device gate / shared expert
@@ -544,13 +563,12 @@ def _block_forward(layer, x: torch.Tensor, start_pos: int,
     ffn_norm_dn = layer.ffn_norm.forward.__self__
     attn_dev = layer.attn._device_attention
     ttnn = attn_norm_dn._ttnn
-    B, S, mhc, hidden = x.shape
-    orig_dtype = x.dtype
     num_tokens = B * S
     num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
 
     with _phase("block.hc_pre"):
-        hc_out_fp32 = mhc_attn.hc_pre_with_upload(x)
+        hc_out_fp32 = mhc_attn.hc_pre_device(
+            num_tokens, num_tokens_pad, a_tt=x)
     with _phase("block.norm"):
         norm_in = ttnn.typecast(hc_out_fp32, dtype=ttnn.bfloat16)
         norm_out_tt = attn_norm_dn.forward_device(norm_in, num_tokens)
@@ -572,14 +590,8 @@ def _block_forward(layer, x: torch.Tensor, start_pos: int,
         post_out_tt = mhc_attn.hc_post_device(num_tokens, x_tt=x_post_input_fp32)
 
     with _phase("block.hc_pre"):
-        post_3d = ttnn.reshape(post_out_tt, [num_tokens, _MHC_TILE, hidden])
-        post_sliced = ttnn.slice(post_3d, [0, 0, 0], [num_tokens, mhc, hidden])
-        post_flat = ttnn.reshape(post_sliced, [num_tokens, mhc * hidden])
-        a_input_tt = ttnn.pad(
-            post_flat,
-            padding=[(0, num_tokens_pad - num_tokens), (0, 0)],
-            value=0.0,
-        )
+        a_input_tt = _mhc_post_to_a_tt(
+            ttnn, post_out_tt, num_tokens, num_tokens_pad, mhc, hidden)
         ffn_hc_out_fp32 = mhc_ffn.hc_pre_device(
             num_tokens, num_tokens_pad, a_tt=a_input_tt)
     with _phase("block.norm"):
@@ -593,10 +605,11 @@ def _block_forward(layer, x: torch.Tensor, start_pos: int,
             ffn_norm_dn.mesh, ffn_norm_dn.mesh_shape, dims=(1, 0))
         x_for_moe = ttnn.to_torch(
             ffn_norm_bridge, mesh_composer=composer)[:B].to(orig_dtype)
-        x = layer.ffn.forward(x_for_moe, input_ids)
+        moe_out = layer.ffn.forward(x_for_moe, input_ids)
     with _phase("block.hc_post"):
-        x = mhc_ffn.hc_post(x)
-    return x
+        ffn_post_out_tt = mhc_ffn.hc_post_with_upload_device(moe_out)
+        return _mhc_post_to_a_tt(
+            ttnn, ffn_post_out_tt, num_tokens, num_tokens_pad, mhc, hidden)
 
 
 class ParallelHead(nn.Module):
@@ -651,10 +664,29 @@ class Transformer(nn.Module):
         with _phase("embed"):
             h = self.embed(input_ids)
             h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+            B, S, mhc, hidden = h.shape
+            orig_dtype = h.dtype
+            num_tokens = B * S
+            num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
+            mhc_attn = self.layers[0]._device_mhc_attn
+            ttnn = mhc_attn._ttnn
+            a_packed = _mhc_pack_residual(h, num_tokens_pad)
+            host_mesh = ttnn.from_torch(
+                a_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                mesh_mapper=mhc_attn._upload_mapper,
+            )
+            ttnn.copy_host_to_device_tensor(host_mesh, mhc_attn._a_upload_tt)
+            a_tt = mhc_attn._a_upload_tt
         with _phase("blocks"):
             for layer in self.layers:
-                h = _block_forward(layer, h, start_pos, input_ids)
+                a_tt = _block_forward(layer, a_tt, start_pos, input_ids,
+                                      B, S, mhc, hidden, orig_dtype)
         with _phase("head"):
+            composer = ttnn.ConcatMesh2dToTensor(
+                mhc_attn.mesh, mhc_attn.mesh_shape, dims=(1, 0))
+            out_packed = ttnn.to_torch(a_tt, mesh_composer=composer)
+            y = _mhc_unpack_a_tt(out_packed, num_tokens, mhc, hidden)
+            h = y.view(B, S, mhc, hidden).to(orig_dtype)
             logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
         return logits
 
@@ -1316,6 +1348,27 @@ def _mhc_unpack_apply_mix_out(packed: torch.Tensor, num_tokens: int, h: int) -> 
 def _mhc_unpack_post_out(packed: torch.Tensor, num_tokens: int, mhc: int, h: int) -> torch.Tensor:
     """[num_tokens_pad * TILE, h] -> [num_tokens, mhc, h] (rows 0..mhc-1 of each block)."""
     return packed.view(-1, _MHC_TILE, h)[:num_tokens, :mhc, :].contiguous()
+
+
+def _mhc_unpack_a_tt(packed: torch.Tensor, num_tokens: int, mhc: int, h: int) -> torch.Tensor:
+    """[num_tokens_pad, mhc*h] (a_tt format) -> [num_tokens, mhc, h]."""
+    return packed.view(-1, mhc, h)[:num_tokens, :, :].contiguous()
+
+
+def _mhc_post_to_a_tt(ttnn, post_out_tt, num_tokens: int, num_tokens_pad: int,
+                      mhc: int, hidden: int):
+    """On-device transform: hc_post_device output [num_tokens*TILE, hidden]
+    -> hc_pre_device input [num_tokens_pad, mhc*hidden] fp32. Slices off the
+    TILE-padding rows, flattens (mhc, hidden) into a row, then zero-pads to
+    num_tokens_pad rows. No host transfers."""
+    post_3d = ttnn.reshape(post_out_tt, [num_tokens, _MHC_TILE, hidden])
+    post_sliced = ttnn.slice(post_3d, [0, 0, 0], [num_tokens, mhc, hidden])
+    post_flat = ttnn.reshape(post_sliced, [num_tokens, mhc * hidden])
+    return ttnn.pad(
+        post_flat,
+        padding=[(0, num_tokens_pad - num_tokens), (0, 0)],
+        value=0.0,
+    )
 
 
 def _mhc_broadcast_row_to_tile(row: torch.Tensor) -> torch.Tensor:
@@ -2235,6 +2288,25 @@ class DeviceMHC(nn.Module):
         out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
         y_flat = _mhc_unpack_post_out(out_packed, num_tokens, mhc, hidden)
         return y_flat.view(B, S, mhc, hidden).to(out_dtype)
+
+    def hc_post_with_upload_device(self, x: torch.Tensor):
+        """Upload x (MoE output) and run hc_post_device. Returns the device
+        tensor [num_tokens * TILE, hidden] fp32 directly (no download). Use
+        when chaining hc_post → next layer's hc_pre on device."""
+        ttnn = self._ttnn
+        B, S, hidden = x.shape
+        if hidden != self.hidden:
+            raise ValueError(
+                f"x hidden {hidden} != expected {self.hidden}")
+        num_tokens = B * S
+        x_2d = x.reshape(num_tokens, hidden)
+        x_packed = _mhc_pack_x_bc(x_2d, self.hc_mult, num_tokens)
+        host_mesh = ttnn.from_torch(
+            x_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
+        return self.hc_post_device(num_tokens)
 
 
 class DeviceSharedExpert(nn.Module):
