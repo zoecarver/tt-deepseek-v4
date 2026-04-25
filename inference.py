@@ -2486,9 +2486,18 @@ class DeviceMHC(nn.Module):
         )
         mix_tt = ttnn.reshape(mix_padded, [num_tokens * _MHC_TILE, _MHC_TILE])
 
-        x_3d = x.view(num_tokens, mhc, hidden)
-        x_packed = _mhc_pack_x_for_apply_mix(x_3d, num_tokens)
-        x_tt = self._rep_tensor(x_packed)
+        # Build apply_mix x layout from the already-uploaded a_tt (the
+        # norm_fn input) instead of re-uploading the residual in a different
+        # shape. a_tt is [num_tokens_pad, mhc*hidden]; we need [num_tokens *
+        # TILE, hidden] with rows 0..mhc-1 of each TILE-block holding x[t,m,:].
+        a_sliced = ttnn.slice(a_tt, [0, 0], [num_tokens, mhc * hidden])
+        a_3d = ttnn.reshape(a_sliced, [num_tokens, mhc, hidden])
+        x_padded = ttnn.pad(
+            a_3d,
+            padding=[(0, 0), (0, _MHC_TILE - mhc), (0, 0)],
+            value=0.0,
+        )
+        x_tt = ttnn.reshape(x_padded, [num_tokens * _MHC_TILE, hidden])
         out_tt = self._zeros((num_tokens * _MHC_TILE, hidden))
         self._apply_mix_kernel(num_tokens)(
             x_tt, mix_tt, self.scaler_tt, out_tt)
