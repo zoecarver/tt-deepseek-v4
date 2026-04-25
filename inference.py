@@ -4428,12 +4428,28 @@ def main():
                         help="Run Compressor + Indexer decode paths on device with "
                              "device-resident state buffers (kv_state, score_state, kv_cache). "
                              "Requires --offload-attn-full and --offload-indexer-linears.")
+    parser.add_argument("--all-on-device", action="store_true",
+                        help="Enable every --offload-* flag. Convenience switch for "
+                             "running the full device path.")
     parser.add_argument("--weights-cache",
                         default=os.environ.get("DS_WEIGHTS_CACHE",
                                                "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
                         help="Path to pickled state_dict cache. First run populates it; "
                              "subsequent runs mmap it (set to empty string to disable).")
     args = parser.parse_args()
+
+    if args.all_on_device:
+        for flag in (
+            "offload_lm_head",
+            "offload_attn_wq_a", "offload_attn_wq_b", "offload_attn_wkv",
+            "offload_attn_wo_a", "offload_attn_wo_b",
+            "offload_moe_gate", "offload_moe_shared_expert",
+            "offload_rms_norms", "offload_embedding",
+            "offload_compressor_linears", "offload_indexer_linears",
+            "offload_sparse_attn", "offload_attn_full",
+            "offload_mhc", "offload_compressor_indexer",
+        ):
+            setattr(args, flag, True)
 
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(min(32, os.cpu_count() or 8))
