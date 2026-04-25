@@ -2166,6 +2166,34 @@ class DeviceSharedExpert(nn.Module):
         self._out_tt = ttnn.from_torch(
             torch.zeros(1, self.dim, dtype=torch.bfloat16), **common_rep)
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
+        self._trace_id = None
+
+    def _compute_body(self):
+        """Pure-device SwiGLU pipeline. All ops write into pre-allocated
+        buffers so trace replay reuses the same addresses."""
+        ttnn = self._ttnn
+        x_tt = self._x_upload_tt
+        ttnn.matmul(x_tt, self.w1_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._y1_tt)
+        ttnn.matmul(x_tt, self.w3_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._y3_tt)
+        if self.swiglu_limit > 0:
+            ttnn.clamp(self._y1_tt, max=self.swiglu_limit, output_tensor=self._y1_tt)
+            ttnn.clamp(self._y3_tt, min=-self.swiglu_limit, max=self.swiglu_limit,
+                       output_tensor=self._y3_tt)
+        ttnn.silu(self._y1_tt, output_tensor=self._silu_tt)
+        ttnn.multiply(self._silu_tt, self._y3_tt, output_tensor=self._mid_tt)
+        ttnn.matmul(self._mid_tt, self.w2_tt,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._out_tt)
+
+    def _capture_trace(self):
+        ttnn = self._ttnn
+        self._compute_body()  # warmup
+        ttnn.synchronize_device(self.mesh)
+        self._trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
+        self._compute_body()
+        ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """x: [M=1, dim] -> [M=1, dim]. weights matches Expert.forward
@@ -2184,20 +2212,10 @@ class DeviceSharedExpert(nn.Module):
             mesh_mapper=self._upload_mapper,
         )
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
-        x_tt = self._x_upload_tt
-        ttnn.matmul(x_tt, self.w1_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    optional_output_tensor=self._y1_tt)
-        ttnn.matmul(x_tt, self.w3_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    optional_output_tensor=self._y3_tt)
-        if self.swiglu_limit > 0:
-            ttnn.clamp(self._y1_tt, max=self.swiglu_limit, output_tensor=self._y1_tt)
-            ttnn.clamp(self._y3_tt, min=-self.swiglu_limit, max=self.swiglu_limit,
-                       output_tensor=self._y3_tt)
-        ttnn.silu(self._y1_tt, output_tensor=self._silu_tt)
-        ttnn.multiply(self._silu_tt, self._y3_tt, output_tensor=self._mid_tt)
-        ttnn.matmul(self._mid_tt, self.w2_tt,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    optional_output_tensor=self._out_tt)
+        if self._trace_id is None:
+            self._capture_trace()
+        else:
+            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
 
         composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
         y = ttnn.to_torch(self._out_tt, mesh_composer=composer)[:M]
