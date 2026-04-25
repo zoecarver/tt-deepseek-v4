@@ -3011,24 +3011,50 @@ class DeviceAttention(nn.Module):
         return self._decode(x, start_pos)
 
     def _decode(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """Wrapper: uploads x, runs forward_device, downloads y. Use
+        forward_device directly when chaining on device."""
         ttnn = self._ttnn
-        attn = self.attn
         B, S, _ = x.shape
-        H, D = self.n_heads, self.head_dim
-        rd = self.rope_head_dim
-        win = self.window_size
 
-        # Single upload of x via the hoisted upload buffer.
         host_mesh = ttnn.from_torch(
             x.to(torch.bfloat16).contiguous(),
             dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             mesh_mapper=self._upload_mapper,
         )
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
-        x_tt = self._x_upload_tt
+
+        out_tt = self.forward_device(self._x_upload_tt, start_pos, x_cpu=x)
+
+        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
+        out = ttnn.to_torch(out_tt, mesh_composer=composer)[:B]
+        return out.to(x.dtype)
+
+    def forward_device(self, x_tt, start_pos: int,
+                       x_cpu: Optional[torch.Tensor] = None):
+        """Pure-device attention body. x_tt is the pre-uploaded
+        [B, 1, dim] device tensor; returns out_tt [B, 1, dim] device
+        tensor. Caller is responsible for upload/download.
+
+        x_cpu is required only when the CPU-fallback compressor path is
+        active (attn._device_compressor is None); on the device-everything
+        path it can be None.
+        """
+        ttnn = self._ttnn
+        attn = self.attn
+        B = int(x_tt.shape[0])
+        S = 1
+        H, D = self.n_heads, self.head_dim
+        rd = self.rope_head_dim
+        win = self.window_size
 
         device_comp = getattr(attn, "_device_compressor", None)
         device_indexer = getattr(attn, "_device_indexer", None)
+        if device_comp is None and x_cpu is None:
+            raise ValueError(
+                "DeviceAttention.forward_device requires x_cpu when "
+                "the CPU-fallback compressor path is active "
+                "(attn._device_compressor is None)."
+            )
 
         # Q path: wq_a -> q_norm -> wq_b -> per-head rsqrt-norm -> rotary.
         q_lora_tt = attn.wq_a.forward_device(x_tt)            # [B, S, q_lora_rank]
@@ -3074,7 +3100,7 @@ class DeviceAttention(nn.Module):
         # Device path keeps kv_tt on device for both window-slot and compress-
         # slot writes (no round-trip).
         if device_comp is None:
-            kv_cpu = self._download_replicated(kv_tt, B, S, D).to(x.dtype)
+            kv_cpu = self._download_replicated(kv_tt, B, S, D).to(x_cpu.dtype)
 
         topk_idxs = get_window_topk_idxs(win, B, S, start_pos)
         topk_idxs_dev = None  # int32 TILE [B, S, K] if device path, else None
@@ -3134,7 +3160,7 @@ class DeviceAttention(nn.Module):
         if device_comp is None:
             attn.kv_cache[:B, start_pos % win] = kv_cpu.squeeze(1)
             if self.compress_ratio:
-                attn.compressor(x, start_pos)
+                attn.compressor(x_cpu, start_pos)
             window_slot = (
                 attn.kv_cache[:B, start_pos % win]
                 .to(torch.bfloat16)
@@ -3205,11 +3231,7 @@ class DeviceAttention(nn.Module):
         R = self.o_lora_rank
         o_flat = ttnn.reshape(o_wo_a, [B, S, self.n_groups * R])
         out_tt = attn.wo_b.forward_device(o_flat)             # [B, S, dim]
-
-        # Download once.
-        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        out = ttnn.to_torch(out_tt, mesh_composer=composer)[:B]
-        return out.to(x.dtype)
+        return out_tt
 
     def _rmsnorm_device(self, norm_dev: "DeviceRMSNorm", x_2d_tt, num_rows: int):
         """Run device rmsnorm on a 2D [M, hidden] device tensor. Pads M to TILE
