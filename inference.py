@@ -2531,6 +2531,86 @@ class DeviceSharedExpert(nn.Module):
         return y.to(x.dtype)
 
 
+class DeviceRoutedExperts(nn.Module):
+    """All 256 routed experts of one MoE layer, sharded across a (4, 8) Galaxy
+    mesh. Per-expert weights live on a single chip (no sub-sharding inside an
+    expert): 256 experts split as mesh_rows (4) x mesh_cols (8) x per_chip (8).
+
+    Stored as ttnn.bfloat8_b — bf16 would overflow chip DRAM (480 GiB across
+    40 routed-expert layers vs 417 GiB aggregate chip budget). bfp8 cuts the
+    footprint to ~7.5 GiB / chip with PCC drift in the noise (matches metal
+    V3's choice for FFN gate/up; see tt-metal/models/demos/deepseek_v3/tt/
+    experts.py:76).
+
+    Phase A: weight upload only — forward stays on host. Once Phase B lands
+    the on-device kernel this class will own forward_device too."""
+
+    def __init__(self, mesh, experts, dim: int, inter_dim: int,
+                 swiglu_limit: float):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        self.dim = dim
+        self.inter_dim = inter_dim
+        self.swiglu_limit = float(swiglu_limit)
+
+        n_experts = len(experts)
+        rows, cols = self.mesh_shape
+        if rows * cols == 0 or n_experts % (rows * cols) != 0:
+            raise ValueError(
+                f"DeviceRoutedExperts: n_experts {n_experts} must be divisible "
+                f"by mesh_rows*mesh_cols {rows}*{cols}={rows*cols}"
+            )
+        per_chip = n_experts // (rows * cols)
+        self.per_chip = per_chip
+        self.n_experts = n_experts
+
+        self.w1_tt = self._stack_shard_upload(
+            experts, "w1", in_dim=dim, out_dim=inter_dim)
+        self.w3_tt = self._stack_shard_upload(
+            experts, "w3", in_dim=dim, out_dim=inter_dim)
+        self.w2_tt = self._stack_shard_upload(
+            experts, "w2", in_dim=inter_dim, out_dim=dim)
+
+    def _stack_shard_upload(self, experts, attr: str, in_dim: int, out_dim: int):
+        """Stack one weight matrix across all experts, reshape to
+        [mesh_rows, mesh_cols, per_chip, in_dim, out_dim] (so each chip
+        gets per_chip transposed weights), and upload as bfloat8_b sharded
+        on (dim 0, dim 1) of the tensor."""
+        ttnn = self._ttnn
+        rows, cols = self.mesh_shape
+        per_chip = self.per_chip
+
+        # _weight_to_bf16 gives [out_features, in_features]; transpose so x @ w
+        # is matmul-shape-friendly: [..., in_dim] @ [in_dim, out_dim].
+        bf16_list = []
+        for e in experts:
+            w = _weight_to_bf16(getattr(e, attr).weight)
+            if w.shape != (out_dim, in_dim):
+                raise ValueError(
+                    f"expert.{attr} expected ({out_dim}, {in_dim}), got {tuple(w.shape)}"
+                )
+            bf16_list.append(w.transpose(0, 1).contiguous())
+        stacked = torch.stack(bf16_list, dim=0)  # [n_experts, in_dim, out_dim]
+        del bf16_list
+
+        reshaped = stacked.view(rows, cols, per_chip, in_dim, out_dim).contiguous()
+        del stacked
+
+        tt = ttnn.as_tensor(
+            reshaped,
+            device=self.mesh,
+            dtype=ttnn.bfloat8_b,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(
+                self.mesh, self.mesh_shape, dims=(0, 1)),
+        )
+        return tt
+
+
 class DeviceSparseAttn(nn.Module):
     """V4-Flash sparse_attn on a 1xN mesh (replicated attn_sink).
 
@@ -3848,6 +3928,34 @@ class Model:
             ffn.shared_experts = dse
             self._device_shared_experts.append(dse)
 
+    def offload_routed_experts(self, mesh):
+        """Stack and shard every MoE layer's 256 routed experts onto the
+        (4, 8) Galaxy mesh as bfloat8_b. Hash-gate layers (layer_id <
+        n_hash_layers) have no routed experts and are skipped.
+
+        Phase A: weights only. The host routed-expert loop in
+        MoE.forward_device still runs; the device weights sit unused
+        until Phase B lands the on-device forward kernel. We keep the
+        host fp4 weights live so the host fallback continues to work."""
+        self._device_routed_experts = []
+        for layer in self.transformer.layers:
+            ffn = layer.ffn
+            if not isinstance(ffn, MoE):
+                continue
+            if ffn.gate.hash:
+                continue
+            sample = ffn.experts[0]
+            inter_dim = sample.w1.out_features
+            dre = DeviceRoutedExperts(
+                mesh,
+                list(ffn.experts),
+                dim=ffn.dim,
+                inter_dim=inter_dim,
+                swiglu_limit=sample.swiglu_limit,
+            )
+            ffn._device_routed_experts = dre
+            self._device_routed_experts.append(dre)
+
     def offload_embedding(self, mesh):
         """Move token embedding to the 1xN mesh (replicated).
 
@@ -4322,6 +4430,7 @@ def main():
         ("wo_b", model.offload_attn_wo_b),
         ("moe_gate", model.offload_moe_gate),
         ("moe_shared_expert", model.offload_moe_shared_expert),
+        ("moe_routed_experts", model.offload_routed_experts),
         ("rms_norms", model.offload_rms_norms),
         ("embedding", model.offload_embedding),
         ("compressor_linears", model.offload_compressor_linears),
