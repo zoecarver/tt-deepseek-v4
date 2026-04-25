@@ -37,8 +37,6 @@ from huggingface_hub import snapshot_download
 # Global state (mirrors deepseek inference/model.py)
 # ==============================================================================
 
-world_size = 1
-rank = 0
 block_size = 128
 fp4_block_size = 32
 default_dtype = torch.bfloat16
@@ -102,8 +100,6 @@ _FP4_VALUES = torch.tensor(
 def _dequant_fp8_weight(w_fp8: torch.Tensor, scale: torch.Tensor, group_size: int = 128) -> torch.Tensor:
     """Dequantize an FP8 weight [N, K] with per-[group,group] scale to bf16."""
     N, K = w_fp8.shape
-    # scale shape: [ceil(N/group), ceil(K/group)]
-    gN, gK = scale.shape
     w = w_fp8.to(torch.float32)
     # expand scale to [N, K]
     s = scale.to(torch.float32).repeat_interleave(group_size, dim=0).repeat_interleave(group_size, dim=1)
@@ -154,7 +150,6 @@ class ModelArgs:
     moe_inter_dim: int = 2048
     n_layers: int = 43
     n_hash_layers: int = 3
-    n_mtp_layers: int = 1
     n_heads: int = 64
     n_routed_experts: int = 256
     n_shared_experts: int = 1
@@ -321,7 +316,6 @@ class Compressor(nn.Module):
         self.dim = args.dim
         self.head_dim = head_dim
         self.rope_head_dim = args.rope_head_dim
-        self.nope_head_dim = head_dim - args.rope_head_dim
         self.compress_ratio = compress_ratio
         self.overlap = compress_ratio == 4
         self.rotate = rotate
@@ -380,7 +374,6 @@ class Attention(nn.Module):
         self.o_lora_rank = args.o_lora_rank
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
-        self.nope_head_dim = args.head_dim - args.rope_head_dim
         self.n_groups = args.o_groups
         self.n_local_groups = self.n_groups
         self.window_size = args.window_size
@@ -784,139 +777,6 @@ class DeviceColLinear(nn.Module):
         return ttnn.all_gather(y_sharded, dim=-1, num_links=1)
 
 
-class DeviceRowLinear(nn.Module):
-    """Row-parallel linear across a 1xN mesh with all-reduce sum.
-
-    Weight: [out, in] (nn.Linear order). Transposed to [in, out] for ttnn,
-    row-sharded on the input dim: each chip holds [in/N, out]. Input must
-    be sharded on its last dim (in/N per chip); we shard it on upload.
-    Output is all-reduced (sum) across the mesh and returned as bf16.
-    """
-
-    def __init__(self, mesh, cpu_weight: torch.Tensor):
-        super().__init__()
-        import ttnn
-        self._ttnn = ttnn
-        self.mesh = mesh
-        self.mesh_shape = tuple(mesh.shape)
-        out_dim, in_dim = cpu_weight.shape
-        N = self.mesh_shape[1]
-        if in_dim % N != 0:
-            raise ValueError(
-                f"row-linear in_dim {in_dim} not divisible by mesh axis 1 {N}"
-            )
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        w_io = _weight_to_bf16(cpu_weight).transpose(0, 1).contiguous()  # [in, out]
-        self.w_tt = ttnn.as_tensor(
-            w_io,
-            device=mesh,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, 0)),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        ttnn = self._ttnn
-        B, S, D = x.shape
-        x_tt = ttnn.as_tensor(
-            x.to(torch.bfloat16).contiguous(),
-            device=self.mesh,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(None, -1)),
-        )
-        y_tt = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        # Bring N partial outputs back and sum. Mesh axis 0 has size 1 so its
-        # concat dim is a no-op; route it to tensor dim 1 and stack axis-1
-        # shards along tensor dim 0 so y.shape[0] = N*B.
-        y = ttnn.to_torch(
-            y_tt,
-            mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0)),
-        )
-        N = self.mesh_shape[1]
-        y = y.view(N, B, S, self.out_dim).sum(dim=0)
-        return y.to(torch.bfloat16)
-
-
-class DeviceGroupedLinear(nn.Module):
-    """Block-diagonal (per-group) linear across a 1xN mesh.
-
-    For wo_a: weight is [n_groups*out_per_group, in_per_group] where each group
-    g has its own [out_per_group, in_per_group] matrix; activations are
-    [B, S, n_groups, in_per_group]. Computes
-        out[b,s,g,r] = sum_d x[b,s,g,d] * w[g,r,d]
-    i.e. the einsum "bsgd,grd->bsgr".
-
-    Sharding: groups are distributed across mesh axis 1 (must divide evenly).
-    Each chip holds its groups' weights AND sees only its groups' activations
-    -- no wasted compute. Output is gathered and permuted back to
-    [B, S, n_groups, out_per_group].
-    """
-
-    def __init__(self, mesh, cpu_weight: torch.Tensor, n_groups: int):
-        super().__init__()
-        import ttnn
-        self._ttnn = ttnn
-        self.mesh = mesh
-        self.mesh_shape = tuple(mesh.shape)
-        N = self.mesh_shape[1]
-        if n_groups % N != 0:
-            raise ValueError(f"n_groups {n_groups} not divisible by mesh axis 1 {N}")
-        out_total, in_per_group = cpu_weight.shape
-        if out_total % n_groups != 0:
-            raise ValueError(f"weight out_dim {out_total} not divisible by n_groups {n_groups}")
-        out_per_group = out_total // n_groups
-        self.n_groups = n_groups
-        self.in_per_group = in_per_group
-        self.out_per_group = out_per_group
-
-        w_bf16 = _weight_to_bf16(cpu_weight).view(n_groups, out_per_group, in_per_group)
-        # Transpose to [n_groups, in_per_group, out_per_group] for A @ B matmul.
-        w_gio = w_bf16.transpose(1, 2).contiguous()
-        self.w_tt = ttnn.as_tensor(
-            w_gio,
-            device=mesh,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, 0)),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, S, n_groups, in_per_group] -> [B, S, n_groups, out_per_group]."""
-        ttnn = self._ttnn
-        B, S, G, D = x.shape
-        if G != self.n_groups or D != self.in_per_group:
-            raise ValueError(
-                f"x shape ({B},{S},{G},{D}) mismatch "
-                f"expected groups={self.n_groups} in_per_group={self.in_per_group}"
-            )
-        # [B,S,G,D] -> [G, B*S, D] so each chip's slice on dim 0 = its groups.
-        x_g = x.to(torch.bfloat16).permute(2, 0, 1, 3).reshape(G, B * S, D).contiguous()
-        x_tt = ttnn.as_tensor(
-            x_g,
-            device=self.mesh,
-            layout=ttnn.TILE_LAYOUT,
-            dtype=ttnn.bfloat16,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(None, 0)),
-        )
-        y_tt = ttnn.linear(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        # Each chip holds [G/N, B*S, out_per_group]; stack along mesh axis 1 onto
-        # tensor dim 0 (ConcatMesh2dToTensor dims=(1, 0) -- mesh axis 0 is size 1,
-        # routes to tensor dim 1 no-op; axis 1 stacks on dim 0).
-        y = ttnn.to_torch(
-            y_tt,
-            mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0)),
-        )
-        y = y[:G]  # trim any trailing pad
-        y = y.view(G, B, S, self.out_per_group).permute(1, 2, 0, 3).contiguous()
-        return y.to(torch.bfloat16)
-
-
 class DeviceMoEGate(nn.Module):
     """V4-Flash MoE gate (sqrtsoftplus score_func) on a 1xN mesh.
 
@@ -1220,22 +1080,6 @@ def _mhc_pack_fn(fn: torch.Tensor, mhc_mult3: int) -> torch.Tensor:
     return out.contiguous()
 
 
-def _mhc_pack_x_for_apply_mix(x: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
-    """[num_tokens, mhc, h] -> [num_tokens_pad * TILE, h] fp32 (rows 0..mhc-1 hold x; rest 0)."""
-    num_tokens, mhc, h = x.shape
-    out = torch.zeros(num_tokens_pad * _MHC_TILE, h, dtype=torch.float32)
-    out.view(num_tokens_pad, _MHC_TILE, h)[:num_tokens, :mhc, :] = x.to(torch.float32)
-    return out.contiguous()
-
-
-def _mhc_pack_mix(mix: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
-    """[num_tokens, mhc] -> [num_tokens_pad * TILE, TILE] fp32 (col 0 of rows 0..mhc-1)."""
-    num_tokens, mhc = mix.shape
-    out = torch.zeros(num_tokens_pad * _MHC_TILE, _MHC_TILE, dtype=torch.float32)
-    out.view(num_tokens_pad, _MHC_TILE, _MHC_TILE)[:num_tokens, :mhc, 0] = mix.to(torch.float32)
-    return out.contiguous()
-
-
 def _mhc_pack_x_bc(x: torch.Tensor, mhc: int, num_tokens_pad: int) -> torch.Tensor:
     """[num_tokens, h] -> [num_tokens_pad * TILE, h] fp32 (rows 0..mhc-1 each hold a copy of x)."""
     num_tokens, h = x.shape
@@ -1243,29 +1087,6 @@ def _mhc_pack_x_bc(x: torch.Tensor, mhc: int, num_tokens_pad: int) -> torch.Tens
     out = torch.zeros(num_tokens_pad * _MHC_TILE, h, dtype=torch.float32)
     out.view(num_tokens_pad, _MHC_TILE, h)[:num_tokens, :mhc, :] = src.to(torch.float32)
     return out.contiguous()
-
-
-def _mhc_pack_residual_for_post(residual: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
-    """[num_tokens, mhc, h] -> [num_tokens_pad * TILE, h] fp32 (rows 0..mhc-1 hold residual)."""
-    num_tokens, mhc, h = residual.shape
-    out = torch.zeros(num_tokens_pad * _MHC_TILE, h, dtype=torch.float32)
-    out.view(num_tokens_pad, _MHC_TILE, h)[:num_tokens, :mhc, :] = residual.to(torch.float32)
-    return out.contiguous()
-
-
-def _mhc_pack_comb_T(comb: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
-    """[num_tokens, mhc, mhc] -> [num_tokens_pad * TILE, TILE] fp32 (comb^T in top-left)."""
-    num_tokens, m, n = comb.shape
-    if m != n:
-        raise ValueError(f"comb must be square, got {m}x{n}")
-    out = torch.zeros(num_tokens_pad * _MHC_TILE, _MHC_TILE, dtype=torch.float32)
-    out.view(num_tokens_pad, _MHC_TILE, _MHC_TILE)[:num_tokens, :m, :m] = comb.transpose(-1, -2).to(torch.float32)
-    return out.contiguous()
-
-
-def _mhc_pack_post_mix(post: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
-    """[num_tokens, mhc] -> [num_tokens_pad * TILE, TILE] fp32 (col 0 of rows 0..mhc-1)."""
-    return _mhc_pack_mix(post, num_tokens_pad)
 
 
 def _mhc_unpack_apply_mix_out(packed: torch.Tensor, num_tokens: int, h: int) -> torch.Tensor:
@@ -1342,31 +1163,10 @@ def _mhc_sinkhorn_eps_mask_tile(hc_mult: int, eps: float) -> torch.Tensor:
     return m
 
 
-def _mhc_pack_comb_for_sinkhorn(
-    comb: torch.Tensor, num_tokens: int, num_tokens_pad: int, hc_mult: int,
-) -> torch.Tensor:
-    """[num_tokens, hc, hc] -> [num_tokens_pad * TILE, TILE] fp32.
-
-    Each hc x hc slice sits in the top-left of its own 32x32 tile; the rest of
-    the tile is `_MHC_PAD_SENTINEL` so softmax pad cells underflow. Padded
-    slices (tokens >= num_tokens) get zeros in the valid region so softmax is
-    still well-defined there even though the output is discarded.
-    """
-    if comb.shape != (num_tokens, hc_mult, hc_mult):
-        raise ValueError(
-            f"comb shape {tuple(comb.shape)} != expected ({num_tokens}, {hc_mult}, {hc_mult})")
-    out = torch.full(
-        (num_tokens_pad, _MHC_TILE, _MHC_TILE),
-        _MHC_PAD_SENTINEL, dtype=torch.float32)
-    out[:num_tokens, :hc_mult, :hc_mult] = comb.to(torch.float32)
-    out[num_tokens:, :hc_mult, :hc_mult] = 0.0
-    return out.reshape(num_tokens_pad * _MHC_TILE, _MHC_TILE).contiguous()
-
-
 def _mhc_unpack_comb_from_sinkhorn(
     packed: torch.Tensor, num_tokens: int, hc_mult: int,
 ) -> torch.Tensor:
-    """Inverse of _mhc_pack_comb_for_sinkhorn: top-left hc x hc per slice."""
+    """Top-left hc x hc per slice from a [num_tokens_pad * TILE, TILE] tensor."""
     return packed.view(-1, _MHC_TILE, _MHC_TILE)[:num_tokens, :hc_mult, :hc_mult].contiguous()
 
 
@@ -2612,8 +2412,6 @@ class DeviceCompressor(nn.Module):
                 kv_cache_init = torch.cat([kv_cache_init, pad], dim=1)
             self.kv_cache_tt = ttnn.as_tensor(
                 kv_cache_init.view(B, 1, T_pad, d).contiguous(), **rep)
-            self.kv_cache_T = T
-            self.kv_cache_T_pad = T_pad
 
     def forward_device(self, x_tt, B: int, start_pos: int):
         ttnn = self._ttnn
@@ -2889,7 +2687,6 @@ class DeviceAttention(nn.Module):
             raise ValueError(
                 f"head_dim {self.head_dim} must be a multiple of 32 for tile layout"
             )
-        self.kv_batch_size = kv_shape[0]
         self.kv_cache_size = kv_shape[1]
         self.kv_cache_size_pad = -(-self.kv_cache_size // 32) * 32
         self.kv_cache_tt = None  # allocated on first _decode call
@@ -3416,37 +3213,29 @@ class Model:
             torch.save(self.transformer.state_dict(), cache_path)
             print(f"[load] cache written in {time.time()-t0:.1f}s")
 
-    def offload_lm_head(self, mesh, include_final_norm: bool = True):
-        """Move the lm_head matmul (and optionally the final RMSNorm) to a 1xN mesh.
+    def offload_lm_head(self, mesh):
+        """Move the lm_head matmul and the final RMSNorm to a 1xN mesh.
 
         Must be called after load_weights(). Shards the lm_head column-parallel
         across vocab; replicates the tiny final-norm weight on each chip.
-
-        When `include_final_norm=True`, ParallelHead.forward is rebound to skip
-        the CPU norm and pass the unnormalized last-token hidden straight to
-        the device (norm + matmul fused there).
+        ParallelHead.forward is rebound to skip the CPU norm and pass the
+        unnormalized last-token hidden straight to the device (norm + matmul
+        fused there).
         """
         head = self.transformer.head
         final_norm = self.transformer.norm
-        norm_w = final_norm.weight.data if include_final_norm else None
-        norm_eps = final_norm.eps if include_final_norm else 1e-6
         self._device_lm_head = DeviceLMHead(mesh, head.weight.data,
-                                            norm_weight=norm_w, norm_eps=norm_eps)
+                                            norm_weight=final_norm.weight.data,
+                                            norm_eps=final_norm.eps)
         dlh = self._device_lm_head
-        if include_final_norm:
-            # Replace the whole head forward so CPU norm is skipped.
-            def _device_head_forward(self_head, x, hc_fn, hc_scale, hc_base, norm):
-                with _phase("head.hc_combiner"):
-                    x = self_head.hc_head(x, hc_fn, hc_scale, hc_base)  # still CPU
-                with _phase("head.norm_and_logits"):
-                    return dlh(x[:, -1].contiguous())
-            head.forward = _device_head_forward.__get__(head, type(head))
-            final_norm.weight.data = torch.empty(0)  # device owns it
-        else:
-            def _device_get_logits(self_head, x):
-                with _phase("head.norm_and_logits"):
-                    return dlh(x[:, -1].contiguous())
-            head.get_logits = _device_get_logits.__get__(head, type(head))
+
+        def _device_head_forward(self_head, x, hc_fn, hc_scale, hc_base, norm):
+            with _phase("head.hc_combiner"):
+                x = self_head.hc_head(x, hc_fn, hc_scale, hc_base)  # still CPU
+            with _phase("head.norm_and_logits"):
+                return dlh(x[:, -1].contiguous())
+        head.forward = _device_head_forward.__get__(head, type(head))
+        final_norm.weight.data = torch.empty(0)  # device owns it
         head.weight.data = torch.empty(0)
 
     def offload_attn_wq_b(self, mesh):
@@ -3476,43 +3265,13 @@ class Model:
             attn.wkv = dw
             self._device_wkv.append(dw)
 
-    def offload_attn_wo_a(self, mesh):
-        """Shard wo_a block-diagonal per-group across the 1xN mesh.
-
-        wo_a is bf16 with a block-diagonal usage: each of the n_groups groups
-        has its own [o_lora_rank, in_per_group] matrix, and activations are
-        reshaped to [B, S, n_groups, in_per_group] before the einsum. Groups
-        divide evenly across the mesh axis 1 (8 groups / 4 chips = 2/chip).
-        Swaps Attention._wo_a_grouped for a device callable.
-        """
-        self._device_wo_a = []
-        for layer in self.transformer.layers:
-            attn = layer.attn
-            dg = DeviceGroupedLinear(mesh, attn.wo_a.weight, n_groups=attn.n_local_groups)
-
-            def _device_wo_a_call(self_attn, o, _dg=dg):
-                return _dg(o)
-
-            attn._wo_a_grouped = _device_wo_a_call.__get__(attn, type(attn))
-            self._device_wo_a.append(dg)
-
     def offload_sparse_attn(self, mesh):
-        """Run sparse_attn on the 1xN mesh per layer.
-
-        Replaces Attention._sparse_attn with a DeviceSparseAttn callable that
-        uploads (q, kv, topk_idxs), runs gather+score-matmul+masked-softmax+
-        weighted-sum on device, and reads back o from chip 0. Per-call round-
-        trips remain — they collapse once the rest of attn moves on-device.
-        """
+        """Build DeviceSparseAttn instances; consumed by offload_attn_full
+        to run gather+score-matmul+masked-softmax+weighted-sum on device."""
         self._device_sparse_attn = []
         for layer in self.transformer.layers:
             attn = layer.attn
             dsa = DeviceSparseAttn(mesh, attn.attn_sink, attn.softmax_scale)
-
-            def _device_sparse_attn_call(self_attn, q, kv, topk_idxs, _dsa=dsa):
-                return _dsa(q, kv, topk_idxs)
-
-            attn._sparse_attn = _device_sparse_attn_call.__get__(attn, type(attn))
             self._device_sparse_attn.append(dsa)
 
     def offload_rms_norms(self, mesh):
@@ -3575,7 +3334,6 @@ class Model:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
         )
-        self._device_embed_weight = w_tt
 
         def _device_embed(self_embed, x: torch.Tensor) -> torch.Tensor:
             ids = x.to(torch.int32).contiguous()
@@ -3920,14 +3678,6 @@ class Model:
             pos += 1
 
 
-def _resolve_parent(module: nn.Module, dotted: str):
-    parts = dotted.split(".")
-    m = module
-    for p in parts[:-1]:
-        m = getattr(m, p) if not p.isdigit() else m[int(p)]
-    return m
-
-
 # ==============================================================================
 # main
 # ==============================================================================
@@ -3979,7 +3729,6 @@ def main():
         ("wq_a", model.offload_attn_wq_a),
         ("wq_b", model.offload_attn_wq_b),
         ("wkv", model.offload_attn_wkv),
-        ("wo_a", model.offload_attn_wo_a),
         ("wo_b", model.offload_attn_wo_b),
         ("moe_gate", model.offload_moe_gate),
         ("moe_shared_expert", model.offload_moe_shared_expert),
