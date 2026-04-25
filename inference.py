@@ -538,38 +538,27 @@ def _block_forward(layer, x: torch.Tensor, start_pos: int,
       - layer.attn.forward: DeviceAttention.forward (decode-only)
       - layer.ffn.forward: MoE host loop with device gate / shared expert
     """
+    mhc_attn = layer._device_mhc_attn
     attn_norm_dn = layer.attn_norm.forward.__self__
     attn_dev = layer.attn._device_attention
     ttnn = attn_norm_dn._ttnn
+    B, S, _, hidden = x.shape
+    orig_dtype = x.dtype
 
     with _phase("block.hc_pre"):
-        x = layer.hc_pre(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base)
+        hc_out_fp32 = mhc_attn.hc_pre_with_upload(x)
     with _phase("block.norm"):
-        B, S, hidden = x.shape
-        x2 = x.reshape(-1, hidden).to(torch.bfloat16).contiguous()
-        M = x2.shape[0]
-        Mpad = -(-M // _RMS_TILE) * _RMS_TILE
-        if M < Mpad:
-            x2 = torch.cat(
-                [x2, torch.zeros((Mpad - M, hidden), dtype=torch.bfloat16)],
-                dim=0,
-            ).contiguous()
-        host_mesh = ttnn.from_torch(
-            x2, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=attn_norm_dn._upload_mapper,
-        )
-        ttnn.copy_host_to_device_tensor(host_mesh, attn_norm_dn._x_upload_tt)
-        norm_out_tt = attn_norm_dn.forward_device(
-            attn_norm_dn._x_upload_tt, M)
+        norm_in = ttnn.typecast(hc_out_fp32, dtype=ttnn.bfloat16)
+        norm_out_tt = attn_norm_dn.forward_device(norm_in, B * S)
     with _phase("block.attn"):
-        sliced = ttnn.slice(norm_out_tt, [0, 0], [M, hidden])
+        sliced = ttnn.slice(norm_out_tt, [0, 0], [B * S, hidden])
         bridge_tt = ttnn.reshape(sliced, [B, S, hidden])
         attn_out_tt = attn_dev.forward_device(bridge_tt, start_pos)
         composer = ttnn.ConcatMesh2dToTensor(
             attn_dev.mesh, attn_dev.mesh_shape, dims=(1, 0))
-        x = ttnn.to_torch(attn_out_tt, mesh_composer=composer)[:B].to(x.dtype)
+        x = ttnn.to_torch(attn_out_tt, mesh_composer=composer)[:B].to(orig_dtype)
     with _phase("block.hc_post"):
-        x = layer.hc_post(x)
+        x = mhc_attn.hc_post(x)
 
     with _phase("block.hc_pre"):
         x = layer.hc_pre(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
@@ -2084,6 +2073,26 @@ class DeviceMHC(nn.Module):
         self._stash_post_tt = post_tt
         self._stash_comb_sk_tt = comb_sk_out_tt
         return out_tt
+
+    def hc_pre_with_upload(self, x: torch.Tensor):
+        """Upload x and run hc_pre_device. Returns the device tensor
+        [num_tokens * TILE, hidden] fp32 directly. Use when chaining on
+        device (no download)."""
+        ttnn = self._ttnn
+        B, S, mhc, hidden = x.shape
+        if mhc != self.hc_mult or hidden != self.hidden:
+            raise ValueError(
+                f"x shape mismatch: got mhc={mhc}, hidden={hidden}; "
+                f"expected mhc={self.hc_mult}, hidden={self.hidden}")
+        num_tokens = B * S
+        num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
+        a_packed = _mhc_pack_residual(x, num_tokens_pad)
+        host_mesh = ttnn.from_torch(
+            a_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(host_mesh, self._a_upload_tt)
+        return self.hc_pre_device(num_tokens, num_tokens_pad)
 
     def hc_pre(self, x: torch.Tensor):
         """[B, S, mhc, hidden] -> y [B, S, hidden].
@@ -3965,6 +3974,8 @@ class Model:
 
             layer.hc_pre = _device_hc_pre.__get__(layer, type(layer))
             layer.hc_post = _device_hc_post.__get__(layer, type(layer))
+            layer._device_mhc_attn = mhc_attn
+            layer._device_mhc_ffn = mhc_ffn
             self._device_mhc.append((mhc_attn, mhc_ffn))
 
     def _iter_device_modules(self):
