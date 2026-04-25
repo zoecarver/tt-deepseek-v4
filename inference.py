@@ -2437,6 +2437,322 @@ def _device_rotate_activation(ttnn, x_tt, h_tt):
     return ttnn.matmul(x_tt, h_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
+class DeviceCompressor(nn.Module):
+    """Decode-only Compressor on a 1xN mesh.
+
+    Holds device-resident state (kv_state, score_state, kv_cache) and runs
+    the full Compressor.forward decode branch on device. Validated cases
+    (see ./device-compressor-indexer/):
+      - overlap=False, rotate=False  (Attention layers with ratio=128)
+      - overlap=True,  rotate=False  (Attention layers with ratio=4)
+      - overlap=True,  rotate=True   (Indexer's internal compressor; ratio=4)
+
+    fp4_act_quant / act_quant are omitted (bf16 policy; identity in bf16).
+
+    If `slot_offset` is non-zero, kv_cache writes target the *slot_offset+i*-th
+    row of `kv_cache_tt`. This lets the Attention layer point us at a slice
+    of its joint window+compress kv_cache buffer (slot_offset == window_size)
+    so compressed tokens land in the right place without an extra mirror.
+
+    State buffers split the CPU `[B, ratio_pad, coff*head_dim]` shape into
+    front (..., :head_dim) and back (..., head_dim:) buffers when overlap=True.
+    Without the split, the last-dim 2*head_dim trips an L1 overflow in
+    `update_cache_for_token_`. See compressor_overlap.py for details.
+    """
+
+    def __init__(self, mesh, comp, wkv_dev, wgate_dev, norm_dev,
+                 slot_offset: int = 0, kv_cache_tt=None):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        self.comp = comp
+        self.wkv = wkv_dev
+        self.wgate = wgate_dev
+        self.norm_dev = norm_dev
+        self.head_dim = comp.head_dim
+        self.rope_head_dim = comp.rope_head_dim
+        self.compress_ratio = comp.compress_ratio
+        self.overlap = bool(comp.overlap)
+        self.rotate = bool(comp.rotate)
+        self.coff = 2 if self.overlap else 1
+        self.cdim = self.coff * self.head_dim
+        self.row_count = 2 * self.compress_ratio if self.overlap else self.compress_ratio
+        self.slot_offset = slot_offset
+
+        rep = dict(
+            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        self.ape_tt = ttnn.as_tensor(comp.ape.to(torch.bfloat16).contiguous(), **rep)
+
+        fc = comp.freqs_cis
+        self.cos_full_tt = ttnn.as_tensor(fc.real.to(torch.bfloat16).contiguous(), **rep)
+        self.sin_full_tt = ttnn.as_tensor(fc.imag.to(torch.bfloat16).contiguous(), **rep)
+
+        if self.rotate:
+            h_mat = (_sylvester_hadamard(self.head_dim) *
+                     (self.head_dim ** -0.5)).to(torch.bfloat16)
+            self.h_tt = ttnn.as_tensor(h_mat, **rep)
+        else:
+            self.h_tt = None
+
+        self.kv_state_front_tt = None
+        self.kv_state_back_tt = None
+        self.score_state_front_tt = None
+        self.score_state_back_tt = None
+        self.kv_cache_tt = kv_cache_tt
+        self._owns_kv_cache = kv_cache_tt is None
+
+    def bind_kv_cache_tt(self, kv_cache_tt, slot_offset: int):
+        """Attach a pre-existing kv_cache buffer (e.g. the Attention's joint
+        window+compress kv_cache_tt). Call before the first forward_device.
+        Compressed-token writes will land at slot_offset + (start_pos // ratio).
+        """
+        self.kv_cache_tt = kv_cache_tt
+        self.slot_offset = slot_offset
+        self._owns_kv_cache = False
+
+    def _alloc_state(self, B: int):
+        ttnn = self._ttnn
+        comp = self.comp
+        d = self.head_dim
+        ratio_pad = -(-self.row_count // 32) * 32
+        self.ratio_pad = ratio_pad
+
+        kv_init = comp.kv_state[:B].to(torch.bfloat16)               # [B, row_count, c]
+        score_init = comp.score_state[:B].to(torch.bfloat16)
+        if self.overlap:
+            kv_init_front = kv_init[..., :d]
+            kv_init_back = kv_init[..., d:]
+            score_init_front = score_init[..., :d]
+            score_init_back = score_init[..., d:]
+        else:
+            kv_init_front = kv_init
+            score_init_front = score_init
+            kv_init_back = score_init_back = None
+
+        if ratio_pad != self.row_count:
+            zero_pad = torch.zeros(B, ratio_pad - self.row_count, d, dtype=torch.bfloat16)
+            ninf_pad = torch.full_like(zero_pad, float("-inf"))
+            kv_init_front = torch.cat([kv_init_front, zero_pad], dim=1)
+            score_init_front = torch.cat([score_init_front, ninf_pad], dim=1)
+            if self.overlap:
+                kv_init_back = torch.cat([kv_init_back, zero_pad], dim=1)
+                score_init_back = torch.cat([score_init_back, ninf_pad], dim=1)
+
+        rep = dict(
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        self.kv_state_front_tt = ttnn.as_tensor(
+            kv_init_front.view(B, 1, ratio_pad, d).contiguous(), **rep)
+        self.score_state_front_tt = ttnn.as_tensor(
+            score_init_front.view(B, 1, ratio_pad, d).contiguous(), **rep)
+        if self.overlap:
+            self.kv_state_back_tt = ttnn.as_tensor(
+                kv_init_back.view(B, 1, ratio_pad, d).contiguous(), **rep)
+            self.score_state_back_tt = ttnn.as_tensor(
+                score_init_back.view(B, 1, ratio_pad, d).contiguous(), **rep)
+
+        if self._owns_kv_cache:
+            T = comp.kv_cache.shape[1]
+            T_pad = -(-T // 32) * 32
+            kv_cache_init = comp.kv_cache[:B].to(torch.bfloat16)
+            if T_pad != T:
+                pad = torch.zeros(B, T_pad - T, d, dtype=torch.bfloat16)
+                kv_cache_init = torch.cat([kv_cache_init, pad], dim=1)
+            self.kv_cache_tt = ttnn.as_tensor(
+                kv_cache_init.view(B, 1, T_pad, d).contiguous(), **rep)
+            self.kv_cache_T = T
+            self.kv_cache_T_pad = T_pad
+
+    def forward_device(self, x_tt, B: int, start_pos: int):
+        ttnn = self._ttnn
+        ratio = self.compress_ratio
+        d = self.head_dim
+        c = self.cdim
+        rd = self.rope_head_dim
+
+        if self.kv_state_front_tt is None:
+            self._alloc_state(B)
+
+        kv_tt = self.wkv.forward_device(x_tt)
+        score_tt = self.wgate.forward_device(x_tt)
+
+        slot_in_ape = start_pos % ratio
+        ape_slot = ttnn.slice(self.ape_tt, [slot_in_ape, 0], [slot_in_ape + 1, c])
+        score_tt = ttnn.add(score_tt, ttnn.reshape(ape_slot, [1, 1, c]))
+
+        if self.overlap:
+            kv_front = ttnn.slice(kv_tt, [0, 0, 0], [B, 1, d])
+            kv_back  = ttnn.slice(kv_tt, [0, 0, d], [B, 1, c])
+            score_front = ttnn.slice(score_tt, [0, 0, 0], [B, 1, d])
+            score_back  = ttnn.slice(score_tt, [0, 0, d], [B, 1, c])
+            slot = ratio + slot_in_ape
+            ttnn.kv_cache.update_cache_for_token_(self.kv_state_front_tt,
+                                                  ttnn.reshape(kv_front, [B, 1, 1, d]), slot, 0)
+            ttnn.kv_cache.update_cache_for_token_(self.kv_state_back_tt,
+                                                  ttnn.reshape(kv_back, [B, 1, 1, d]), slot, 0)
+            ttnn.kv_cache.update_cache_for_token_(self.score_state_front_tt,
+                                                  ttnn.reshape(score_front, [B, 1, 1, d]), slot, 0)
+            ttnn.kv_cache.update_cache_for_token_(self.score_state_back_tt,
+                                                  ttnn.reshape(score_back, [B, 1, 1, d]), slot, 0)
+        else:
+            slot = slot_in_ape
+            ttnn.kv_cache.update_cache_for_token_(self.kv_state_front_tt,
+                                                  ttnn.reshape(kv_tt, [B, 1, 1, d]), slot, 0)
+            ttnn.kv_cache.update_cache_for_token_(self.score_state_front_tt,
+                                                  ttnn.reshape(score_tt, [B, 1, 1, d]), slot, 0)
+
+        if (start_pos + 1) % ratio != 0:
+            return None
+
+        # TODO(tt-lang): fuse the slice/concat view + softmax-sum + RMSNorm
+        # into one `compressor_softmax_sum_norm` kernel. See
+        # device-compressor-indexer/README.md candidate #1.
+        if self.overlap:
+            front_kv = ttnn.slice(self.kv_state_front_tt, [0, 0, 0, 0],     [B, 1, ratio,     d])
+            back_kv  = ttnn.slice(self.kv_state_back_tt,  [0, 0, ratio, 0], [B, 1, 2 * ratio, d])
+            kv_view = ttnn.concat([front_kv, back_kv], dim=2)
+            front_sc = ttnn.slice(self.score_state_front_tt, [0, 0, 0, 0],     [B, 1, ratio,     d])
+            back_sc  = ttnn.slice(self.score_state_back_tt,  [0, 0, ratio, 0], [B, 1, 2 * ratio, d])
+            score_view = ttnn.concat([front_sc, back_sc], dim=2)
+        else:
+            kv_view = self.kv_state_front_tt
+            score_view = self.score_state_front_tt
+
+        sm_tt = ttnn.softmax(score_view, dim=-2)
+        weighted = ttnn.multiply(kv_view, sm_tt)
+        kv_sum = ttnn.sum(weighted, dim=-2, keepdim=True)
+
+        kv_2d = ttnn.reshape(kv_sum, [B, d])
+        if B < _RMS_TILE:
+            kv_2d = ttnn.pad(kv_2d, padding=[(0, _RMS_TILE - B), (0, 0)], value=0.0)
+        kv_2d = self.norm_dev.forward_device(kv_2d, B)
+        if B < _RMS_TILE:
+            kv_2d = ttnn.slice(kv_2d, [0, 0], [B, d])
+        kv_normed = ttnn.reshape(kv_2d, [B, 1, d])
+
+        rd_half = rd // 2
+        freq_idx = start_pos + 1 - ratio
+        cos = ttnn.slice(self.cos_full_tt, [freq_idx, 0], [freq_idx + 1, rd_half])
+        sin = ttnn.slice(self.sin_full_tt, [freq_idx, 0], [freq_idx + 1, rd_half])
+        cos = ttnn.reshape(cos, [1, 1, rd_half])
+        sin = ttnn.reshape(sin, [1, 1, rd_half])
+        kv_nope = ttnn.slice(kv_normed, [0, 0, 0],     [B, 1, d - rd])
+        kv_rope = ttnn.slice(kv_normed, [0, 0, d - rd], [B, 1, d])
+        kv_rope = _device_apply_rotary_interleaved(ttnn, kv_rope, cos, sin, inverse=False)
+        kv_normed = ttnn.concat([kv_nope, kv_rope], dim=-1)
+
+        if self.rotate:
+            kv_normed = _device_rotate_activation(ttnn, kv_normed, self.h_tt)
+
+        comp_idx = start_pos // ratio
+        kv_4d_out = ttnn.reshape(kv_normed, [B, 1, 1, d])
+        ttnn.kv_cache.update_cache_for_token_(self.kv_cache_tt, kv_4d_out,
+                                              self.slot_offset + comp_idx, 0)
+
+        # TODO(tt-lang): the per-buffer ratio-many slot-shift writes below are
+        # the second tt-lang candidate (compressor_state_shift). One kernel
+        # that copies [B, ratio, d] from slots ratio..2*ratio-1 to 0..ratio-1
+        # in a single dispatch is much cleaner than the loop below.
+        if self.overlap:
+            for buf in (self.kv_state_front_tt, self.kv_state_back_tt,
+                        self.score_state_front_tt, self.score_state_back_tt):
+                for i in range(ratio):
+                    slot_src = ttnn.slice(buf, [0, 0, ratio + i, 0],
+                                               [B, 1, ratio + i + 1, d])
+                    ttnn.kv_cache.update_cache_for_token_(buf, slot_src, i, 0)
+
+        return kv_normed
+
+
+class DeviceIndexer(nn.Module):
+    """Decode-only Indexer on a 1xN mesh.
+
+    Owns:
+      - inner DeviceCompressor (overlap=True, rotate=True)
+      - DeviceColLinear for wq_b and weights_proj
+      - Hadamard table for q rotate
+
+    Returns post-reduce score [B, 1, T_pad] as a *device* tensor; caller
+    pulls it to CPU, masks slots >= end_pos // ratio, and runs topk. Topk
+    on device is the future fusion target (README candidate #4).
+    """
+
+    def __init__(self, mesh, indexer, dc: DeviceCompressor,
+                 wq_b_dev, weights_proj_dev):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.indexer = indexer
+        self.dc = dc
+        self.wq_b = wq_b_dev
+        self.weights_proj = weights_proj_dev
+
+        self.head_dim = indexer.head_dim
+        self.rope_head_dim = indexer.rope_head_dim
+        self.n_heads = indexer.n_heads
+        self.compress_ratio = indexer.compress_ratio
+        self.softmax_scale = float(indexer.softmax_scale)
+        self.index_topk = indexer.index_topk
+
+        rep = dict(
+            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        h_mat = (_sylvester_hadamard(self.head_dim) *
+                 (self.head_dim ** -0.5)).to(torch.bfloat16)
+        self.h_tt = ttnn.as_tensor(h_mat, **rep)
+        fc = indexer.freqs_cis
+        self.cos_full_tt = ttnn.as_tensor(fc.real.to(torch.bfloat16).contiguous(), **rep)
+        self.sin_full_tt = ttnn.as_tensor(fc.imag.to(torch.bfloat16).contiguous(), **rep)
+
+    def forward_device_score(self, x_tt, qr_tt, B: int, start_pos: int):
+        ttnn = self._ttnn
+        H = self.n_heads
+        D = self.head_dim
+        rd = self.rope_head_dim
+
+        q_tt = self.wq_b.forward_device(qr_tt)
+        q_tt = ttnn.reshape(q_tt, [B, 1, H, D])
+
+        rd_half = rd // 2
+        cos = ttnn.slice(self.cos_full_tt, [start_pos, 0], [start_pos + 1, rd_half])
+        sin = ttnn.slice(self.sin_full_tt, [start_pos, 0], [start_pos + 1, rd_half])
+        cos = ttnn.reshape(cos, [1, 1, 1, rd_half])
+        sin = ttnn.reshape(sin, [1, 1, 1, rd_half])
+        q_nope = ttnn.slice(q_tt, [0, 0, 0, 0],     [B, 1, H, D - rd])
+        q_rope = ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, 1, H, D])
+        q_rope = _device_apply_rotary_interleaved(ttnn, q_rope, cos, sin, inverse=False)
+        q_tt = ttnn.concat([q_nope, q_rope], dim=-1)
+        q_tt = _device_rotate_activation(ttnn, q_tt, self.h_tt)
+
+        # fp4_act_quant SKIPPED (bf16 policy).
+        self.dc.forward_device(x_tt, B, start_pos)
+
+        scale = self.softmax_scale * (H ** -0.5)
+        w_tt = self.weights_proj.forward_device(x_tt)
+        w_tt = ttnn.multiply(w_tt, scale)
+
+        kv_T_tt = ttnn.transpose(self.dc.kv_cache_tt, -2, -1)   # [B, 1, D, T_pad]
+        score = ttnn.matmul(q_tt, kv_T_tt)                        # [B, 1, H, T_pad]
+
+        # TODO(tt-lang): fuse relu * weights * sum + topk into a single
+        # `indexer_score_reduce` kernel (README candidate #4).
+        score = ttnn.relu(score)
+        score_t = ttnn.transpose(score, -2, -1)                   # [B, 1, T_pad, H]
+        w_b = ttnn.reshape(w_tt, [B, 1, 1, H])
+        score_t = ttnn.multiply(score_t, w_b)
+        return ttnn.sum(score_t, dim=-1, keepdim=False)           # [B, 1, T_pad]
+
+
 class DeviceAttention(nn.Module):
     """Fused MLA attention forward on a 1xN mesh (decode path device-resident).
 
@@ -2562,14 +2878,18 @@ class DeviceAttention(nn.Module):
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
 
+        device_comp = getattr(attn, "_device_compressor", None)
+        device_indexer = getattr(attn, "_device_indexer", None)
+
         # Q path: wq_a -> q_norm -> wq_b -> per-head rsqrt-norm -> rotary.
         q_lora_tt = attn.wq_a.forward_device(x_tt)            # [B, S, q_lora_rank]
         # q_norm: needs a [Mpad, hidden] device tensor. Reshape and pad-on-device.
         q_lora_2d = ttnn.reshape(q_lora_tt, [B * S, self.q_lora_rank])
         qr_2d = self._rmsnorm_device(self.q_norm_dev, q_lora_2d, B * S)
         qr_tt = ttnn.reshape(qr_2d, [B, S, self.q_lora_rank])
-        # Save qr for the indexer (it needs CPU qr).
-        qr_cpu = self._download_replicated(qr_tt, B, S, self.q_lora_rank)
+        # CPU indexer needs qr on host; device indexer keeps qr_tt on device.
+        if device_indexer is None and attn.indexer is not None:
+            qr_cpu = self._download_replicated(qr_tt, B, S, self.q_lora_rank)
 
         q_full_tt = attn.wq_b.forward_device(qr_tt)           # [B, S, H*D]
         q_tt = ttnn.reshape(q_full_tt, [B, S, H, D])
@@ -2604,15 +2924,34 @@ class DeviceAttention(nn.Module):
         kv_rope_only = ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D])
         kv_tt = ttnn.concat([kv_nope_q, kv_rope_only], dim=-1)
 
-        # Still download kv for CPU side effects (kv_cache update, compressor,
-        # indexer are CPU-resident). Those round-trips go away once task #22
-        # moves Compressor + Indexer onto device.
-        kv_cpu = self._download_replicated(kv_tt, B, S, D).to(x.dtype)
+        # CPU side still needs kv on host when the compressor is CPU-resident.
+        # Device path keeps kv_tt on device for both window-slot and compress-
+        # slot writes (no round-trip).
+        if device_comp is None:
+            kv_cpu = self._download_replicated(kv_tt, B, S, D).to(x.dtype)
 
         topk_idxs = get_window_topk_idxs(win, B, S, start_pos)
         if self.compress_ratio:
             offset = win
-            if attn.indexer is not None:
+            if device_indexer is not None:
+                # Device indexer: runs inner compressor + score reduce on
+                # device, then host topk. (Topk fusion is README candidate #4.)
+                score_tt = device_indexer.forward_device_score(
+                    x_tt, qr_tt, B, start_pos
+                )
+                end_pos = start_pos + 1
+                T_active = end_pos // self.compress_ratio
+                if T_active == 0:
+                    compress_topk_idxs = get_compress_topk_idxs(
+                        self.compress_ratio, B, S, start_pos, offset)
+                else:
+                    sc_dev = self._download_replicated(
+                        score_tt, B, S, score_tt.shape[-1]
+                    )
+                    sc_dev = sc_dev[..., :T_active]
+                    k = min(device_indexer.index_topk, T_active)
+                    compress_topk_idxs = sc_dev.topk(k, dim=-1)[1] + offset
+            elif attn.indexer is not None:
                 compress_topk_idxs = attn.indexer(x, qr_cpu, start_pos, offset)
             else:
                 compress_topk_idxs = get_compress_topk_idxs(
@@ -2620,51 +2959,68 @@ class DeviceAttention(nn.Module):
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
         topk_idxs = topk_idxs.int()
 
-        # KV cache update on CPU.
-        attn.kv_cache[:B, start_pos % win] = kv_cpu.squeeze(1)
-        if self.compress_ratio:
-            attn.compressor(x, start_pos)
-
-        # Mirror CPU writes onto the persistent device cache. Lazy-allocate it
-        # on the first decode call to inherit the post-prefill state.
+        # KV cache update.
         common_rep = dict(
             device=self.mesh, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
-        if self.kv_cache_tt is None:
-            cache_3d = attn.kv_cache[:B].to(torch.bfloat16).contiguous()
-            if self.kv_cache_size_pad != self.kv_cache_size:
-                pad = torch.zeros(
-                    B, self.kv_cache_size_pad - self.kv_cache_size, D,
-                    dtype=torch.bfloat16,
-                )
-                cache_3d = torch.cat([cache_3d, pad], dim=1)
-            cache_4d = cache_3d.view(B, 1, self.kv_cache_size_pad, D)
-            self.kv_cache_tt = ttnn.as_tensor(cache_4d, **common_rep)
-        else:
-            window_slot = (
-                attn.kv_cache[:B, start_pos % win]
-                .to(torch.bfloat16)
-                .contiguous()
-                .view(B, 1, 1, D)
-            )
-            window_slot_tt = ttnn.as_tensor(window_slot, **common_rep)
-            ttnn.kv_cache.update_cache_for_token_(
-                self.kv_cache_tt, window_slot_tt, start_pos % win, 0
-            )
-            if self.compress_ratio and (start_pos + 1) % self.compress_ratio == 0:
-                comp_idx = win + start_pos // self.compress_ratio
-                comp_slot = (
-                    attn.kv_cache[:B, comp_idx]
+        if device_comp is None:
+            attn.kv_cache[:B, start_pos % win] = kv_cpu.squeeze(1)
+            if self.compress_ratio:
+                attn.compressor(x, start_pos)
+            if self.kv_cache_tt is None:
+                cache_3d = attn.kv_cache[:B].to(torch.bfloat16).contiguous()
+                if self.kv_cache_size_pad != self.kv_cache_size:
+                    pad = torch.zeros(
+                        B, self.kv_cache_size_pad - self.kv_cache_size, D,
+                        dtype=torch.bfloat16,
+                    )
+                    cache_3d = torch.cat([cache_3d, pad], dim=1)
+                cache_4d = cache_3d.view(B, 1, self.kv_cache_size_pad, D)
+                self.kv_cache_tt = ttnn.as_tensor(cache_4d, **common_rep)
+            else:
+                window_slot = (
+                    attn.kv_cache[:B, start_pos % win]
                     .to(torch.bfloat16)
                     .contiguous()
                     .view(B, 1, 1, D)
                 )
-                comp_slot_tt = ttnn.as_tensor(comp_slot, **common_rep)
+                window_slot_tt = ttnn.as_tensor(window_slot, **common_rep)
                 ttnn.kv_cache.update_cache_for_token_(
-                    self.kv_cache_tt, comp_slot_tt, comp_idx, 0
+                    self.kv_cache_tt, window_slot_tt, start_pos % win, 0
                 )
+                if self.compress_ratio and (start_pos + 1) % self.compress_ratio == 0:
+                    comp_idx = win + start_pos // self.compress_ratio
+                    comp_slot = (
+                        attn.kv_cache[:B, comp_idx]
+                        .to(torch.bfloat16)
+                        .contiguous()
+                        .view(B, 1, 1, D)
+                    )
+                    comp_slot_tt = ttnn.as_tensor(comp_slot, **common_rep)
+                    ttnn.kv_cache.update_cache_for_token_(
+                        self.kv_cache_tt, comp_slot_tt, comp_idx, 0
+                    )
+        else:
+            # Device path: write window slot directly from kv_tt; compressor
+            # writes compress slot at win + comp_idx into the same buffer.
+            if self.kv_cache_tt is None:
+                cache_3d = attn.kv_cache[:B].to(torch.bfloat16).contiguous()
+                if self.kv_cache_size_pad != self.kv_cache_size:
+                    pad = torch.zeros(
+                        B, self.kv_cache_size_pad - self.kv_cache_size, D,
+                        dtype=torch.bfloat16,
+                    )
+                    cache_3d = torch.cat([cache_3d, pad], dim=1)
+                cache_4d = cache_3d.view(B, 1, self.kv_cache_size_pad, D)
+                self.kv_cache_tt = ttnn.as_tensor(cache_4d, **common_rep)
+                device_comp.bind_kv_cache_tt(self.kv_cache_tt, slot_offset=win)
+            kv_4d = ttnn.reshape(kv_tt, [B, 1, 1, D])
+            ttnn.kv_cache.update_cache_for_token_(
+                self.kv_cache_tt, kv_4d, start_pos % win, 0
+            )
+            device_comp.forward_device(x_tt, B, start_pos)
 
         kv_full_tt = ttnn.reshape(self.kv_cache_tt, [self.kv_cache_size_pad, D])
         idxs_tt, valid_tt = self.sparse_attn_dev._upload_topk(topk_idxs)
@@ -3220,6 +3576,77 @@ class Model:
         if indexer is not None:
             yield indexer.compressor
 
+    def offload_compressor_indexer(self, mesh):
+        """Replace every Attention.compressor and Attention.indexer with
+        DeviceCompressor + DeviceIndexer instances.
+
+        Requires --offload-attn-full (DeviceAttention._decode is what dispatches
+        to the device versions) and --offload-indexer-linears (we share the
+        already-on-device wq_b / weights_proj). Per layer:
+          - attn._device_compressor: DeviceCompressor for attn.compressor.
+            Bound to attn._device_attention.kv_cache_tt at first decode.
+          - attn._device_indexer (when ratio=4): DeviceIndexer wrapping
+            attn.indexer with its own DeviceCompressor (rotate=True).
+        """
+        if not hasattr(self, "_device_attn_full") or not self._device_attn_full:
+            raise RuntimeError(
+                "offload_compressor_indexer requires --offload-attn-full"
+            )
+        self._device_compressors = []
+        self._device_indexers = []
+        for layer, da in zip(self.transformer.layers, self._device_attn_full):
+            attn = layer.attn
+            if not attn.compress_ratio:
+                continue
+            wkv = attn.compressor.wkv if isinstance(
+                attn.compressor.wkv, DeviceColLinear
+            ) else DeviceColLinear(mesh, attn.compressor.wkv.weight)
+            wgate = attn.compressor.wgate if isinstance(
+                attn.compressor.wgate, DeviceColLinear
+            ) else DeviceColLinear(mesh, attn.compressor.wgate.weight)
+            norm_dev = DeviceRMSNorm(
+                mesh, attn.compressor.norm.weight, attn.compressor.norm.eps
+            )
+            dc = DeviceCompressor(
+                mesh=mesh,
+                comp=attn.compressor,
+                wkv_dev=wkv,
+                wgate_dev=wgate,
+                norm_dev=norm_dev,
+            )
+            attn._device_compressor = dc
+            self._device_compressors.append(dc)
+
+            indexer = getattr(attn, "indexer", None)
+            if indexer is None:
+                continue
+            if not isinstance(indexer.wq_b, DeviceColLinear):
+                raise RuntimeError(
+                    "offload_compressor_indexer requires --offload-indexer-linears"
+                )
+            ix_wkv = DeviceColLinear(mesh, indexer.compressor.wkv.weight)
+            ix_wgate = DeviceColLinear(mesh, indexer.compressor.wgate.weight)
+            ix_norm = DeviceRMSNorm(
+                mesh, indexer.compressor.norm.weight, indexer.compressor.norm.eps
+            )
+            ix_dc = DeviceCompressor(
+                mesh=mesh,
+                comp=indexer.compressor,
+                wkv_dev=ix_wkv,
+                wgate_dev=ix_wgate,
+                norm_dev=ix_norm,
+            )
+            di = DeviceIndexer(
+                mesh=mesh,
+                indexer=indexer,
+                dc=ix_dc,
+                wq_b_dev=indexer.wq_b,
+                weights_proj_dev=indexer.weights_proj,
+            )
+            attn._device_indexer = di
+            self._device_indexers.append(di)
+            self._device_compressors.append(ix_dc)
+
     def offload_moe_gate(self, mesh):
         """Move every non-hash MoE gate to the 1xN mesh.
 
@@ -3464,6 +3891,10 @@ def main():
     parser.add_argument("--offload-mhc", action="store_true",
                         help="Run Block.hc_pre / hc_post on 1x4 mesh via tt-lang fused kernels "
                              "(pre_norm_fn + pre_apply_mix + post). Sinkhorn stays CPU.")
+    parser.add_argument("--offload-compressor-indexer", action="store_true",
+                        help="Run Compressor + Indexer decode paths on device with "
+                             "device-resident state buffers (kv_state, score_state, kv_cache). "
+                             "Requires --offload-attn-full and --offload-indexer-linears.")
     parser.add_argument("--weights-cache",
                         default=os.environ.get("DS_WEIGHTS_CACHE",
                                                "/tmp/deepseek_v4_flash_cache/state_dict.pt"),
@@ -3501,6 +3932,7 @@ def main():
         or args.offload_sparse_attn
         or args.offload_attn_full
         or args.offload_mhc
+        or args.offload_compressor_indexer
     )
     if need_mesh:
         print("[phase] opening 1x4 mesh ...")
@@ -3583,6 +4015,11 @@ def main():
         t0 = time.time()
         model.offload_mhc(mesh)
         print(f"[phase] mhc offloaded in {time.time() - t0:.1f}s")
+    if args.offload_compressor_indexer:
+        print(f"[phase] binding DeviceCompressor + DeviceIndexer across {n_layers} layers on mesh ...")
+        t0 = time.time()
+        model.offload_compressor_indexer(mesh)
+        print(f"[phase] compressor_indexer offloaded in {time.time() - t0:.1f}s")
 
     if args.weights_only:
         print("[done] --weights-only set; stopping after weight load")
