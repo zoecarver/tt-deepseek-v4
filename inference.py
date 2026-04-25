@@ -283,20 +283,34 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
-@lru_cache(1)
-def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int):
-    if start_pos >= window_size - 1:
-        start_pos %= window_size
-        matrix = torch.cat(
-            [torch.arange(start_pos + 1, window_size), torch.arange(0, start_pos + 1)], dim=0
+def _build_window_topk_table(window_size: int) -> torch.Tensor:
+    """Precomputed [2*window_size, window_size] int32 lookup table for
+    per-step window topk indices:
+      - rows [0, window_size): forward-pad at p < window_size
+        (`[0, 1, ..., p, -1, ...]`).
+      - rows [window_size, 2*window_size): wraparound at p >= window_size
+        (cat of `arange(p%win + 1, win)` and `arange(0, p%win + 1)`).
+    Indexed via `_window_topk_row_for_pos` and sliced on device per step
+    (loop-prefill keeps seqlen=1, so we never need the seqlen>1 form)."""
+    table = torch.full(
+        (2 * window_size, window_size), -1, dtype=torch.int32
+    )
+    for s in range(window_size):
+        table[s, : s + 1] = torch.arange(s + 1, dtype=torch.int32)
+    for s in range(window_size):
+        table[window_size + s] = torch.cat(
+            [
+                torch.arange(s + 1, window_size, dtype=torch.int32),
+                torch.arange(0, s + 1, dtype=torch.int32),
+            ]
         )
-    elif start_pos > 0:
-        matrix = F.pad(torch.arange(start_pos + 1), (0, window_size - start_pos - 1), value=-1)
-    else:
-        base = torch.arange(seqlen).unsqueeze(1)
-        matrix = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
-        matrix = torch.where(matrix > base, -1, matrix)
-    return matrix.unsqueeze(0).expand(bsz, -1, -1)
+    return table
+
+
+def _window_topk_row_for_pos(start_pos: int, window_size: int) -> int:
+    if start_pos < window_size:
+        return start_pos
+    return window_size + (start_pos % window_size)
 
 
 class Compressor(nn.Module):
@@ -561,7 +575,7 @@ def _block_forward(layer, x, start_pos: int,
     mhc_ffn = layer._device_mhc_ffn
     attn_norm_dn = layer.attn_norm.forward.__self__
     ffn_norm_dn = layer.ffn_norm.forward.__self__
-    attn_dev = layer.attn._device_attention
+    attn_dev = layer.attn.forward.__self__
     ttnn = attn_norm_dn._ttnn
     num_tokens = B * S
     num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
@@ -3136,10 +3150,20 @@ class DeviceAttention(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._upload_mapper,
         )
-        # Window topk indices [B, S, win] int32. The per-step values
-        # change but shape is pinned by the model's window_size.
-        self._win_idxs_upload_tt = ttnn.from_torch(
-            torch.zeros(B, 1, self.window_size, dtype=torch.int32),
+        # Window topk index lookup table: [1, 2*win, win] int32, replicated.
+        # Per-step we slice row s = _window_topk_row_for_pos(start_pos, win)
+        # to get [B=1, 1, win], reproducing get_window_topk_idxs without any
+        # host transfer. See _build_window_topk_table for the layout.
+        if B != 1:
+            raise ValueError(
+                f"DeviceAttention only supports B=1, got B={B}; "
+                "_win_idxs_table_tt is sized for [1, 2*win, win]."
+            )
+        win_table = _build_window_topk_table(self.window_size).view(
+            1, 2 * self.window_size, self.window_size
+        )
+        self._win_idxs_table_tt = ttnn.from_torch(
+            win_table,
             device=self.mesh, dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._upload_mapper,
@@ -3258,31 +3282,22 @@ class DeviceAttention(nn.Module):
         kv_rope_only = ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D])
         kv_tt = ttnn.concat([kv_nope_q, kv_rope_only], dim=-1)
 
-        # Build the topk index tensor. Window indices are still produced on
-        # host (task: move on device). Compress indices live on device:
+        # Build the topk index tensor entirely on device.
+        # Window slot indices are sliced from the precomputed
+        # _win_idxs_table_tt lookup table (no host transfer per step).
+        # Compress indices, when applicable:
         #  * device_indexer present: device-side score reduce -> ttnn.topk.
         #  * device_indexer absent (compress_ratio in {2, 128, ...}): slice
         #    the precomputed [win, win+1, ..., win+max_T-1] ramp on device.
-        # When compress_ratio is 0 (no compressor at all), topk stays on
-        # host and is uploaded via sparse_attn_dev._upload_topk.
-        topk_idxs = get_window_topk_idxs(win, B, S, start_pos)
-        topk_idxs_dev = None
-        topk_idxs_dev_K = None
+        win_row = _window_topk_row_for_pos(start_pos, win)
+        topk_idxs_dev = ttnn.slice(
+            self._win_idxs_table_tt,
+            [0, win_row, 0], [B, win_row + 1, win],
+        )
+        topk_idxs_dev_K = win
         if self.compress_ratio:
-            win_idxs_torch = topk_idxs.to(torch.int32).contiguous()
-            win_host_mesh = ttnn.from_torch(
-                win_idxs_torch, dtype=ttnn.int32,
-                layout=ttnn.TILE_LAYOUT,
-                mesh_mapper=self._upload_mapper,
-            )
-            ttnn.copy_host_to_device_tensor(
-                win_host_mesh, self._win_idxs_upload_tt
-            )
             T_active = (start_pos + 1) // self.compress_ratio
-            if T_active == 0:
-                topk_idxs_dev = self._win_idxs_upload_tt
-                topk_idxs_dev_K = win
-            else:
+            if T_active > 0:
                 if device_indexer is not None:
                     score_tt = device_indexer.forward_device_score(
                         x_tt, qr_tt, B, start_pos
@@ -3302,12 +3317,9 @@ class DeviceAttention(nn.Module):
                     )
                     k = T_active
                 topk_idxs_dev = ttnn.concat(
-                    [self._win_idxs_upload_tt, cmp_idxs_int], dim=-1
+                    [topk_idxs_dev, cmp_idxs_int], dim=-1
                 )
                 topk_idxs_dev_K = win + k
-            topk_idxs = None
-        if topk_idxs is not None:
-            topk_idxs = topk_idxs.int()
 
         # KV cache update: write window slot from kv_tt; the device compressor
         # (when compress_ratio is set) writes compress slot at win + comp_idx
@@ -3320,14 +3332,10 @@ class DeviceAttention(nn.Module):
             device_comp.forward_device(x_tt, B, start_pos)
 
         kv_full_tt = ttnn.reshape(self.kv_cache_tt, [self.kv_cache_size_pad, D])
-        if topk_idxs_dev is not None:
-            K = topk_idxs_dev_K
-            idxs_tt, valid_tt = self.sparse_attn_dev._idxs_int_tile_to_idxs_and_mask(
-                topk_idxs_dev, B, S, K
-            )
-        else:
-            idxs_tt, valid_tt = self.sparse_attn_dev._upload_topk(topk_idxs)
-            K = topk_idxs.shape[-1]
+        K = topk_idxs_dev_K
+        idxs_tt, valid_tt = self.sparse_attn_dev._idxs_int_tile_to_idxs_and_mask(
+            topk_idxs_dev, B, S, K
+        )
         o_tt = self.sparse_attn_dev.forward_device(
             q_tt, kv_full_tt, idxs_tt, valid_tt, S, K
         )
