@@ -1777,6 +1777,25 @@ class DeviceMHC(nn.Module):
         self._apply_mix_out_tt = self._zeros((num_tokens * _MHC_TILE, self.hidden))
         self._post_out_tt = self._zeros((num_tokens * _MHC_TILE, self.hidden))
 
+        # Pre-allocated upload buffers. hc_pre uploads residual packed as
+        # [num_tokens_pad, mhc*hidden]; hc_post uploads x packed as
+        # [num_tokens * TILE, hidden]. Pinned to num_tokens=1.
+        self._a_upload_tt = ttnn.from_torch(
+            torch.zeros(num_tokens_pad, self.hc_mult * self.hidden,
+                        dtype=torch.float32),
+            device=mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        self._x_upload_tt = ttnn.from_torch(
+            torch.zeros(num_tokens * _MHC_TILE, self.hidden,
+                        dtype=torch.float32),
+            device=mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        self._upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
+
     def _norm_fn_kernel(self, num_out_tiles: int):
         key = ("norm_fn", num_out_tiles)
         k = self._kernels.get(key)
@@ -1870,7 +1889,12 @@ class DeviceMHC(nn.Module):
         # num_tokens_pad sizing. Per-token kernels (sinkhorn, apply_mix, post)
         # use real num_tokens to avoid 32x over-allocation on decode.
         a_packed = _mhc_pack_residual(x, num_tokens_pad)
-        a_tt = self._rep_tensor(a_packed)
+        host_mesh = ttnn.from_torch(
+            a_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(host_mesh, self._a_upload_tt)
+        a_tt = self._a_upload_tt
         mixes_tt = self._mixes_tt
         self._norm_fn_kernel(num_tokens_pad // _MHC_TILE)(
             a_tt, self.fn_tt, self.scaler_tt, mixes_tt)
@@ -1969,7 +1993,13 @@ class DeviceMHC(nn.Module):
         self._stash_comb_sk_tt = None
 
         x_2d = x.reshape(num_tokens, hidden)
-        x_tt = self._rep_tensor(_mhc_pack_x_bc(x_2d, mhc, num_tokens))
+        x_packed = _mhc_pack_x_bc(x_2d, mhc, num_tokens)
+        host_mesh = ttnn.from_torch(
+            x_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
+        x_tt = self._x_upload_tt
 
         # Build res_tt from the stashed a_tt (norm_fn input == hc_pre's
         # residual, packed [num_tokens_pad, mhc*hidden]). Slice -> reshape ->
