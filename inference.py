@@ -530,24 +530,43 @@ class Block(nn.Module):
             self.hc_ffn_scale = nn.Parameter(torch.empty(3))
 
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]):
-        with _phase("block.hc_pre"):
-            x = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        with _phase("block.norm"):
-            x = self.attn_norm(x)
-        with _phase("block.attn"):
-            x = self.attn(x, start_pos)
-        with _phase("block.hc_post"):
-            x = self.hc_post(x)
+        return _block_forward(self, x, start_pos, input_ids)
 
-        with _phase("block.hc_pre"):
-            x = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        with _phase("block.norm"):
-            x = self.ffn_norm(x)
-        with _phase("block.ffn"):
-            x = self.ffn(x, input_ids)
-        with _phase("block.hc_post"):
-            x = self.hc_post(x)
-        return x
+
+def _block_forward(layer, x: torch.Tensor, start_pos: int,
+                   input_ids: Optional[torch.Tensor]):
+    """Vanilla block forward. Calls the bound (device or CPU) sub-modules
+    directly so the chain is one flat sequence of explicit calls — no
+    nn.Module.__call__ traversal between phases.
+
+    Layout transitions: x at entry is [B, S, mhc, hidden]; hc_pre flattens
+    to [B, S, hidden]; hc_post un-flattens back. attn / norm / ffn operate
+    on [B, S, hidden].
+
+    Method dispatch follows the offload-time bindings:
+      - layer.hc_pre / layer.hc_post: bound DeviceMHC dispatch closures
+      - layer.attn_norm.forward / layer.ffn_norm.forward: DeviceRMSNorm
+      - layer.attn.forward: DeviceAttention.forward (decode-only)
+      - layer.ffn.forward: MoE host loop with device gate / shared expert
+    """
+    with _phase("block.hc_pre"):
+        x = layer.hc_pre(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base)
+    with _phase("block.norm"):
+        x = layer.attn_norm.forward(x)
+    with _phase("block.attn"):
+        x = layer.attn.forward(x, start_pos)
+    with _phase("block.hc_post"):
+        x = layer.hc_post(x)
+
+    with _phase("block.hc_pre"):
+        x = layer.hc_pre(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
+    with _phase("block.norm"):
+        x = layer.ffn_norm.forward(x)
+    with _phase("block.ffn"):
+        x = layer.ffn.forward(x, input_ids)
+    with _phase("block.hc_post"):
+        x = layer.hc_post(x)
+    return x
 
 
 class ParallelHead(nn.Module):
@@ -604,7 +623,7 @@ class Transformer(nn.Module):
             h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         with _phase("blocks"):
             for layer in self.layers:
-                h = layer(h, start_pos, input_ids)
+                h = _block_forward(layer, h, start_pos, input_ids)
         with _phase("head"):
             logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
         return logits
