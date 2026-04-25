@@ -3136,11 +3136,15 @@ class DeviceAttention(nn.Module):
         return t[:expected_shape[0]] if expected_shape else t
 
 
-def _open_mesh(shape=(1, 4)):
-    """Open a mesh device. Enables 1D fabric for CCL ops (all_gather etc.)."""
+def _open_mesh(shape=(1, 4), trace_region_size: int = 100_000_000):
+    """Open a mesh device. Enables 1D fabric for CCL ops (all_gather etc.)
+    and reserves trace_region_size bytes (default 100MB) for captured
+    traces; required before any begin_trace_capture call."""
     import ttnn
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D, ttnn.FabricReliabilityMode.RELAXED_INIT)
-    return ttnn.open_mesh_device(ttnn.MeshShape(*shape))
+    return ttnn.open_mesh_device(
+        ttnn.MeshShape(*shape), trace_region_size=trace_region_size
+    )
 
 
 def _close_mesh(mesh):
