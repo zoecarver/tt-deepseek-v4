@@ -32,12 +32,12 @@ Load these skills before doing any work:
 - `ttnn`
 - `tt-lang`
 
-Remote config for this project: `/Users/zcarver/.claude/skills/tt-connect-remote-device/scripts/all.conf` (ssh to `bh-qbae-15`, docker container `zcarver-ird-all`).
+Remote config for this project: `/Users/zcarver/.claude/skills/tt-connect-remote-device/scripts/galaxy.conf` (ssh to `g08blx03.tenstorrent.net`, docker container `ubuntu-ird-all`).
 
 Verify the remote is reachable with the smoke test:
 
 ```
-export TT_REMOTE_CONF=/Users/zcarver/.claude/skills/tt-connect-remote-device/scripts/all.conf
+export TT_REMOTE_CONF=/Users/zcarver/.claude/skills/tt-connect-remote-device/scripts/galaxy.conf
 /Users/zcarver/.claude/skills/tt-connect-remote-device/scripts/smoke-test.sh
 ```
 
@@ -68,7 +68,7 @@ Ad-hoc, one-shot probe scripts (checking a ttnn API signature, listing device op
 
 ## Hang recovery
 
-**Important: follow these steps exactly. Deviating can leave the device in an unrecoverable state. If anything is unclear, stop and ask the user before running commands.**
+**Never attempt hang recovery yourself. Do not run `pkill`, `tt-smi`, `tt-smi -r`, or any other recovery command. If you suspect the device is hung or in a bad state, stop and ask the user — they will handle recovery.**
 
 ### Detecting a hang vs. normal slow progress
 
@@ -78,29 +78,17 @@ The inference script must print clear progress markers so it is obvious whether 
 
 If the last marker is "weights loaded" but not "weights transferred", the process is likely still moving data to the device (not hung). If both markers printed and then it stalled, that is a real kernel-level hang.
 
-Also check the **first ~20 lines of the log** for a message indicating another process holds a lock on the device. A device lock will show up early in the log, not as a hang mid-run, and the fix is to clear the other process rather than reset the device.
+Also check the **first ~20 lines of the log** for a message indicating another process holds a lock on the device. A device lock will show up early in the log, not as a hang mid-run.
 
 The exact log line to grep for is:
 ```
 Waiting for lock 'CHIP_IN_USE_1_PCIe' which is currently held by thread TID: <pid>, PID: <pid>
 ```
-If you see this, the current run is queued behind a stale process and will not progress until that process is killed. Don't keep waiting — escalate immediately. The blessed fix is `pkill -9 python` inside the docker container; if that command is denied, ask the user to run it themselves and pause the loop.
+If you see this, the current run is queued behind a stale process and will not progress. Stop and ask the user to clear it.
 
-### Recovery steps
+### When a hang is suspected
 
-When a hang is confirmed:
-
-1. Kill Python processes **inside the docker container** using `remote-run.sh`:
-   ```
-   /Users/zcarver/.claude/skills/tt-connect-remote-device/scripts/remote-run.sh pkill -9 python
-   ```
-
-2. SSH into the remote host (**not** into the docker container) and run `tt-smi -r`:
-   ```
-   ssh zcarver@bh-qbae-15 tt-smi -r
-   ```
-
-**Do NOT run `tt-smi -r` from inside the docker container.** Running it from docker will put the device in an unrecoverable state.
+Stop and ask the user. Do not run any recovery commands.
 
 ## Inference script shape
 

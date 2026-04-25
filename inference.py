@@ -524,8 +524,6 @@ class MoE(nn.Module):
         shared_dev = self.shared_experts
         ttnn = shared_dev._ttnn
         mesh = shared_dev.mesh
-        composer = ttnn.ConcatMesh2dToTensor(
-            mesh, shared_dev.mesh_shape, dims=(1, 0))
         upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
 
         M = int(x_tt.shape[0])
@@ -538,22 +536,21 @@ class MoE(nn.Module):
                 f"x_tt last dim {int(x_tt.shape[-1])} != self.dim {self.dim}"
             )
 
-        x = ttnn.to_torch(x_tt, mesh_composer=composer)[:M].to(torch.bfloat16)
-        x_host_mesh = ttnn.from_torch(
-            x.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=upload_mapper,
-        )
+        x = _readback_replicated_2d(
+            ttnn, x_tt, mesh, shared_dev.mesh_shape).to(torch.bfloat16)
 
         if self.gate.hash:
             weights, indices = self.gate.forward(x.float(), input_ids.flatten())
         else:
             gate_dev = self.gate._device_gate
-            ttnn.copy_host_to_device_tensor(x_host_mesh, gate_dev._x_upload_tt)
+            ttnn.copy(x_tt, gate_dev._x_upload_tt)
             weights_tt, indices_tt = gate_dev.forward_device()
-            weights = ttnn.to_torch(weights_tt, mesh_composer=composer)[:M].float()
-            indices = ttnn.to_torch(indices_tt, mesh_composer=composer)[:M].long()
+            weights = _readback_replicated_2d(
+                ttnn, weights_tt, mesh, shared_dev.mesh_shape)[:M].float()
+            indices = _readback_replicated_2d(
+                ttnn, indices_tt, mesh, shared_dev.mesh_shape)[:M].long()
 
-        ttnn.copy_host_to_device_tensor(x_host_mesh, shared_dev._x_upload_tt)
+        ttnn.copy(x_tt, shared_dev._x_upload_tt)
         shared_out_tt = shared_dev.forward_device()
 
         y_routed = torch.zeros(M, self.dim, dtype=torch.float32)
@@ -612,9 +609,8 @@ class Block(nn.Module):
         ttnn.copy_host_to_device_tensor(host_mesh, mhc_attn._a_upload_tt)
         out_tt = _block_forward(self, mhc_attn._a_upload_tt, start_pos,
                                 input_ids, B, S, mhc, hidden, x.dtype)
-        composer = ttnn.ConcatMesh2dToTensor(
-            mhc_attn.mesh, mhc_attn.mesh_shape, dims=(1, 0))
-        out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
+        out_packed = _readback_replicated_2d(
+            ttnn, out_tt, mhc_attn.mesh, mhc_attn.mesh_shape)
         y = _mhc_unpack_a_tt(out_packed, num_tokens, mhc, hidden)
         return y.view(B, S, mhc, hidden).to(x.dtype)
 
@@ -768,9 +764,8 @@ class Transformer(nn.Module):
                 a_tt = _block_forward(layer, a_tt, start_pos, input_ids,
                                       B, S, mhc, hidden, orig_dtype)
         with _phase("head"):
-            composer = ttnn.ConcatMesh2dToTensor(
-                mhc_attn.mesh, mhc_attn.mesh_shape, dims=(1, 0))
-            out_packed = ttnn.to_torch(a_tt, mesh_composer=composer)
+            out_packed = _readback_replicated_2d(
+                ttnn, a_tt, mhc_attn.mesh, mhc_attn.mesh_shape)
             y = _mhc_unpack_a_tt(out_packed, num_tokens, mhc, hidden)
             h = y.view(B, S, mhc, hidden).to(orig_dtype)
             logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
@@ -1000,11 +995,12 @@ class DeviceColLinear(nn.Module):
     def forward_device(self, x_tt) -> "object":
         """Device-only path. x_tt: replicated input [1, 1, in_dim]. Returns
         replicated output [1, 1, out_dim] via all_gather along the sharded
-        axis. Output buffers are pre-allocated; both ops write in place."""
+        col axis (cluster_axis=1 on a (4, 8) Galaxy mesh). Output buffers
+        are pre-allocated; both ops write in place."""
         ttnn = self._ttnn
         ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._matmul_out_tt)
-        ttnn.all_gather(self._matmul_out_tt, dim=-1, num_links=1,
+        ttnn.all_gather(self._matmul_out_tt, dim=-1, cluster_axis=1, num_links=1,
                         output_tensor=self._gather_out_tt)
         return self._gather_out_tt
 
@@ -1133,10 +1129,10 @@ class DeviceMoEGate(nn.Module):
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
         weights_tt, indices_tt = self.forward_device()
 
-        # Replicated readback: stack 4 copies on tensor dim 0, take first M rows.
-        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        weights = ttnn.to_torch(weights_tt, mesh_composer=composer)[:M].float()
-        indices = ttnn.to_torch(indices_tt, mesh_composer=composer)[:M].long()
+        weights = _readback_replicated_2d(
+            ttnn, weights_tt, self.mesh, self.mesh_shape)[:M].float()
+        indices = _readback_replicated_2d(
+            ttnn, indices_tt, self.mesh, self.mesh_shape)[:M].long()
         return weights, indices
 
 
@@ -1357,8 +1353,8 @@ class DeviceRMSNorm(nn.Module):
             x_tt = ttnn.as_tensor(x2.contiguous(), **rep)
             out_tt = self.forward_device(x_tt, M)
 
-        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        y = ttnn.to_torch(out_tt, mesh_composer=composer)[:M]
+        y = _readback_replicated_2d(
+            ttnn, out_tt, self.mesh, self.mesh_shape)[:M]
         return y.view(*orig_shape).to(x.dtype)
 
     def forward_device(self, x_tt, num_rows: int):
@@ -2289,8 +2285,8 @@ class DeviceMHC(nn.Module):
 
         out_tt = self.hc_pre_device(num_tokens, num_tokens_pad)
 
-        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
+        out_packed = _readback_replicated_2d(
+            ttnn, out_tt, self.mesh, self.mesh_shape)
         y_flat = _mhc_unpack_apply_mix_out(out_packed, num_tokens, hidden)
         return y_flat.view(B, S, hidden).to(out_dtype)
 
@@ -2370,8 +2366,8 @@ class DeviceMHC(nn.Module):
 
         out_tt = self.hc_post_device(num_tokens)
 
-        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        out_packed = ttnn.to_torch(out_tt, mesh_composer=composer)
+        out_packed = _readback_replicated_2d(
+            ttnn, out_tt, self.mesh, self.mesh_shape)
         y_flat = _mhc_unpack_post_out(out_packed, num_tokens, mhc, hidden)
         return y_flat.view(B, S, mhc, hidden).to(out_dtype)
 
@@ -2530,8 +2526,8 @@ class DeviceSharedExpert(nn.Module):
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
         out_tt = self.forward_device()
 
-        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        y = ttnn.to_torch(out_tt, mesh_composer=composer)[:M]
+        y = _readback_replicated_2d(
+            ttnn, out_tt, self.mesh, self.mesh_shape)[:M]
         return y.to(x.dtype)
 
 
@@ -2597,8 +2593,8 @@ class DeviceSparseAttn(nn.Module):
         idxs_tt, valid_tt = self._upload_topk(topk_idxs)
 
         out_tt = self.forward_device(q_tt, kv_tt, idxs_tt, valid_tt, S, topk_idxs.shape[-1])
-        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        out = ttnn.to_torch(out_tt, mesh_composer=composer)[:B]
+        out = _readback_replicated_2d(
+            ttnn, out_tt, self.mesh, self.mesh_shape)[:B]
         return out.to(q.dtype)
 
     def _upload_topk(self, topk_idxs: torch.Tensor):
@@ -3285,8 +3281,8 @@ class DeviceAttention(nn.Module):
 
         out_tt = self.forward_device(self._x_upload_tt, start_pos)
 
-        composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(1, 0))
-        out = ttnn.to_torch(out_tt, mesh_composer=composer)[:B]
+        out = _readback_replicated_2d(
+            ttnn, out_tt, self.mesh, self.mesh_shape)[:B]
         return out.to(x.dtype)
 
     def forward_device(self, x_tt, start_pos: int):
@@ -3476,15 +3472,36 @@ class DeviceAttention(nn.Module):
         return cos, sin
 
 
-def _open_mesh(shape=(1, 4), trace_region_size: int = 100_000_000):
-    """Open a mesh device. Enables 1D fabric for CCL ops (all_gather etc.)
-    and reserves trace_region_size bytes (default 100MB) for captured
-    traces; required before any begin_trace_capture call."""
+def _open_mesh(shape=(4, 8), trace_region_size: int = 100_000_000):
+    """Open a Galaxy (TG) mesh device. Default shape (4, 8) matches
+    SYSTEM_NAME_TO_MESH_SHAPE["TG"] in tt-metal/models/demos/deepseek_v3.
+
+    FABRIC_1D is correct here even on a 2D mesh: the model only does 1D
+    tensor parallelism (sharded along the 8-col axis, replicated along the
+    4-row axis). deepseek_v3's Galaxy demo uses the same setting (see
+    demo/demo.py:292)."""
     import ttnn
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D, ttnn.FabricReliabilityMode.RELAXED_INIT)
     return ttnn.open_mesh_device(
         ttnn.MeshShape(*shape), trace_region_size=trace_region_size
     )
+
+
+def _readback_replicated_2d(ttnn, tensor_tt, mesh, mesh_shape):
+    """Read a fully-replicated device tensor back to host as chip (0,0)'s view.
+
+    Replicated tensors hold identical data on every chip, but
+    ConcatMesh2dToTensor with `dims=(1, 0)` materialises them as
+    `[M1 * d0, M0 * d1, ...rest]` on a `(M0, M1)` mesh. On a (1, 4) mesh
+    the result happens to collapse to `[4 * d0, d1]` so a single `[:M]`
+    slice is enough. On (4, 8) the second axis grows too, so we have to
+    slice both. This helper centralises the slicing so every call site
+    is mesh-shape agnostic."""
+    composer = ttnn.ConcatMesh2dToTensor(mesh, mesh_shape, dims=(1, 0))
+    raw = ttnn.to_torch(tensor_tt, mesh_composer=composer)
+    shape = tuple(tensor_tt.shape)
+    slicer = tuple(slice(0, s) for s in shape)
+    return raw[slicer]
 
 
 def _close_mesh(mesh):
@@ -3862,8 +3879,7 @@ class Model:
                 mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
             )
             y_tt = ttnn.embedding(ids_tt, w_tt, layout=ttnn.TILE_LAYOUT)
-            composer = ttnn.ConcatMesh2dToTensor(mesh, mesh_shape, dims=(1, 0))
-            y = ttnn.to_torch(y_tt, mesh_composer=composer)
+            y = _readback_replicated_2d(ttnn, y_tt, mesh, mesh_shape)
             B = x.shape[0]
             return y[:B].to(torch.bfloat16)
 
@@ -4285,9 +4301,13 @@ def main():
     model.load_weights(verbose=args.verbose_load, cache_path=args.weights_cache or None)
     print(f"[phase] weights loaded in {time.time() - t0:.1f}s")
 
-    print("[phase] opening 1x4 mesh ...")
+    if args.weights_only:
+        print("[done] --weights-only set; stopping before mesh open")
+        return
+
+    print("[phase] opening 4x8 mesh ...")
     t0 = time.time()
-    mesh = _open_mesh(shape=(1, 4))
+    mesh = _open_mesh()
     print(f"[phase] mesh opened in {time.time() - t0:.1f}s")
 
     n_layers = len(model.transformer.layers)
@@ -4319,12 +4339,6 @@ def main():
     n_alloc_modules = sum(1 for _ in model._iter_device_modules())
     print(f"[phase] {n_alloc_modules} device modules registered for "
           f"Model.allocate_decode_tensors")
-
-    if args.weights_only:
-        print("[done] --weights-only set; stopping after weight load")
-        if mesh is not None:
-            _close_mesh(mesh)
-        return
 
     print("[phase] encoding prompt ...")
     prompt = args.prompt

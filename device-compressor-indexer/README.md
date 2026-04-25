@@ -138,7 +138,7 @@ In priority order; each lands in `../tt-lang-kernels/<name>.py`:
 ## Run
 
 ```bash
-export TT_REMOTE_CONF=/Users/zcarver/.claude/skills/tt-connect-remote-device/scripts/all.conf
+export TT_REMOTE_CONF=/Users/zcarver/.claude/skills/tt-connect-remote-device/scripts/galaxy.conf
 # One case:
 /path/to/run-test.sh --hw device-compressor-indexer/compressor_no_overlap.py
 # All:
