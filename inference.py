@@ -2682,6 +2682,33 @@ class DeviceSparseAttn(nn.Module):
         )
         return idxs_tt, valid_tt
 
+    def _idxs_int_tile_to_idxs_and_mask(self, idxs_int_tt, B: int, S: int, K: int):
+        """Convert a device-resident [B, S, K] int32 TILE topk index tensor
+        (with -1 sentinels) into (idxs_uint32_rm [B, S*K], valid_bf16_tile
+        [B, S, 1, K]). Used by the device-indexer path to avoid a CPU round
+        trip on the indices."""
+        ttnn = self._ttnn
+        cond = ttnn.lt(idxs_int_tt, 0)
+        cond_4d = ttnn.reshape(cond, [B, S, 1, K])
+        ninf_tt = ttnn.from_torch(
+            torch.full((B, S, 1, K), float("-inf"), dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        zero_tt = ttnn.from_torch(
+            torch.zeros((B, S, 1, K), dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        valid_tt = ttnn.where(cond_4d, ninf_tt, zero_tt)
+        safe = ttnn.clamp(idxs_int_tt, min=0)
+        safe = ttnn.reshape(safe, [B, S * K])
+        safe = ttnn.typecast(safe, dtype=ttnn.uint32)
+        safe = ttnn.to_layout(safe, ttnn.ROW_MAJOR_LAYOUT)
+        return safe, valid_tt
+
     def forward_device(self, q_tt, kv_tt, idxs_tt, valid_tt, S: int, K: int):
         """Device-only sparse_attn. q_tt: [1,S,H,D] tile; kv_tt: [N,D] tile;
         idxs_tt: [1, S*K] uint32 row-major; valid_tt: [1,S,1,K] tile additive
@@ -3302,12 +3329,15 @@ class DeviceAttention(nn.Module):
             kv_cpu = self._download_replicated(kv_tt, B, S, D).to(x.dtype)
 
         topk_idxs = get_window_topk_idxs(win, B, S, start_pos)
+        topk_idxs_dev = None  # int32 TILE [B, S, K] if device path, else None
+        topk_idxs_dev_K = None
         if self.compress_ratio:
             offset = win
             if device_indexer is not None:
                 # Device indexer: runs inner compressor + score reduce on
-                # device, then ttnn.topk on device. Only the small [B, S, k]
-                # indices come back to CPU for the offset add + concat.
+                # device, then ttnn.topk on device. When T_active > 0 we keep
+                # the indices fully on device through typecast+add+concat to
+                # avoid the small but synchronizing CPU round-trip.
                 score_tt = device_indexer.forward_device_score(
                     x_tt, qr_tt, B, start_pos
                 )
@@ -3316,22 +3346,35 @@ class DeviceAttention(nn.Module):
                 if T_active == 0:
                     compress_topk_idxs = get_compress_topk_idxs(
                         self.compress_ratio, B, S, start_pos, offset)
+                    topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
                 else:
                     k = min(device_indexer.index_topk, T_active)
                     score_valid_tt = ttnn.slice(
                         score_tt, [0, 0, 0], [B, S, T_active])
-                    _, idxs_tt = ttnn.topk(
+                    _, cmp_idxs_tt = ttnn.topk(
                         score_valid_tt, k=k, dim=-1,
                         largest=True, sorted=True)
-                    idxs_cpu = self._download_replicated(idxs_tt, B, S, k)
-                    compress_topk_idxs = idxs_cpu.long() + offset
+                    cmp_idxs_int = ttnn.typecast(cmp_idxs_tt, dtype=ttnn.int32)
+                    cmp_idxs_int = ttnn.add(cmp_idxs_int, offset)
+                    win_idxs_torch = topk_idxs.to(torch.int32).contiguous()
+                    win_idxs_tt = ttnn.from_torch(
+                        win_idxs_torch, device=self.mesh, dtype=ttnn.int32,
+                        layout=ttnn.TILE_LAYOUT,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+                    )
+                    topk_idxs_dev = ttnn.concat([win_idxs_tt, cmp_idxs_int], dim=-1)
+                    topk_idxs_dev_K = win + k
+                    topk_idxs = None
             elif getattr(attn, "indexer", None) is not None:
                 compress_topk_idxs = attn.indexer(x, qr_cpu, start_pos, offset)
+                topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
             else:
                 compress_topk_idxs = get_compress_topk_idxs(
                     self.compress_ratio, B, S, start_pos, offset)
-            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
-        topk_idxs = topk_idxs.int()
+                topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+        if topk_idxs is not None:
+            topk_idxs = topk_idxs.int()
 
         # KV cache update.
         common_rep = dict(
@@ -3397,8 +3440,14 @@ class DeviceAttention(nn.Module):
             device_comp.forward_device(x_tt, B, start_pos)
 
         kv_full_tt = ttnn.reshape(self.kv_cache_tt, [self.kv_cache_size_pad, D])
-        idxs_tt, valid_tt = self.sparse_attn_dev._upload_topk(topk_idxs)
-        K = topk_idxs.shape[-1]
+        if topk_idxs_dev is not None:
+            K = topk_idxs_dev_K
+            idxs_tt, valid_tt = self.sparse_attn_dev._idxs_int_tile_to_idxs_and_mask(
+                topk_idxs_dev, B, S, K
+            )
+        else:
+            idxs_tt, valid_tt = self.sparse_attn_dev._upload_topk(topk_idxs)
+            K = topk_idxs.shape[-1]
         o_tt = self.sparse_attn_dev.forward_device(
             q_tt, kv_full_tt, idxs_tt, valid_tt, S, K
         )
