@@ -161,17 +161,14 @@ def fp4_bytes_to_fp4_dequant_bf16(
     return (vals * sf_exp).to(torch.bfloat16)
 
 
-def expand_e8m0_scale_to_bf16_kn(
+def expand_e8m0_scale_to_bf16_compact_kn(
     w_sf_e8m0: torch.Tensor, K: int, N: int, block_k: int = FP4_BLOCK_K
 ) -> torch.Tensor:
-    """e8m0 [N, K/block_k] → bf16 [Kb*TILE, N] for tile-aligned device upload.
+    """e8m0 [N, Kb] → bf16 [Kb, N] in matmul-order, no K-axis expansion.
 
-    Each fp4 K-block (32 elements) gets one scalar scale per output channel n.
-    To match a tt-lang/ttnn matmul's weight tile layout, we replicate each
-    [1, N] scale row 32 times along K, producing a [(K/block_k)*TILE, N] tensor.
-
-    Returns bf16 tensor [(K/block_k)*32, N]. With block_k=32 and TILE=32, that
-    is exactly [K, N] (one scale row per K-tile, replicated across the tile).
+    The scalar per fp4 K-block (32 elements) per output column. The expansion
+    from Kb to K (replicate each row 32×) is deferred to the device, so on-disk
+    and on-device storage stays at 1/32 the expanded size. With Kb = K/block_k.
     """
     if block_k != FP4_BLOCK_K:
         raise NotImplementedError(f"only block_k=32 supported (got {block_k})")
@@ -187,12 +184,8 @@ def expand_e8m0_scale_to_bf16_kn(
     if sf_u.shape != (N, Kb):
         raise ValueError(f"scale shape {tuple(sf_u.shape)} != ({N}, {Kb})")
     sf_f32 = (sf_u.to(torch.int32) << 23).contiguous().view(torch.float32)
-    # [N, Kb] -> [Kb, N] (matmul-order transpose)
-    sf_kn = sf_f32.transpose(0, 1).contiguous()
-    # Replicate each scale row 32× along K-dim so a 32-row tile sees one scale
-    # value per output column.
-    sf_expanded = sf_kn.repeat_interleave(TILE, dim=0)
-    return sf_expanded.to(torch.bfloat16)
+    sf_kn = sf_f32.transpose(0, 1).contiguous()  # [Kb, N]
+    return sf_kn.to(torch.bfloat16)
 
 
 # -----------------------------------------------------------------------------
@@ -223,15 +216,19 @@ def _remap_bfp4_lattice_to_fp4_mags(b_tt: ttnn.Tensor) -> ttnn.Tensor:
 def fp4_gemm_via_bfp4(
     x_tt: ttnn.Tensor,           # bf16 [M, K] on device
     w_bfp4_tt: ttnn.Tensor,      # bfp4 [K, N] on device (matmul-order)
-    scale_tt: ttnn.Tensor,       # bf16 [K, N] on device (per-K-block scale, replicated within tile)
+    scale_compact_tt: ttnn.Tensor,  # bf16 [Kb, N] on device, Kb = K / FP4_BLOCK_K
 ) -> ttnn.Tensor:
     """Run y = x @ dequant(w_fp4, scale) on device, with weights stored at
     fp4 density (bfp4 storage) and zero numeric loss.
 
+    The scale is supplied compact: one row per fp4 K-block per output column.
+    We expand it to per-K-row [K, N] on device with repeat_interleave so the
+    matrix multiply only sees a regular bf16 multiply.
+
     Steps on device:
       1) typecast bfp4 → bf16 (transient L1/DRAM bf16 expansion of weight)
       2) algebraic remap: lattice values → fp4 e2m1 magnitudes
-      3) per-block scale multiply (broadcast across K within block)
+      3) repeat_interleave compact scale Kb→K, multiply
       4) bf16 @ bf16 matmul
 
     Returns bf16 [M, N].
@@ -242,9 +239,10 @@ def fp4_gemm_via_bfp4(
     # 2) remap bfp4 lattice {0, ±0.25, ..., ±1.75} -> fp4 mags {0, ±0.5, ..., ±6}
     w_remap = _remap_bfp4_lattice_to_fp4_mags(w_bf16)
 
-    # 3) apply per-K-block scale. scale_tt is [K, N] with each K-tile of 32 rows
-    #    holding the same per-output-column scale.
-    w_scaled = ttnn.multiply(w_remap, scale_tt)
+    # 3) expand compact scale [Kb, N] -> [K, N] then multiply
+    scale_expanded = ttnn.repeat_interleave(scale_compact_tt, repeats=FP4_BLOCK_K, dim=-2)
+    w_scaled = ttnn.multiply(w_remap, scale_expanded)
+    ttnn.deallocate(scale_expanded)
 
     # 4) matmul
     y = ttnn.matmul(x_tt, w_scaled)
@@ -299,8 +297,8 @@ def _test_shape(device, K: int, N: int, M: int = 32, threshold: float = 0.999):
     w_lat_nk = fp4_bytes_to_bfp4_lattice_bf16(w_fp4_nk_packed)   # [N, K] bf16, lattice values
     w_lat_kn = w_lat_nk.transpose(0, 1).contiguous()              # [K, N]
 
-    # Per-K-block scale, expanded to [K, N] for tile-aligned multiply.
-    scale_kn = expand_e8m0_scale_to_bf16_kn(w_sf_nk, K=K, N=N)   # [K, N] bf16
+    # Per-K-block scale stored compact [Kb, N]; device repeat_interleave at multiply.
+    scale_kn = expand_e8m0_scale_to_bf16_compact_kn(w_sf_nk, K=K, N=N)   # [Kb, N] bf16
 
     common = dict(
         layout=ttnn.TILE_LAYOUT,
