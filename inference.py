@@ -601,28 +601,23 @@ class MoE(nn.Module):
         # Rank 4 throughout: ttnn.eq / ttnn.clamp only support ranks 2/3/4.
 
         # Selection mask:
-        #   chip_ids   [1, 1, per_chip, 1]   sharded
+        #   chip_ids   [1, per_chip, 1, 1]   sharded (pre-shaped at offload)
         #   indices    [1, 1, 1, topk]       replicated
-        #   eq         [1, 1, per_chip, topk]
-        #   * weights  [1, 1, per_chip, topk]
-        #   sum -1     [1, 1, per_chip, 1]   = per-chip selection mask
-        chip_ids_4d = ttnn.reshape(
-            self._chip_local_ids_tt, [1, 1, per_chip, 1])
+        #   eq         [1, per_chip, 1, topk]
+        #   * weights  [1, per_chip, 1, topk]
+        #   sum -1     [1, per_chip, 1, 1]   = per-chip mask, already aligned
         weights_4d = ttnn.reshape(weights_tt, [1, 1, 1, topk])
         indices_int32 = (
             indices_tt if indices_tt.dtype == ttnn.int32
             else ttnn.typecast(indices_tt, ttnn.int32))
         indices_4d = ttnn.reshape(indices_int32, [1, 1, 1, topk])
-        match = ttnn.eq(indices_4d, chip_ids_4d)
+        match = ttnn.eq(indices_4d, self._chip_ids_4d_tt)
         match_bf16 = ttnn.typecast(match, ttnn.bfloat16)
         ttnn.deallocate(match)
         weighted = ttnn.multiply(weights_4d, match_bf16)
         ttnn.deallocate(match_bf16)
         mask = ttnn.sum(weighted, dim=-1, keepdim=True)
         ttnn.deallocate(weighted)
-        # Align mask with y's per_chip dim (dim=1 in matmul output).
-        mask_aligned = ttnn.reshape(mask, [1, per_chip, 1, 1])
-        ttnn.deallocate(mask)
 
         # Grouped MLP. Weights are [1, per_chip, K, N] sharded; ttnn.matmul
         # won't broadcast batch dims when one operand is all-1 and the
@@ -647,9 +642,9 @@ class MoE(nn.Module):
         y = _fp4_gemm_via_bfp4(ttnn, glu, self._w2_tt, self._w2_scale_tt)
         ttnn.deallocate(glu)
 
-        y_masked = ttnn.multiply(y, mask_aligned)  # [1, per_chip, 1, dim]
+        y_masked = ttnn.multiply(y, mask)  # [1, per_chip, 1, dim]
         ttnn.deallocate(y)
-        ttnn.deallocate(mask_aligned)
+        ttnn.deallocate(mask)
 
         # Sum across local experts: keepdim=True so result stays rank 4.
         y_local = ttnn.sum(y_masked, dim=1, keepdim=True)  # [1, 1, 1, dim]
@@ -4256,6 +4251,11 @@ class Model:
             ffn._w2_scale_tt = _load_s(paths["w2_scale"], kb_w2, dim)
             ffn._chip_local_ids_tt = _make_chip_local_ids_tt(
                 ttnn, mesh, mesh_shape, ffn.n_routed_experts)
+            # Pre-shape chip_ids to [1, per_chip, 1, 1]: matches the per_chip
+            # axis of the grouped MLP output (dim=1), so the per-call selection
+            # mask comes out aligned without a reshape.
+            ffn._chip_ids_4d_tt = ttnn.reshape(
+                ffn._chip_local_ids_tt, [1, n_per_chip, 1, 1])
             ffn._n_per_chip = n_per_chip
             for expert in ffn.experts:
                 expert.w1.weight.data = torch.empty(0)
