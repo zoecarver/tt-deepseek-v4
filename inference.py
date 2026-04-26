@@ -22,6 +22,7 @@ import json
 import time
 import argparse
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Tuple, Optional, Literal
 from functools import lru_cache
 from contextlib import contextmanager
@@ -515,12 +516,15 @@ class MoE(nn.Module):
         x_tt: [M, dim] bf16 device tensor (replicated). Must be M=1 (decode).
         Returns y_tt: [M, dim] bf16 device tensor.
 
-        For non-hash gates: one upload of x feeds both the device gate
-        and the device shared expert (was two from_torch calls before).
-        For hash gates: gate runs on host (vocab lookup), so we only
-        upload x once for the shared expert. In both cases the shared
-        expert output stays on device and is combined with the routed
-        sum via ttnn.add."""
+        Two routed-expert paths:
+          - Path D (cached, on-device): when offload_moe_routed_experts has
+            attached _w1_tt/_w1_scale_tt/... to this MoE and the gate is
+            non-hash. Per-chip 8-expert grouped MLP + selection-mask sum +
+            ttnn.all_reduce. No host transfers.
+          - Host fallback: readback x + (weights, indices), run torch
+            scatter loop, upload result. Used for hash-gate layers (vocab
+            lookup) and when no cache is attached.
+        """
         shared_dev = self.shared_experts
         ttnn = shared_dev._ttnn
         mesh = shared_dev.mesh
@@ -536,6 +540,19 @@ class MoE(nn.Module):
                 f"x_tt last dim {int(x_tt.shape[-1])} != self.dim {self.dim}"
             )
 
+        ttnn.copy(x_tt, shared_dev._x_upload_tt)
+        shared_out_tt = shared_dev.forward_device()
+
+        use_cached = (
+            getattr(self, "_w1_tt", None) is not None and not self.gate.hash
+        )
+        if use_cached:
+            gate_dev = self.gate._device_gate
+            ttnn.copy(x_tt, gate_dev._x_upload_tt)
+            weights_tt, indices_tt = gate_dev.forward_device()
+            return self._forward_device_routed_cached(
+                x_tt, weights_tt, indices_tt, shared_out_tt)
+
         x = _readback_replicated_2d(
             ttnn, x_tt, mesh, shared_dev.mesh_shape).to(torch.bfloat16)
 
@@ -549,9 +566,6 @@ class MoE(nn.Module):
                 ttnn, weights_tt, mesh, shared_dev.mesh_shape)[:M].float()
             indices = _readback_replicated_2d(
                 ttnn, indices_tt, mesh, shared_dev.mesh_shape)[:M].long()
-
-        ttnn.copy(x_tt, shared_dev._x_upload_tt)
-        shared_out_tt = shared_dev.forward_device()
 
         y_routed = torch.zeros(M, self.dim, dtype=torch.float32)
         counts = torch.bincount(
@@ -571,6 +585,98 @@ class MoE(nn.Module):
             mesh_mapper=upload_mapper,
         )
         return ttnn.add(y_routed_tt, shared_out_tt)
+
+    def _forward_device_routed_cached(
+        self, x_tt, weights_tt, indices_tt, shared_out_tt
+    ):
+        """Path D body: per-chip 8-expert grouped MLP + selection mask.
+
+        Inputs (all device tensors):
+          x_tt: bf16 [1, dim] replicated
+          weights_tt: bf16 [1, topk] replicated (gate output, normalized * route_scale)
+          indices_tt: int32 [1, topk] replicated
+          shared_out_tt: bf16 [1, dim] replicated (shared expert output)
+
+        Cached weights (attached by Model.offload_moe_routed_experts):
+          self._w1_tt:        bfp4_b [1, 1, per_chip, dim, inter] sharded
+          self._w1_scale_tt:  bf16   [1, 1, per_chip, dim/32, inter] sharded
+          self._w3_tt, self._w3_scale_tt: same shape as w1
+          self._w2_tt:        bfp4_b [1, 1, per_chip, inter, dim] sharded
+          self._w2_scale_tt:  bf16   [1, 1, per_chip, inter/32, dim] sharded
+          self._chip_local_ids_tt: int32 [1, 1, per_chip] sharded
+          self._n_per_chip: experts per chip (== n_routed_experts // mesh_size)
+
+        Returns: bf16 [1, dim] replicated.
+        """
+        ttnn = self.shared_experts._ttnn
+        per_chip = self._n_per_chip
+        topk = self.n_activated_experts
+        dim = self.dim
+
+        # Rank 4 throughout: ttnn.eq / ttnn.clamp only support ranks 2/3/4.
+
+        # Selection mask:
+        #   chip_ids   [1, 1, per_chip, 1]   sharded
+        #   indices    [1, 1, 1, topk]       replicated
+        #   eq         [1, 1, per_chip, topk]
+        #   * weights  [1, 1, per_chip, topk]
+        #   sum -1     [1, 1, per_chip, 1]   = per-chip selection mask
+        chip_ids_4d = ttnn.reshape(
+            self._chip_local_ids_tt, [1, 1, per_chip, 1])
+        weights_4d = ttnn.reshape(weights_tt, [1, 1, 1, topk])
+        indices_int32 = (
+            indices_tt if indices_tt.dtype == ttnn.int32
+            else ttnn.typecast(indices_tt, ttnn.int32))
+        indices_4d = ttnn.reshape(indices_int32, [1, 1, 1, topk])
+        match = ttnn.eq(indices_4d, chip_ids_4d)
+        match_bf16 = ttnn.typecast(match, ttnn.bfloat16)
+        ttnn.deallocate(match)
+        weighted = ttnn.multiply(weights_4d, match_bf16)
+        ttnn.deallocate(match_bf16)
+        mask = ttnn.sum(weighted, dim=-1, keepdim=True)
+        ttnn.deallocate(weighted)
+        # Align mask with y's per_chip dim (dim=1 in matmul output).
+        mask_aligned = ttnn.reshape(mask, [1, per_chip, 1, 1])
+        ttnn.deallocate(mask)
+
+        # Grouped MLP. Weights are [1, per_chip, K, N] sharded; ttnn.matmul
+        # won't broadcast batch dims when one operand is all-1 and the
+        # other isn't, so we repeat x along the per_chip dim explicitly.
+        x_4d = ttnn.reshape(x_tt, [1, 1, 1, dim])
+        x_grouped = ttnn.repeat(x_4d, [1, per_chip, 1, 1])  # [1, per_chip, 1, dim]
+        y1 = _fp4_gemm_via_bfp4(
+            ttnn, x_grouped, self._w1_tt, self._w1_scale_tt)
+        y3 = _fp4_gemm_via_bfp4(
+            ttnn, x_grouped, self._w3_tt, self._w3_scale_tt)
+        ttnn.deallocate(x_grouped)
+        if self.experts[0].swiglu_limit > 0:
+            limit = float(self.experts[0].swiglu_limit)
+            ttnn.clamp(y1, max=limit, output_tensor=y1)
+            ttnn.clamp(y3, min=-limit, max=limit, output_tensor=y3)
+        silu_y1 = ttnn.silu(y1)
+        ttnn.deallocate(y1)
+        glu = ttnn.multiply(silu_y1, y3)  # [1, per_chip, 1, inter]
+        ttnn.deallocate(silu_y1)
+        ttnn.deallocate(y3)
+
+        y = _fp4_gemm_via_bfp4(ttnn, glu, self._w2_tt, self._w2_scale_tt)
+        ttnn.deallocate(glu)
+
+        y_masked = ttnn.multiply(y, mask_aligned)  # [1, per_chip, 1, dim]
+        ttnn.deallocate(y)
+        ttnn.deallocate(mask_aligned)
+
+        # Sum across local experts: keepdim=True so result stays rank 4.
+        y_local = ttnn.sum(y_masked, dim=1, keepdim=True)  # [1, 1, 1, dim]
+        ttnn.deallocate(y_masked)
+
+        # All-reduce across the (rows*cols) mesh: full 256-expert sum.
+        y_full = ttnn.all_reduce(y_local)
+        ttnn.deallocate(y_local)
+
+        y_2d = ttnn.reshape(y_full, [1, dim])
+        ttnn.deallocate(y_full)
+        return ttnn.add(y_2d, shared_out_tt)
 
 
 class Block(nn.Module):
@@ -662,8 +768,9 @@ def _block_forward(layer, x, start_pos: int,
         )
         x_post_input = ttnn.reshape(
             x_padded, [num_tokens * _MHC_TILE, hidden])
-        x_post_input_fp32 = ttnn.typecast(x_post_input, dtype=ttnn.float32)
-        post_out_tt = mhc_attn.hc_post_device(num_tokens, x_tt=x_post_input_fp32)
+        ttnn.typecast(x_post_input, dtype=ttnn.float32,
+                      output_tensor=mhc_attn._x_upload_tt)
+        post_out_tt = mhc_attn.hc_post_device(num_tokens)
 
     with _phase("block.hc_pre"):
         a_input_tt = _mhc_post_to_a_tt(
@@ -687,9 +794,9 @@ def _block_forward(layer, x, start_pos: int,
         )
         x_post_input = ttnn.reshape(
             x_padded, [num_tokens * _MHC_TILE, hidden])
-        x_post_input_fp32 = ttnn.typecast(x_post_input, dtype=ttnn.float32)
-        ffn_post_out_tt = mhc_ffn.hc_post_device(
-            num_tokens, x_tt=x_post_input_fp32)
+        ttnn.typecast(x_post_input, dtype=ttnn.float32,
+                      output_tensor=mhc_ffn._x_upload_tt)
+        ffn_post_out_tt = mhc_ffn.hc_post_device(num_tokens)
         return _mhc_post_to_a_tt(
             ttnn, ffn_post_out_tt, num_tokens, num_tokens_pad, mhc, hidden)
 
@@ -3504,6 +3611,87 @@ def _readback_replicated_2d(ttnn, tensor_tt, mesh, mesh_shape):
     return raw[slicer]
 
 
+# Inlined from tt-lang-kernels/fp4_gemm.py. Used by the cached routed-expert
+# path (Model.offload_moe_routed_experts -> MoE._forward_device_routed_cached).
+# The cache stores fp4 e2m1 nibbles bit-cast as bfp4_b (lossless via the bfp4
+# lattice trick); the algebraic remap below recovers fp4 magnitudes on device.
+FP4_BLOCK_K = 32
+
+
+def _remap_bfp4_lattice_to_fp4_mags(ttnn, b_tt):
+    """f(b) = 2b + 2(relu(b-1) - relu(-b-1)) + 4(relu(b-1.5) - relu(-b-1.5))
+
+    Maps the bfp4 lattice {0, ±0.25, ..., ±1.75} (what gets stored when we
+    feed our lattice bf16 values to ttnn.from_torch(dtype=bfloat4_b)) back to
+    fp4 e2m1 magnitudes {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}. Verified by hand
+    for all 16 lattice values."""
+    two_b = ttnn.multiply(b_tt, 2.0)
+    pos1 = ttnn.relu(ttnn.subtract(b_tt, 1.0))
+    neg1 = ttnn.relu(ttnn.subtract(ttnn.neg(b_tt), 1.0))
+    step1 = ttnn.multiply(ttnn.subtract(pos1, neg1), 2.0)
+    pos15 = ttnn.relu(ttnn.subtract(b_tt, 1.5))
+    neg15 = ttnn.relu(ttnn.subtract(ttnn.neg(b_tt), 1.5))
+    step15 = ttnn.multiply(ttnn.subtract(pos15, neg15), 4.0)
+    return ttnn.add(ttnn.add(two_b, step1), step15)
+
+
+def _fp4_gemm_via_bfp4(ttnn, x_tt, w_bfp4_tt, scale_compact_tt):
+    """y = x @ dequant(w_fp4, scale).
+
+    Shape-agnostic in the leading dims: works for both 2D (single-expert
+    [K, N] @ [..., K]) and 5D grouped-expert ([1, 1, E, K, N] @
+    [1, 1, 1, 1, K]) layouts. The leading dims of x and w broadcast.
+
+    x_tt: bf16, last-dim-K matching the weight.
+    w_bfp4_tt: bfp4_b [..., K, N] (matmul order), tile layout.
+    scale_compact_tt: bf16 [..., Kb, N] with Kb = K / FP4_BLOCK_K.
+
+    Steps (all on device):
+      1) typecast bfp4 -> bf16 (lossless; lattice values are bf16-exact)
+      2) algebraic remap: bfp4 lattice -> fp4 e2m1 magnitudes
+      3) repeat_interleave the compact scale Kb -> K, multiply
+      4) bf16 @ bf16 matmul
+
+    Per-step / per-layer / per-weight; called 240x per decode step (40 MoE
+    layers x 6 = w1/w1s + w3/w3s + w2/w2s). Explicit deallocates on every
+    intermediate so DRAM doesn't drift across the step.
+    """
+    w_bf16 = ttnn.typecast(w_bfp4_tt, ttnn.bfloat16)
+    w_remap = _remap_bfp4_lattice_to_fp4_mags(ttnn, w_bf16)
+    ttnn.deallocate(w_bf16)
+    scale_expanded = ttnn.repeat_interleave(
+        scale_compact_tt, repeats=FP4_BLOCK_K, dim=-2)
+    w_scaled = ttnn.multiply(w_remap, scale_expanded)
+    ttnn.deallocate(w_remap)
+    ttnn.deallocate(scale_expanded)
+    y_tt = ttnn.matmul(x_tt, w_scaled)
+    ttnn.deallocate(w_scaled)
+    return y_tt
+
+
+def _make_chip_local_ids_tt(ttnn, mesh, mesh_shape, n_experts: int):
+    """[rows, cols, per_chip] int32 sharded over (rows, cols).
+
+    chip(r, c) sees [per_chip] = [r*cols*per_chip + c*per_chip + i for i].
+    Used by Path D selection mask: an indices == chip_local_ids broadcast
+    comparison gives a per-chip [per_chip, topk] match matrix on each chip.
+    """
+    rows, cols = mesh_shape
+    if n_experts % (rows * cols) != 0:
+        raise ValueError(
+            f"n_experts={n_experts} not divisible by mesh size {rows*cols}")
+    per_chip = n_experts // (rows * cols)
+    ids = torch.arange(n_experts, dtype=torch.int32).view(rows, cols, per_chip).contiguous()
+    return ttnn.from_torch(
+        ids,
+        device=mesh,
+        dtype=ttnn.int32,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=ttnn.ShardTensor2dMesh(mesh, (rows, cols), dims=(0, 1)),
+    )
+
+
 def _close_mesh(mesh):
     import ttnn
     ttnn.close_mesh_device(mesh)
@@ -4019,6 +4207,99 @@ class Model:
             self._device_indexers.append(di)
             self._device_compressors.append(ix_dc)
 
+    def offload_moe_routed_experts(self, mesh):
+        """Attach cached bfp4_b routed-expert weights to every non-hash MoE
+        layer, plus the per-chip expert-ID lookup used by Path D selection.
+
+        Cache layout (produced by scripts/preprocess_routed_experts.py):
+          {cache_dir}/layer_{L:03d}/{w1,w1_scale,w2,w2_scale,w3,w3_scale}.tensorbin
+
+        Each .tensorbin holds a [rows, cols, per_chip, K, N] tensor sharded
+        with ShardTensor2dMesh(dims=(0, 1)) for the (rows, cols) mesh, so
+        ttnn.load_tensor returns a 5D device tensor that's already laid out
+        for grouped-expert matmul.
+
+        Hash-gate layers (layer_id < args.n_hash_layers) are skipped: the
+        preprocess does not cover them, so they keep the host fallback in
+        MoE.forward_device.
+
+        Cache directory comes from $DS_ROUTED_EXPERT_CACHE; defaults to
+        /home/ubuntu/hf/state_dict_bfp4_routed.
+        """
+        import ttnn
+        cache_dir = os.environ.get(
+            "DS_ROUTED_EXPERT_CACHE", "/home/ubuntu/hf/state_dict_bfp4_routed")
+        cache_dir = Path(cache_dir)
+        if not cache_dir.is_dir():
+            raise FileNotFoundError(
+                f"routed-expert cache dir not found: {cache_dir}. Run "
+                f"scripts/preprocess_routed_experts.py to populate it, or "
+                f"set $DS_ROUTED_EXPERT_CACHE to its location.")
+        mesh_shape = tuple(mesh.shape)
+        rows, cols = mesh_shape
+        n_chips = rows * cols
+        self._device_routed_experts = []
+        for layer in self.transformer.layers:
+            ffn = layer.ffn
+            if not isinstance(ffn, MoE):
+                continue
+            if ffn.gate.hash:
+                continue
+            n_per_chip = ffn.n_routed_experts // n_chips
+            if ffn.n_routed_experts % n_chips != 0:
+                raise ValueError(
+                    f"layer {layer.layer_id}: n_routed_experts="
+                    f"{ffn.n_routed_experts} not divisible by mesh size "
+                    f"{n_chips}")
+            layer_dir = cache_dir / f"layer_{layer.layer_id:03d}"
+            paths = {
+                name: layer_dir / f"{name}.tensorbin"
+                for name in ("w1", "w1_scale", "w2", "w2_scale",
+                             "w3", "w3_scale")
+            }
+            for name, path in paths.items():
+                if not path.is_file():
+                    raise FileNotFoundError(
+                        f"layer {layer.layer_id}: missing {path}")
+            # Cache was dumped as rank 5 [rows, cols, per_chip, K, N]; the
+            # loader's per-chip view depends on TTNN's sharded-load convention
+            # (may be rank 5 with sharded dims kept as 1, or rank 3 with
+            # sharded dims dropped). Reshape to rank 4 [1, per_chip, K, N]
+            # so downstream ops (which max out at rank 4) are happy.
+            dim = ffn.dim
+            # Expert.w1.weight is [inter, dim] (out, in); shape[0] is inter.
+            # Read it before the post-load cleanup loop zeroes the CPU weights.
+            inter = ffn.experts[0].w1.weight.shape[0]
+            kb_w1 = dim // FP4_BLOCK_K
+            kb_w2 = inter // FP4_BLOCK_K
+
+            def _load_w(ttnn_path, K, N):
+                t = ttnn.load_tensor(str(ttnn_path), device=mesh)
+                return ttnn.reshape(t, [1, n_per_chip, K, N])
+
+            def _load_s(ttnn_path, Kb, N):
+                t = ttnn.load_tensor(str(ttnn_path), device=mesh)
+                return ttnn.reshape(t, [1, n_per_chip, Kb, N])
+
+            ffn._w1_tt = _load_w(paths["w1"], dim, inter)
+            ffn._w1_scale_tt = _load_s(paths["w1_scale"], kb_w1, inter)
+            ffn._w3_tt = _load_w(paths["w3"], dim, inter)
+            ffn._w3_scale_tt = _load_s(paths["w3_scale"], kb_w1, inter)
+            ffn._w2_tt = _load_w(paths["w2"], inter, dim)
+            ffn._w2_scale_tt = _load_s(paths["w2_scale"], kb_w2, dim)
+            ffn._chip_local_ids_tt = _make_chip_local_ids_tt(
+                ttnn, mesh, mesh_shape, ffn.n_routed_experts)
+            ffn._n_per_chip = n_per_chip
+            for expert in ffn.experts:
+                expert.w1.weight.data = torch.empty(0)
+                expert.w2.weight.data = torch.empty(0)
+                expert.w3.weight.data = torch.empty(0)
+                if hasattr(expert.w1, "scale"):
+                    expert.w1.scale.data = torch.empty(0)
+                    expert.w2.scale.data = torch.empty(0)
+                    expert.w3.scale.data = torch.empty(0)
+            self._device_routed_experts.append(ffn)
+
     def offload_moe_gate(self, mesh):
         """Move every non-hash MoE gate to the 1xN mesh.
 
@@ -4322,6 +4603,7 @@ def main():
         ("wo_b", model.offload_attn_wo_b),
         ("moe_gate", model.offload_moe_gate),
         ("moe_shared_expert", model.offload_moe_shared_expert),
+        ("moe_routed_experts", model.offload_moe_routed_experts),
         ("rms_norms", model.offload_rms_norms),
         ("embedding", model.offload_embedding),
         ("compressor_linears", model.offload_compressor_linears),
