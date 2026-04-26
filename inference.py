@@ -495,21 +495,6 @@ class MoE(nn.Module):
         assert args.n_shared_experts == 1
         self.shared_experts = Expert(args.dim, args.moe_inter_dim)
 
-    def forward(self, x: torch.Tensor, input_ids: torch.Tensor):
-        shape = x.size()
-        x = x.view(-1, self.dim)
-        weights, indices = self.gate(x, input_ids.flatten())
-        y = torch.zeros_like(x, dtype=torch.float32)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-        for i in range(self.n_routed_experts):
-            if counts[i] == 0:
-                continue
-            expert = self.experts[i]
-            idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx], weights[idx, top, None])
-        y += self.shared_experts(x)
-        return y.type_as(x).view(shape)
-
     def forward_device(self, x_tt, input_ids: torch.Tensor):
         """Device-in / device-out MoE for the chained block path.
 
@@ -701,25 +686,6 @@ class Block(nn.Module):
             self.hc_attn_scale = nn.Parameter(torch.empty(3))
             self.hc_ffn_scale = nn.Parameter(torch.empty(3))
 
-    def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]):
-        B, S, mhc, hidden = x.shape
-        mhc_attn = self._device_mhc_attn
-        ttnn = mhc_attn._ttnn
-        num_tokens = B * S
-        num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
-        a_packed = _mhc_pack_residual(x, num_tokens_pad)
-        host_mesh = ttnn.from_torch(
-            a_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
-            mesh_mapper=mhc_attn._upload_mapper,
-        )
-        ttnn.copy_host_to_device_tensor(host_mesh, mhc_attn._a_upload_tt)
-        out_tt = _block_forward(self, mhc_attn._a_upload_tt, start_pos,
-                                input_ids, B, S, mhc, hidden, x.dtype)
-        out_packed = _readback_replicated_2d(
-            ttnn, out_tt, mhc_attn.mesh, mhc_attn.mesh_shape)
-        y = _mhc_unpack_a_tt(out_packed, num_tokens, mhc, hidden)
-        return y.view(B, S, mhc, hidden).to(x.dtype)
-
 
 def _block_forward(layer, x, start_pos: int,
                    input_ids: Optional[torch.Tensor],
@@ -737,7 +703,8 @@ def _block_forward(layer, x, start_pos: int,
       - layer._device_mhc_attn / layer._device_mhc_ffn: DeviceMHC instances
       - layer.attn_norm.forward / layer.ffn_norm.forward: DeviceRMSNorm
       - layer.attn.forward: DeviceAttention.forward (decode-only)
-      - layer.ffn.forward: MoE host loop with device gate / shared expert
+      - layer.ffn.forward_device: cached Path D for non-hash layers, host
+        fallback only for hash-gate layers (layer_id < n_hash_layers).
     """
     mhc_attn = layer._device_mhc_attn
     mhc_ffn = layer._device_mhc_ffn
