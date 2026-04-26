@@ -49,17 +49,32 @@ default_dtype = torch.bfloat16
 # inclusive of its instrumented subregions" and only compare sibling phases.
 _PHASE_ACCUM: dict[str, float] = {}
 _PHASE_COUNTS: dict[str, int] = {}
+# When set, called at the start and end of every _phase() to flush the device
+# command queue. Without this, ttnn ops are non-blocking and a phase's wall
+# time captures dispatch overhead instead of compute, with the actual work
+# bleeding into the next phase. Costs ~one synchronize_device per region but
+# makes the per-phase shares trustworthy. Set by main() once the mesh opens.
+_PHASE_SYNC = None
 
 
 @contextmanager
 def _phase(name: str):
+    if _PHASE_SYNC is not None:
+        _PHASE_SYNC()
     t0 = time.perf_counter()
     try:
         yield
     finally:
+        if _PHASE_SYNC is not None:
+            _PHASE_SYNC()
         dt = time.perf_counter() - t0
         _PHASE_ACCUM[name] = _PHASE_ACCUM.get(name, 0.0) + dt
         _PHASE_COUNTS[name] = _PHASE_COUNTS.get(name, 0) + 1
+
+
+def _set_phase_sync(fn):
+    global _PHASE_SYNC
+    _PHASE_SYNC = fn
 
 
 def _phase_report() -> str:
@@ -4557,6 +4572,9 @@ def main():
     t0 = time.time()
     mesh = _open_mesh()
     print(f"[phase] mesh opened in {time.time() - t0:.1f}s")
+
+    import ttnn
+    _set_phase_sync(lambda: ttnn.synchronize_device(mesh))
 
     n_layers = len(model.transformer.layers)
     print("[phase] sharding lm_head on mesh ...")
