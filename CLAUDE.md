@@ -147,6 +147,7 @@ Ideas for optimization:
 * Try things measure perf, if you have a crazy idea try it and revert if it doesn't work.
 * If you can think of a creative way to improve moe routing, great, but lower priority.
 * Currently we use nn.Module, but this might add some overhead, we could restructure to just use vanilla python for classes and functions. This might be a lot cleaner and better and not allow there to be any implicit lifecycle (inits being called too much) or graph building that might add overhead. At some point I'd like you to refactor to just super simple clean python functions that are called in loops and can be organized in classes if you'd like.
+* You are now on galaxy, you can use it! We have 32 cards, see how much you can distribute work across the mesh :)
 
 ## References
 
@@ -181,3 +182,5 @@ When setting timeouts, make them 1-2 minutes. The model should take 2-4 minutes 
 Do not automatically fall back to cpu if imports are not available, just error and exit. We should trust this will only be run on a device with ttnn and ttlang set up.
 
 IMPORTANT regarding optimization: you are NOT allowed to remove tt-lang kernels or move logic from tt-lang to ttnn or host. If you think that you need to stop using a tt-lang kernel for some reason, pause and ask the user. You are allowed to (and encouraged to) move more to tt-lang (from host or ttnn), fuse tt-lang kernels, and optimize tt-lang kernels. Similarly, if you need to move logic from device to host (eg from ttnn/ttlang to torch), you must stop and ask the user. Even if this is a short term gain, it will not bear out eventually once all logic is on device and traced.
+
+LATEST STATUS: you are now running on a galaxy, your job is to get tok/s as fast as possible while validation passes. You are still not allowed to move things from tt-lang -> ttnn/host. You are still encouraged to write MORE tt-lang and fuse things using tt-lang. You can use all.conf remote config to prototype kernels or prototype them on galaxy. You have carte-blance to make this model sing (apart from the tt-lang usage requirement).
