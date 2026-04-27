@@ -1067,12 +1067,23 @@ class DeviceLMHead:
 
 
 class DeviceColLinear(nn.Module):
-    """Column-parallel linear across a 1xN mesh.
+    """Column-parallel linear across the mesh.
 
-    Weight: [out, in] (nn.Linear order). Transposed to [in, out] for ttnn,
-    column-sharded on the output dim: each chip holds [in, out/N]. Output
-    is gathered (concat on last dim) back to host as bf16.
+    Weight: [out, in] (nn.Linear order). Transposed to [in, out] for ttnn.
+    Auto-selects sharding based on out_dim:
+      - **Full-mesh (TP=N)**: when `out_dim % (num_chips * TILE) == 0`, shard
+        the out axis 1D-flat across all 32 chips. Each chip holds
+        [in, out/N]. After matmul, two sequential all_gathers (cluster_axis=1
+        then cluster_axis=0) reconstruct the full out_dim replicated across
+        the mesh.
+      - **Cols-only (TP=cols)**: otherwise, fall back to the original 8-chip
+        col-shard. Each chip holds [in, out/cols], with 4x replication on
+        the row axis. After matmul, one all_gather on cluster_axis=1.
+    Output is replicated [1, 1, out_dim] in either mode, same calling
+    contract.
     """
+
+    _TILE = 32
 
     def __init__(self, mesh, cpu_weight: torch.Tensor):
         super().__init__()
@@ -1080,11 +1091,17 @@ class DeviceColLinear(nn.Module):
         self._ttnn = ttnn
         self.mesh = mesh
         self.mesh_shape = tuple(mesh.shape)
+        n_rows, n_cols = self.mesh_shape
+        num_chips = n_rows * n_cols
         out_dim, in_dim = cpu_weight.shape
-        if out_dim % self.mesh_shape[1] != 0:
+        if out_dim % n_cols != 0:
             raise ValueError(
-                f"col-linear out_dim {out_dim} not divisible by mesh axis 1 {self.mesh_shape[1]}"
+                f"col-linear out_dim {out_dim} not divisible by mesh cols {n_cols}"
             )
+        # Pick the finest shard that keeps each chip's slice tile-aligned.
+        full_mesh = (out_dim % (num_chips * self._TILE) == 0)
+        self._full_mesh = full_mesh
+        self._n_shards = num_chips if full_mesh else n_cols
         self.in_dim = in_dim
         self.out_dim = out_dim
         w_io = _weight_to_bf16(cpu_weight).transpose(0, 1).contiguous()  # [in, out]
@@ -1094,20 +1111,28 @@ class DeviceColLinear(nn.Module):
             layout=ttnn.TILE_LAYOUT,
             dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1)),
+            mesh_mapper=self._w_mapper(),
         )
         self._alloc_decode_tensors()
 
+    def _w_mapper(self):
+        ttnn = self._ttnn
+        if self._full_mesh:
+            return ttnn.ShardTensorToMesh(self.mesh, dim=-1)
+        return ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(None, -1))
+
     def _alloc_decode_tensors(self):
         """Pre-allocate per-step output buffers for [B=1, S=1, out_dim]
-        decode. forward_device's matmul + all_gather both write in place."""
+        decode. The intermediate `_row_gathered_tt` is only used in the
+        full-mesh path (after all_gather cluster_axis=1, before
+        cluster_axis=0); skip it in the cols-only path."""
         ttnn = self._ttnn
         zeros = torch.zeros(1, 1, self.out_dim, dtype=torch.bfloat16)
         self._matmul_out_tt = ttnn.from_torch(
             zeros,
             device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(None, -1)),
+            mesh_mapper=self._w_mapper(),
         )
         self._gather_out_tt = ttnn.from_torch(
             zeros,
@@ -1115,6 +1140,19 @@ class DeviceColLinear(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
+        if self._full_mesh:
+            # After cluster_axis=1 gather, each row holds n_cols × per-chip
+            # contiguous out values, replicated across cols within the row.
+            # Shard tensor dim -1 across rows (axis 0 of mesh), replicate on
+            # cols. The next all_gather (cluster_axis=0) collapses this into
+            # _gather_out_tt.
+            self._row_gathered_tt = ttnn.from_torch(
+                zeros,
+                device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ShardTensor2dMesh(
+                    self.mesh, self.mesh_shape, dims=(-1, None)),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ttnn = self._ttnn
@@ -1128,10 +1166,11 @@ class DeviceColLinear(nn.Module):
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
         y_tt = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        y = ttnn.to_torch(
-            y_tt,
-            mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(0, -1)),
-        )
+        if self._full_mesh:
+            composer = ttnn.ConcatMeshToTensor(self.mesh, dim=-1)
+        else:
+            composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(0, -1))
+        y = ttnn.to_torch(y_tt, mesh_composer=composer)
         if y.shape[0] != B:
             y = y[:B]
         if y.shape[1] != S:
@@ -1140,14 +1179,21 @@ class DeviceColLinear(nn.Module):
 
     def forward_device(self, x_tt) -> "object":
         """Device-only path. x_tt: replicated input [1, 1, in_dim]. Returns
-        replicated output [1, 1, out_dim] via all_gather along the sharded
-        col axis (cluster_axis=1 on a (4, 8) Galaxy mesh). Output buffers
-        are pre-allocated; both ops write in place."""
+        replicated output [1, 1, out_dim]. In TP=N mode the gather is two
+        sequential all_gathers (cluster_axis=1 then cluster_axis=0); in
+        TP=cols mode it's a single cluster_axis=1 gather. Output buffers
+        are pre-allocated; all ops write in place."""
         ttnn = self._ttnn
         ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._matmul_out_tt)
-        ttnn.all_gather(self._matmul_out_tt, dim=-1, cluster_axis=1, num_links=1,
-                        output_tensor=self._gather_out_tt)
+        if self._full_mesh:
+            ttnn.all_gather(self._matmul_out_tt, dim=-1, cluster_axis=1,
+                            num_links=1, output_tensor=self._row_gathered_tt)
+            ttnn.all_gather(self._row_gathered_tt, dim=-1, cluster_axis=0,
+                            num_links=1, output_tensor=self._gather_out_tt)
+        else:
+            ttnn.all_gather(self._matmul_out_tt, dim=-1, cluster_axis=1,
+                            num_links=1, output_tensor=self._gather_out_tt)
         return self._gather_out_tt
 
 
