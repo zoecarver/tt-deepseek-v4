@@ -4030,50 +4030,52 @@ class DeviceAttention(nn.Module):
             )
 
         # Q path: wq_a -> q_norm -> wq_b -> per-head rsqrt-norm -> rotary.
-        q_lora_tt = attn.wq_a.forward_device(x_tt)            # [B, S, q_lora_rank]
-        # q_norm: needs a [Mpad, hidden] device tensor. Reshape and pad-on-device.
-        q_lora_2d = ttnn.reshape(q_lora_tt, [B * S, self.q_lora_rank])
-        qr_2d = self._rmsnorm_device(self.q_norm_dev, q_lora_2d, B * S)
-        qr_tt = ttnn.reshape(qr_2d, [B, S, self.q_lora_rank])
+        with _phase("attn.q"):
+            q_lora_tt = attn.wq_a.forward_device(x_tt)            # [B, S, q_lora_rank]
+            # q_norm: needs a [Mpad, hidden] device tensor. Reshape and pad-on-device.
+            q_lora_2d = ttnn.reshape(q_lora_tt, [B * S, self.q_lora_rank])
+            qr_2d = self._rmsnorm_device(self.q_norm_dev, q_lora_2d, B * S)
+            qr_tt = ttnn.reshape(qr_2d, [B, S, self.q_lora_rank])
 
-        q_full_tt = attn.wq_b.forward_device(qr_tt)           # [B, S, H*D]
-        q_tt = ttnn.reshape(q_full_tt, [B, S, H, D])
-        q_tt = _device_q_rsqrt_norm(ttnn, q_tt, self.eps)
+            q_full_tt = attn.wq_b.forward_device(qr_tt)           # [B, S, H*D]
+            q_tt = ttnn.reshape(q_full_tt, [B, S, H, D])
+            q_tt = _device_q_rsqrt_norm(ttnn, q_tt, self.eps)
 
-        cos_q, sin_q = self._rotary_tables(start_pos, S, q_dims=4)
-        # Rotate q[..., -rd:] by slicing -> rotating -> concatenating.
-        ttnn.slice(q_tt, [0, 0, 0, 0], [B, S, H, D - rd],
-                   output_tensor=self._q_nope_scratch_tt)
-        ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, S, H, D],
-                   output_tensor=self._q_rope_scratch_tt)
-        q_rope = _device_apply_rotary_interleaved(
-            ttnn, self._q_rope_scratch_tt, cos_q, sin_q, inverse=False)
-        q_tt = ttnn.concat([self._q_nope_scratch_tt, q_rope], dim=-1)
+            cos_q, sin_q = self._rotary_tables(start_pos, S, q_dims=4)
+            # Rotate q[..., -rd:] by slicing -> rotating -> concatenating.
+            ttnn.slice(q_tt, [0, 0, 0, 0], [B, S, H, D - rd],
+                       output_tensor=self._q_nope_scratch_tt)
+            ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, S, H, D],
+                       output_tensor=self._q_rope_scratch_tt)
+            q_rope = _device_apply_rotary_interleaved(
+                ttnn, self._q_rope_scratch_tt, cos_q, sin_q, inverse=False)
+            q_tt = ttnn.concat([self._q_nope_scratch_tt, q_rope], dim=-1)
 
         # KV path: wkv -> kv_norm -> rotary.
-        kv_tt = attn.wkv.forward_device(x_tt)                 # [B, S, D]
-        kv_2d = ttnn.reshape(kv_tt, [B * S, D])
-        kv_2d = self._rmsnorm_device(self.kv_norm_dev, kv_2d, B * S)
-        kv_tt = ttnn.reshape(kv_2d, [B, S, D])
-        cos_kv, sin_kv = self._rotary_tables(start_pos, S, q_dims=3)
-        ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd],
-                   output_tensor=self._kv_nope_scratch_tt)
-        ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D],
-                   output_tensor=self._kv_rope_scratch_tt)
-        kv_rope = _device_apply_rotary_interleaved(
-            ttnn, self._kv_rope_scratch_tt, cos_kv, sin_kv, inverse=False)
-        kv_tt = ttnn.concat([self._kv_nope_scratch_tt, kv_rope], dim=-1)
+        with _phase("attn.kv"):
+            kv_tt = attn.wkv.forward_device(x_tt)                 # [B, S, D]
+            kv_2d = ttnn.reshape(kv_tt, [B * S, D])
+            kv_2d = self._rmsnorm_device(self.kv_norm_dev, kv_2d, B * S)
+            kv_tt = ttnn.reshape(kv_2d, [B, S, D])
+            cos_kv, sin_kv = self._rotary_tables(start_pos, S, q_dims=3)
+            ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd],
+                       output_tensor=self._kv_nope_scratch_tt)
+            ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D],
+                       output_tensor=self._kv_rope_scratch_tt)
+            kv_rope = _device_apply_rotary_interleaved(
+                ttnn, self._kv_rope_scratch_tt, cos_kv, sin_kv, inverse=False)
+            kv_tt = ttnn.concat([self._kv_nope_scratch_tt, kv_rope], dim=-1)
 
-        # Device-side act_quant on the nope region (bf16 round-trip; no fp8
-        # cast under the bf16-everywhere precision policy). After this, kv_tt
-        # mirrors what CPU `act_quant(..., inplace=True)` would produce in bf16.
-        kv_nope_q = _device_act_quant_block(
-            ttnn,
-            ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd]),
-            block_size=64,
-        )
-        kv_rope_only = ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D])
-        kv_tt = ttnn.concat([kv_nope_q, kv_rope_only], dim=-1)
+            # Device-side act_quant on the nope region (bf16 round-trip; no fp8
+            # cast under the bf16-everywhere precision policy). After this, kv_tt
+            # mirrors what CPU `act_quant(..., inplace=True)` would produce in bf16.
+            kv_nope_q = _device_act_quant_block(
+                ttnn,
+                ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd]),
+                block_size=64,
+            )
+            kv_rope_only = ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D])
+            kv_tt = ttnn.concat([kv_nope_q, kv_rope_only], dim=-1)
 
         # Build the topk index tensor entirely on device.
         # Window slot indices are sliced from the precomputed
@@ -4082,86 +4084,92 @@ class DeviceAttention(nn.Module):
         #  * device_indexer present: device-side score reduce -> ttnn.topk.
         #  * device_indexer absent (compress_ratio in {2, 128, ...}): slice
         #    the precomputed [win, win+1, ..., win+max_T-1] ramp on device.
-        win_row = _window_topk_row_for_pos(start_pos, win)
-        topk_idxs_dev = ttnn.slice(
-            self._win_idxs_table_tt,
-            [0, win_row, 0], [B, win_row + 1, win],
-        )
-        topk_idxs_dev_K = win
-        if self.compress_ratio:
-            T_active = (start_pos + 1) // self.compress_ratio
-            if T_active > 0:
-                if device_indexer is not None:
-                    score_tt = device_indexer.forward_device_score(
-                        x_tt, qr_tt, B, start_pos
+        with _phase("attn.topk"):
+            win_row = _window_topk_row_for_pos(start_pos, win)
+            topk_idxs_dev = ttnn.slice(
+                self._win_idxs_table_tt,
+                [0, win_row, 0], [B, win_row + 1, win],
+            )
+            topk_idxs_dev_K = win
+            if self.compress_ratio:
+                T_active = (start_pos + 1) // self.compress_ratio
+                if T_active > 0:
+                    if device_indexer is not None:
+                        with _phase("attn.topk.indexer"):
+                            score_tt = device_indexer.forward_device_score(
+                                x_tt, qr_tt, B, start_pos
+                            )
+                            k = min(device_indexer.index_topk, T_active)
+                            score_valid_tt = ttnn.slice(
+                                score_tt, [0, 0, 0], [B, S, T_active])
+                            _, cmp_idxs_tt = ttnn.topk(
+                                score_valid_tt, k=k, dim=-1,
+                                largest=True, sorted=True)
+                            cmp_idxs_int = ttnn.typecast(cmp_idxs_tt, dtype=ttnn.int32)
+                            cmp_idxs_int = ttnn.add(cmp_idxs_int, win)
+                    else:
+                        cmp_idxs_int = ttnn.slice(
+                            self._compress_idxs_ramp_tt,
+                            [0, 0, 0], [B, S, T_active],
+                        )
+                        k = T_active
+                    topk_idxs_dev = ttnn.concat(
+                        [topk_idxs_dev, cmp_idxs_int], dim=-1
                     )
-                    k = min(device_indexer.index_topk, T_active)
-                    score_valid_tt = ttnn.slice(
-                        score_tt, [0, 0, 0], [B, S, T_active])
-                    _, cmp_idxs_tt = ttnn.topk(
-                        score_valid_tt, k=k, dim=-1,
-                        largest=True, sorted=True)
-                    cmp_idxs_int = ttnn.typecast(cmp_idxs_tt, dtype=ttnn.int32)
-                    cmp_idxs_int = ttnn.add(cmp_idxs_int, win)
-                else:
-                    cmp_idxs_int = ttnn.slice(
-                        self._compress_idxs_ramp_tt,
-                        [0, 0, 0], [B, S, T_active],
-                    )
-                    k = T_active
-                topk_idxs_dev = ttnn.concat(
-                    [topk_idxs_dev, cmp_idxs_int], dim=-1
-                )
-                topk_idxs_dev_K = win + k
+                    topk_idxs_dev_K = win + k
 
         # KV cache update: write window slot from kv_tt; the device compressor
         # (when compress_ratio is set) writes compress slot at win + comp_idx
         # into the same buffer.
-        kv_4d = ttnn.reshape(kv_tt, [B, 1, 1, D])
-        ttnn.kv_cache.update_cache_for_token_(
-            self.kv_cache_tt, kv_4d, start_pos % win, 0
-        )
-        if self.compress_ratio:
-            device_comp.forward_device(x_tt, B, start_pos)
-
-        kv_full_tt = ttnn.reshape(self.kv_cache_tt, [self.kv_cache_size_pad, D])
-        K = topk_idxs_dev_K
-        idxs_tt, valid_tt = self.sparse_attn_dev._idxs_int_tile_to_idxs_and_mask(
-            topk_idxs_dev, B, S, K
-        )
-        o_tt = self.sparse_attn_dev.forward_device(
-            q_tt, kv_full_tt, idxs_tt, valid_tt, S, K
-        )
-        # o_tt: [B, S, H, D].
-
-        # Inverse rotary on o[..., -rd:].
-        cos_o, sin_o = self._rotary_tables(start_pos, S, q_dims=4)
-        ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H, D - rd],
-                   output_tensor=self._o_nope_scratch_tt)
-        ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H, D],
-                   output_tensor=self._o_rope_scratch_tt)
-        o_rope = _device_apply_rotary_interleaved(
-            ttnn, self._o_rope_scratch_tt, cos_o, sin_o, inverse=True)
-        o_tt = ttnn.concat([self._o_nope_scratch_tt, o_rope], dim=-1)
-
-        # Group reshape: [B, S, H, D] -> [G, B*S, H*D/G] for batched matmul.
-        per_group = (H * D) // self.n_groups
-        if per_group != self.wo_a_in_per_group:
-            raise RuntimeError(
-                f"wo_a in_per_group {self.wo_a_in_per_group} != H*D/G {per_group}"
+        with _phase("attn.kv_update"):
+            kv_4d = ttnn.reshape(kv_tt, [B, 1, 1, D])
+            ttnn.kv_cache.update_cache_for_token_(
+                self.kv_cache_tt, kv_4d, start_pos % win, 0
             )
-        o_perm = ttnn.reshape(o_tt, [B, S, self.n_groups, per_group])
-        # Permute to [G, B, S, in_per_group] then merge B*S.
-        o_perm = ttnn.permute(o_perm, [2, 0, 1, 3])
-        o_g = ttnn.reshape(o_perm, [self.n_groups, B * S, per_group])
-        # Block-diag matmul: [G, B*S, in] @ [G, in, R] -> [G, B*S, R]
-        o_wo_a_g = ttnn.matmul(o_g, self.wo_a_w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        # Reshape back to [B, S, G, R] then flatten last two dims.
-        o_wo_a_rs = ttnn.reshape(o_wo_a_g, [self.n_groups, B, S, self.o_lora_rank])
-        o_wo_a = ttnn.permute(o_wo_a_rs, [1, 2, 0, 3])  # [B, S, G, R]
-        R = self.o_lora_rank
-        o_flat = ttnn.reshape(o_wo_a, [B, S, self.n_groups * R])
-        out_tt = attn.wo_b.forward_device(o_flat)             # [B, S, dim]
+        if self.compress_ratio:
+            with _phase("attn.compress"):
+                device_comp.forward_device(x_tt, B, start_pos)
+
+        with _phase("attn.sparse"):
+            kv_full_tt = ttnn.reshape(self.kv_cache_tt, [self.kv_cache_size_pad, D])
+            K = topk_idxs_dev_K
+            idxs_tt, valid_tt = self.sparse_attn_dev._idxs_int_tile_to_idxs_and_mask(
+                topk_idxs_dev, B, S, K
+            )
+            o_tt = self.sparse_attn_dev.forward_device(
+                q_tt, kv_full_tt, idxs_tt, valid_tt, S, K
+            )
+            # o_tt: [B, S, H, D].
+
+        with _phase("attn.o"):
+            # Inverse rotary on o[..., -rd:].
+            cos_o, sin_o = self._rotary_tables(start_pos, S, q_dims=4)
+            ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H, D - rd],
+                       output_tensor=self._o_nope_scratch_tt)
+            ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H, D],
+                       output_tensor=self._o_rope_scratch_tt)
+            o_rope = _device_apply_rotary_interleaved(
+                ttnn, self._o_rope_scratch_tt, cos_o, sin_o, inverse=True)
+            o_tt = ttnn.concat([self._o_nope_scratch_tt, o_rope], dim=-1)
+
+            # Group reshape: [B, S, H, D] -> [G, B*S, H*D/G] for batched matmul.
+            per_group = (H * D) // self.n_groups
+            if per_group != self.wo_a_in_per_group:
+                raise RuntimeError(
+                    f"wo_a in_per_group {self.wo_a_in_per_group} != H*D/G {per_group}"
+                )
+            o_perm = ttnn.reshape(o_tt, [B, S, self.n_groups, per_group])
+            # Permute to [G, B, S, in_per_group] then merge B*S.
+            o_perm = ttnn.permute(o_perm, [2, 0, 1, 3])
+            o_g = ttnn.reshape(o_perm, [self.n_groups, B * S, per_group])
+            # Block-diag matmul: [G, B*S, in] @ [G, in, R] -> [G, B*S, R]
+            o_wo_a_g = ttnn.matmul(o_g, self.wo_a_w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            # Reshape back to [B, S, G, R] then flatten last two dims.
+            o_wo_a_rs = ttnn.reshape(o_wo_a_g, [self.n_groups, B, S, self.o_lora_rank])
+            o_wo_a = ttnn.permute(o_wo_a_rs, [1, 2, 0, 3])  # [B, S, G, R]
+            R = self.o_lora_rank
+            o_flat = ttnn.reshape(o_wo_a, [B, S, self.n_groups * R])
+            out_tt = attn.wo_b.forward_device(o_flat)             # [B, S, dim]
         return out_tt
 
     def _rmsnorm_device(self, norm_dev: "DeviceRMSNorm", x_2d_tt, num_rows: int):
