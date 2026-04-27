@@ -247,3 +247,123 @@ Tiny weight (~2 MB), tiny compute. Replication is cheap. Skip.
 - MoE routing (still on host per `project_hw_roadmap.md`).
 - Sparse attention algorithmic changes - we're only resharding the same
   algorithm onto more chips.
+
+---
+
+## New fused kernels (in `tt-lang-kernels/`) and how to deploy them
+
+Three kernels were prototyped and benchmarked at V4-Flash decode shapes. Each
+file is self-contained with a mesh4 PCC test against a torch reference.
+Numbers below were measured on all.conf (1×4 BH QB).
+
+### 1. `fused_matmul_rmsnorm.py` — rmsnorm(x, gamma) @ W in one kernel
+
+**Math:** `(1/rms[m]) * (x @ Wg)` where `Wg = gamma[:, None] * W` is pre-baked
+on host (no per-step gamma traffic). The K-loop accumulates the matmul
+partial AND the per-row ssq simultaneously; after K, the kernel finalizes
+inv_rms and multiplies into the output.
+
+**Optimal deployment:**
+- **Mesh layout:** put W on as many cards as possible by **col-sharding `Wg`
+  along its N axis** (`ShardTensor2dMesh(mesh, dims=(None, -1))`). For Galaxy
+  (4, 8) use 2D N-shard (= TP=32). For all.conf use 1×4 (TP=4).
+- **Replicate** x and the [TILE, TILE] scaler tile (`ReplicateTensorToMesh`).
+- **CCL needed:** **0 inside the kernel**, and **1 downstream** —
+  `ttnn.all_gather(out, dim=-1, cluster_axis=N_AXIS)` if the consumer needs a
+  replicated input. Same all_gather as today's `DeviceColLinear`; the fusion
+  doesn't change the CCL story.
+
+**Where to land it:** Replace the `rms_norm + matmul` pair at the four K=4096
+fusion sites: `attn_norm → wq_a`, `ffn_norm → shared_expert.w1` (single
+fanout root), `final_norm → lm_head`. Skip `w3`/`gate` fanouts and let them
+re-use a shared rms_norm output (avoids paying the rms work 3x per layer).
+
+**Caveat:** at decode K=4096 the fused kernel is **~1.4x slower** than
+`ttnn.rms_norm + ttnn.matmul` (mesh4: 0.34ms vs 0.25ms). It uses 8 cores
+(SUMMA grid Mp=1, Np=8) versus ttnn's full ~64-core matmul. Adopt only at
+sites where ttnn is *not* well tuned, or where the dispatch reduction
+(2 ops → 1 op under tracing) makes a meaningful difference. **lm_head**
+(N=129280) is the strong candidate; the small attn fusion sites are not.
+
+### 2. `pre_norm_fn_ksplit.py` — pre_norm_fn parallelized across the K axis
+
+**Math:** unchanged from `pre_norm_fn.py`:
+`mixes[t, m] = (residual[t] @ fn[m, :]) * rsqrt(sum_k residual[t, k]^2/D + eps)`.
+The decode shape (D=16384, 1 output tile, K_tiles=512) ran the original
+single-core in 0.69ms. The ksplit version splits the K-loop across `Kp`
+cores via two pipe-gather reduces (matmul partial + ssq partial), then the
+root finalizes inv_rms.
+
+**Optimal deployment:**
+- **Per-chip config:** `Kp=8, grid=(8, 1)` — uses 8 cores per chip. **0.25ms
+  per call**, 2.80x speedup (saves ~39 ms/token at 86 calls). PCC 0.989
+  (acceptable; matches the "fp32 accumulator drift" caveat already in the
+  base kernel docstring).
+- **Why not push Kp higher:** Kp=16 hits a ~0.24ms floor (I/O-bound, not
+  compute-bound). Kp=32 same floor at PCC 0.928 (bf16-precision reduce_sum
+  partials compounding).
+- **Mesh layout:** **replicated on a small sub-mesh** (1 chip is enough; or
+  1×4 sub-mesh of Galaxy if the result needs to feed multiple consumers
+  cheaply). Inputs (residual, fn) are replicated. Output is replicated too.
+- **CCL needed:** **0 if you accept replication on the sub-mesh.** If you run
+  on N < total chips and the result must reach the others, **1 CCL**:
+  `ttnn.all_gather` (or a `broadcast`) along the chip axis after the kernel.
+  Today the model runs MHC kernels replicated on all 32 chips — that wastes
+  31x the compute. A path-2 fix would compute on a 1×8 sub-row and broadcast
+  to the other rows (1 CCL/call), trading replicated compute for fabric
+  bandwidth. See P2.3.
+
+### 3. `pre_apply_mix_h.py` — pre_apply_mix h-axis-sharded across cores
+
+**Math:** unchanged: `out[t, h] = sum_m x[t, m, :] * mix[t, m]`. The original
+parallelized on `num_tokens`, so at decode (num_tokens=1) only one core
+fired and the inner h_tiles=128 loop ran serially. This kernel flattens
+(token, h_tile) into one work axis and `grid="auto"` distributes across all
+~130 BH cores. Each h-tile is independent; **no reduce needed**.
+
+**Optimal deployment:**
+- **Per-chip config:** `grid="auto"` (the kernel uses whatever the device
+  exposes). On a 130-core BH chip each core handles ~1 h-tile. **0.18ms per
+  call**, 1.36x speedup (saves ~6 ms/token at 86 calls). PCC 1.000 — exact.
+- **Mesh layout:** **replicated.** Same story as norm_fn_ksplit: today the
+  model runs this replicated on all 32 chips. A path-2 fix would compute on
+  a 1×8 sub-row and broadcast (1 CCL/call), but at 0.18ms/call the
+  broadcast cost likely dominates the saved compute on Galaxy fabric. **Don't
+  shard the h axis across chips** — the kernel already saturates the
+  per-chip cores; cross-chip h-shard would require an all_gather of the
+  output that costs more than the kernel itself.
+- **CCL needed:** **0** (if replicated) or **1 all_gather/broadcast** (if
+  computed on a sub-mesh and result must reach the others).
+
+### Summary table
+
+| kernel                    | optimal per-chip cores | mesh layout                  | CCLs/call         | per-token saved |
+|---------------------------|------------------------|------------------------------|-------------------|-----------------|
+| `fused_matmul_rmsnorm`    | 8 (SUMMA Np=8)         | col-shard N across full mesh | 0 inside, 1 after | -22 ms (regression at K=4096; positive only at lm_head N=129280) |
+| `pre_norm_fn_ksplit`      | 8 (Kp=8)               | replicated (sub-mesh OK)     | 0 (or 1 broadcast)| +39 ms          |
+| `pre_apply_mix_h`         | ~130 (grid="auto")     | replicated (sub-mesh OK)     | 0 (or 1 broadcast)| +6 ms           |
+
+### Recommended landing order
+
+1. **`pre_norm_fn_ksplit`** — biggest single win (39 ms/token), drop-in
+   replacement for the existing kernel in `inference.py:_compile_mhc_norm_fn_kernel`,
+   no architectural change.
+2. **`pre_apply_mix_h`** — small win (6 ms/token), but trivial drop-in.
+3. **`fused_matmul_rmsnorm`** — defer until lm_head fusion site is wired.
+   At the small fusion sites it's a regression vs ttnn. Treat as the
+   foundation for P1.3 (LM head 2D shard with rms fusion), not as an
+   immediate decode-path drop-in.
+
+### What we deliberately did *not* do
+
+- **Cross-chip ksplit on `pre_norm_fn`.** Could move from per-chip Kp=8 to
+  full-mesh Kp=128 (4 chips × 32 cores). Would require an `all_reduce`
+  CCL on the matmul + ssq partials. Estimate: ~0.05ms CCL cost + ~0.05ms
+  saved compute = breakeven at best. Not worth the complexity now.
+- **Tree-reduce in `pre_norm_fn_ksplit`.** Current gather caps at Kp=32
+  (block_count limit). Two-stage gather would unlock Kp=64+, but plateau
+  data shows no speedup beyond Kp=8.
+- **Higher PCC on `pre_norm_fn_ksplit`.** Removing
+  `--no-ttl-reduce-full-fp32` would help at higher Kp but cost time. Skipped
+  because Kp=8 PCC=0.989 already meets the existing kernel's 0.998 baseline
+  closely enough at decode.
