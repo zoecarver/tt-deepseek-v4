@@ -629,10 +629,9 @@ class MoE(nn.Module):
         match = ttnn.eq(indices_4d, self._chip_ids_4d_tt)
         match_bf16 = ttnn.typecast(match, ttnn.bfloat16)
         ttnn.deallocate(match)
-        weighted = ttnn.multiply(weights_4d, match_bf16)
+        ttnn.multiply(weights_4d, match_bf16, output_tensor=match_bf16)
+        mask = ttnn.sum(match_bf16, dim=-1, keepdim=True)
         ttnn.deallocate(match_bf16)
-        mask = ttnn.sum(weighted, dim=-1, keepdim=True)
-        ttnn.deallocate(weighted)
 
         # Grouped MLP. Weights are [1, per_chip, K, N] sharded; ttnn.matmul
         # won't broadcast batch dims when one operand is all-1 and the
@@ -648,22 +647,19 @@ class MoE(nn.Module):
             limit = float(self.experts[0].swiglu_limit)
             ttnn.clamp(y1, max=limit, output_tensor=y1)
             ttnn.clamp(y3, min=-limit, max=limit, output_tensor=y3)
-        silu_y1 = ttnn.silu(y1)
-        ttnn.deallocate(y1)
-        glu = ttnn.multiply(silu_y1, y3)  # [1, per_chip, 1, inter]
-        ttnn.deallocate(silu_y1)
+        ttnn.silu(y1, output_tensor=y1)
+        ttnn.multiply(y1, y3, output_tensor=y1)  # glu = silu(y1) * y3 (in-place)
         ttnn.deallocate(y3)
 
-        y = _fp4_gemm_via_bfp4(ttnn, glu, self._w2_tt, self._w2_scale_tt)
-        ttnn.deallocate(glu)
+        y = _fp4_gemm_via_bfp4(ttnn, y1, self._w2_tt, self._w2_scale_tt)
+        ttnn.deallocate(y1)
 
-        y_masked = ttnn.multiply(y, mask)  # [1, per_chip, 1, dim]
-        ttnn.deallocate(y)
+        ttnn.multiply(y, mask, output_tensor=y)  # y_masked (in-place)
         ttnn.deallocate(mask)
 
         # Sum across local experts: keepdim=True so result stays rank 4.
-        y_local = ttnn.sum(y_masked, dim=1, keepdim=True)  # [1, 1, 1, dim]
-        ttnn.deallocate(y_masked)
+        y_local = ttnn.sum(y, dim=1, keepdim=True)  # [1, 1, 1, dim]
+        ttnn.deallocate(y)
 
         # All-reduce across the (rows*cols) mesh: full 256-expert sum.
         y_full = ttnn.all_reduce(y_local)
