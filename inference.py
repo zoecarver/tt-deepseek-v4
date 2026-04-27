@@ -49,6 +49,12 @@ default_dtype = torch.bfloat16
 # inclusive of its instrumented subregions" and only compare sibling phases.
 _PHASE_ACCUM: dict[str, float] = {}
 _PHASE_COUNTS: dict[str, int] = {}
+# Snapshot of _PHASE_ACCUM/_PHASE_COUNTS taken when both decode traces
+# become warm. Lets us report two breakdowns: pre-warm (untraced decode
+# steps; shows the per-component breakdown) and post-warm (only replay
+# wall time, since traced replays don't run any Python phase ctx mgr).
+_PHASE_PREWARM_ACCUM: dict[str, float] = {}
+_PHASE_PREWARM_COUNTS: dict[str, int] = {}
 # When set, called at the start and end of every _phase() to flush the device
 # command queue. Without this, ttnn ops are non-blocking and a phase's wall
 # time captures dispatch overhead instead of compute, with the actual work
@@ -77,16 +83,39 @@ def _set_phase_sync(fn):
     _PHASE_SYNC = fn
 
 
-def _phase_report() -> str:
-    if not _PHASE_ACCUM:
+def _phase_report(accum=None, counts=None) -> str:
+    accum = _PHASE_ACCUM if accum is None else accum
+    counts = _PHASE_COUNTS if counts is None else counts
+    if not accum:
         return "(no phases recorded)"
     lines = ["phase                      total(s)    n    avg(ms)"]
-    for k in sorted(_PHASE_ACCUM, key=lambda k: -_PHASE_ACCUM[k]):
-        tot = _PHASE_ACCUM[k]
-        n = _PHASE_COUNTS[k]
+    for k in sorted(accum, key=lambda k: -accum[k]):
+        tot = accum[k]
+        n = counts[k]
+        if n == 0:
+            continue
         avg_ms = 1000.0 * tot / n
         lines.append(f"  {k:24s}  {tot:7.2f}  {n:4d}  {avg_ms:9.1f}")
     return "\n".join(lines)
+
+
+def _phase_snapshot_at_trace_warm():
+    """Copy current per-phase counters into the pre-warm snapshot dicts.
+    Called once when both decode traces are captured. Subsequent _phase()
+    calls keep accumulating; the post-warm view subtracts the snapshot."""
+    _PHASE_PREWARM_ACCUM.clear()
+    _PHASE_PREWARM_COUNTS.clear()
+    _PHASE_PREWARM_ACCUM.update(_PHASE_ACCUM)
+    _PHASE_PREWARM_COUNTS.update(_PHASE_COUNTS)
+
+
+def _phase_postwarm():
+    """Return (accum_delta, counts_delta) for steady-state replay only."""
+    a = {k: _PHASE_ACCUM[k] - _PHASE_PREWARM_ACCUM.get(k, 0.0)
+         for k in _PHASE_ACCUM}
+    c = {k: _PHASE_COUNTS[k] - _PHASE_PREWARM_COUNTS.get(k, 0)
+         for k in _PHASE_COUNTS}
+    return a, c
 
 
 @contextmanager
@@ -6359,10 +6388,9 @@ class Model:
             if (self._trace_no_emit is not None
                     and self._trace_emit is not None
                     and not self._traces_warm):
-                _PHASE_ACCUM.clear()
-                _PHASE_COUNTS.clear()
+                _phase_snapshot_at_trace_warm()
                 self._traces_warm = True
-                print("[trace] both traces captured; phase counters reset")
+                print("[trace] both traces captured; phase snapshot taken")
             return head.argmax_pull(argmax_tt, max_tt)
 
         trace_id, argmax_tt, max_tt = target
@@ -6522,22 +6550,32 @@ def main():
     print()
     print(f"[debug] token ids: {out_tokens}")
     print(f"[debug] full decode: {model.tokenizer.decode(out_tokens)!r}")
-    # Steady-state trace tok/s: decode_step phase counter is cleared in
-    # step_decode the moment both traces are warm, so the accumulated
-    # decode_step total here reflects only post-warm replay (or, for
-    # short runs that never reach two captures, the untraced fallback).
-    ds_total = _PHASE_ACCUM.get("decode_step", 0.0)
-    ds_count = _PHASE_COUNTS.get("decode_step", 0)
-    if ds_count > 0 and ds_total > 0:
-        if model._traces_warm:
+    # Steady-state trace tok/s comes from the post-warm decode_step delta:
+    # _phase counters keep accumulating across the run; at trace-warm we
+    # snapshot them, and (current - snapshot) reflects only replay steps.
+    if model._traces_warm:
+        post_accum, post_counts = _phase_postwarm()
+        ds_total = post_accum.get("decode_step", 0.0)
+        ds_count = post_counts.get("decode_step", 0)
+        if ds_count > 0 and ds_total > 0:
             print(f"[phase] trace replay: {ds_count} tokens in "
                   f"{ds_total:.2f}s ({ds_count / ds_total:.2f} tok/s)")
-        else:
+    else:
+        ds_total = _PHASE_ACCUM.get("decode_step", 0.0)
+        ds_count = _PHASE_COUNTS.get("decode_step", 0)
+        if ds_count > 0 and ds_total > 0:
             print(f"[phase] decode (untraced fallback): {ds_count} tokens "
                   f"in {ds_total:.2f}s ({ds_count / ds_total:.2f} tok/s)")
 
-    print("\n[timing] per-phase breakdown (inclusive; sort by total):")
-    print(_phase_report())
+    if model._traces_warm:
+        print("\n[timing] pre-warm phases (untraced steps before trace capture):")
+        print(_phase_report(_PHASE_PREWARM_ACCUM, _PHASE_PREWARM_COUNTS))
+        post_accum, post_counts = _phase_postwarm()
+        print("\n[timing] post-warm phases (trace replay only):")
+        print(_phase_report(post_accum, post_counts))
+    else:
+        print("\n[timing] per-phase breakdown (inclusive; sort by total):")
+        print(_phase_report())
 
     _close_mesh(mesh)
 
