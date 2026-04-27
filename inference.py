@@ -1055,6 +1055,26 @@ class DeviceLMHead:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=-1),
         )
+        # Per-chip top-1 outputs for greedy sampling. Pre-allocated so the
+        # outer decode trace records writes into stable addresses (multiple
+        # captured traces all write to the same buffers; argmax_pull reads
+        # from them after each replay).
+        num_chips = self.mesh_shape[0] * self.mesh_shape[1]
+        self._topk_vals_tt = ttnn.from_torch(
+            torch.zeros(1, 1, num_chips, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=-1),
+        )
+        # topk indices must be UINT16 or UINT32 in this build, but UINT32
+        # silently produces wrong values when pre-allocated; only UINT16
+        # matches the unpreallocated path. Verified via /tmp/probe_topk_output.py.
+        self._topk_idxs_tt = ttnn.from_torch(
+            torch.zeros(1, 1, num_chips, dtype=torch.int32),
+            device=self.mesh, dtype=ttnn.uint16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=-1),
+        )
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
 
     def _compute_body(self):
@@ -1143,16 +1163,18 @@ class DeviceLMHead:
 
     def forward_argmax_device(self, a_tt, num_tokens: int):
         """Pure-device half of greedy sampling: logits body + per-chip
-        argmax/max. Returns (local_argmax_tt, local_max_tt) — both still on
-        device. Safe to call inside a captured trace.
+        top-1. Writes into pre-allocated `_topk_vals_tt` / `_topk_idxs_tt`
+        so outer decode traces record stable output addresses. Returns
+        (idxs_tt, vals_tt). Safe to call inside a captured trace.
         """
         ttnn = self._ttnn
         logits_tt = self._logits_body(a_tt, num_tokens)
-        # Per-chip local argmax (uint32 [1, 1]) and max value (bf16 [1, 1]).
-        # Each chip operates on its [1, 1, vocab_per_chip] shard.
-        local_argmax_tt = ttnn.argmax(logits_tt, dim=-1)
-        local_max_tt = ttnn.max(logits_tt, dim=-1)
-        return local_argmax_tt, local_max_tt
+        # Per-chip top-1 over the [1, 1, vocab_per_chip] shard.
+        # Single op replaces argmax+max with two outputs both backed by
+        # pre-allocated buffers.
+        ttnn.topk(logits_tt, k=1, dim=-1, largest=True, sorted=True,
+                  output_tensor=(self._topk_vals_tt, self._topk_idxs_tt))
+        return self._topk_idxs_tt, self._topk_vals_tt
 
     def argmax_pull(self, local_argmax_tt, local_max_tt) -> int:
         """Host half of greedy sampling: pull the two small tensors and
@@ -5273,7 +5295,7 @@ class DeviceAttention(nn.Module):
         return cos, sin
 
 
-def _open_mesh(shape=(4, 8), trace_region_size: int = 100_000_000):
+def _open_mesh(shape=(4, 8), trace_region_size: int = 200_000_000):
     """Open a Galaxy (TG) mesh device. Default shape (4, 8) matches
     SYSTEM_NAME_TO_MESH_SHAPE["TG"] in tt-metal/models/demos/deepseek_v3.
 
@@ -5443,12 +5465,17 @@ class Model:
         self.ckpt_dir = ckpt_dir
         self.transformer = Transformer(args)
         # Trace state. The first 16 decode steps run untraced so every
-        # lazy _alloc_decode_tensors path fires; the next no-emit step
-        # captures `_trace_no_emit = (trace_id, argmax_tt, max_tt)`,
-        # subsequent no-emit steps replay it. Emit steps stay untraced
-        # (second trace will be added once this path is solid).
+        # lazy _alloc_decode_tensors path fires. Two traces are then
+        # captured on demand, keyed by emit branch:
+        #   _trace_no_emit: covers (start_pos+1) % 4 != 0
+        #   _trace_emit:    covers (start_pos+1) % 4 == 0
+        # Each holds (trace_id, local_argmax_tt, local_max_tt).
+        # Once both are warm, phase counters are cleared so the
+        # remaining decode_step entries reflect steady-state replay.
         self._trace_warmup_remaining = 16
         self._trace_no_emit = None
+        self._trace_emit = None
+        self._traces_warm = False
 
     @classmethod
     def from_hf(cls, repo_id: str, max_seq_len: int = 512, max_batch_size: int = 1):
@@ -6291,10 +6318,12 @@ class Model:
     def step_decode(self, token_id: int, pos: int) -> int:
         """Single greedy decode step. Returns next token id.
 
-        After 16 untraced warmup steps, captures a single trace of the
-        no-emit body (embed -> blocks -> head argmax/max) and replays it
-        on every subsequent no-emit step. Emit steps ((pos+1)%4==0) stay
-        on the untraced path until a second trace is added.
+        After 16 untraced warmup steps, captures one trace per emit
+        branch (no-emit / emit) on first hit and replays it on every
+        subsequent step in the matching branch. The two host-int
+        branches collapse to one trace each: ratio-128 layers always
+        take the no-emit path within our position window, and ratio-4
+        layers / the indexer share the (pos+1)%4 cadence.
         """
         import ttnn
         ids = torch.tensor([[token_id]], dtype=torch.long)
@@ -6304,27 +6333,39 @@ class Model:
 
         B, S, num_tokens, num_tokens_pad = transformer._decode_uploads(ids, pos)
 
-        if is_emit or self._trace_warmup_remaining > 0:
-            if self._trace_warmup_remaining > 0:
-                self._trace_warmup_remaining -= 1
+        if self._trace_warmup_remaining > 0:
+            self._trace_warmup_remaining -= 1
             local_argmax_tt, local_max_tt = transformer._decode_argmax_body(
                 B, S, num_tokens, num_tokens_pad, pos)
             return head.argmax_pull(local_argmax_tt, local_max_tt)
 
-        if self._trace_no_emit is None:
+        target = self._trace_emit if is_emit else self._trace_no_emit
+        if target is None:
             mesh = self._device_lm_head.mesh
-            print(f"[trace] capturing no-emit decode body at pos={pos} ...")
+            kind = "emit" if is_emit else "no-emit"
+            print(f"[trace] capturing {kind} decode body at pos={pos} ...")
             t0 = time.time()
             trace_id = ttnn.begin_trace_capture(mesh, cq_id=0)
             argmax_tt, max_tt = transformer._decode_argmax_body(
                 B, S, num_tokens, num_tokens_pad, pos)
             ttnn.end_trace_capture(mesh, trace_id, cq_id=0)
-            self._trace_no_emit = (trace_id, argmax_tt, max_tt)
-            print(f"[trace] captured no-emit trace id={trace_id} in "
+            target = (trace_id, argmax_tt, max_tt)
+            if is_emit:
+                self._trace_emit = target
+            else:
+                self._trace_no_emit = target
+            print(f"[trace] captured {kind} trace id={trace_id} in "
                   f"{time.time()-t0:.1f}s")
+            if (self._trace_no_emit is not None
+                    and self._trace_emit is not None
+                    and not self._traces_warm):
+                _PHASE_ACCUM.clear()
+                _PHASE_COUNTS.clear()
+                self._traces_warm = True
+                print("[trace] both traces captured; phase counters reset")
             return head.argmax_pull(argmax_tt, max_tt)
 
-        trace_id, argmax_tt, max_tt = self._trace_no_emit
+        trace_id, argmax_tt, max_tt = target
         ttnn.execute_trace(self._device_lm_head.mesh, trace_id,
                            cq_id=0, blocking=True)
         return head.argmax_pull(argmax_tt, max_tt)
@@ -6472,7 +6513,6 @@ def main():
     print(f"[phase] prompt = {prompt!r}, {len(tokens)} tokens")
 
     print("[phase] generating ...")
-    t0 = time.time()
     out_tokens = []
     for tok in model.generate(tokens, max_tokens=args.max_tokens,
                               warmup_tokens=args.warmup_tokens):
@@ -6482,8 +6522,19 @@ def main():
     print()
     print(f"[debug] token ids: {out_tokens}")
     print(f"[debug] full decode: {model.tokenizer.decode(out_tokens)!r}")
-    dt = time.time() - t0
-    print(f"\n[phase] generated {len(out_tokens)} tokens in {dt:.1f}s ({len(out_tokens)/dt:.2f} tok/s)")
+    # Steady-state trace tok/s: decode_step phase counter is cleared in
+    # step_decode the moment both traces are warm, so the accumulated
+    # decode_step total here reflects only post-warm replay (or, for
+    # short runs that never reach two captures, the untraced fallback).
+    ds_total = _PHASE_ACCUM.get("decode_step", 0.0)
+    ds_count = _PHASE_COUNTS.get("decode_step", 0)
+    if ds_count > 0 and ds_total > 0:
+        if model._traces_warm:
+            print(f"[phase] trace replay: {ds_count} tokens in "
+                  f"{ds_total:.2f}s ({ds_count / ds_total:.2f} tok/s)")
+        else:
+            print(f"[phase] decode (untraced fallback): {ds_count} tokens "
+                  f"in {ds_total:.2f}s ({ds_count / ds_total:.2f} tok/s)")
 
     print("\n[timing] per-phase breakdown (inclusive; sort by total):")
     print(_phase_report())
