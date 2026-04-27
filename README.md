@@ -12,33 +12,35 @@ experts (offload-time re-quantized; see `_dequant_to_native_bfp4` in
 `inference.py`). Coherent text out, quality acceptable.
 
 ```
- In dwelling, live close to the ground. In thinking, keep to the simple.
- In conflict, be fair and generous. In governing, don't try to control.
- In work, do what you enjoy. In family life, be completely present.
-
-[phase] generated 50 tokens in 138.8s (0.36 tok/s)
+[debug] full decode: ' In dwelling, be close to the land. In meditation, go deep in the heart heart.. In dealing with others, be gentle and kind. In speech, be true. In ruling, be just. In business, be competent. In action'
+[phase] trace replay: 32 tokens in 21.00s (1.52 tok/s)
 
 [timing] per-phase breakdown (inclusive; sort by total):
 phase                      total(s)    n    avg(ms)
-  decode_step                 80.34    47     1709.3
-  blocks                      79.77    47     1697.2
-  block.attn                  46.91  2021       23.2
-  block.ffn                   13.78  2021        6.8
-  attn.topk                   10.47  2021        5.2
-  attn.q                       9.20  2021        4.6
-  attn.topk.indexer            8.86   987        9.0
-  block.hc_post                7.55  4042        1.9
-  block.hc_pre                 7.37  4042        1.8
-  attn.kv                      7.31  2021        3.6
-  attn.o                       7.05  2021        3.5
-  attn.sparse                  6.01  2021        3.0
-  attn.compress                3.93  1927        2.0
-  block.norm                   1.91  4042        0.5
-  head                         0.42    47        9.0
-  attn.kv_update               0.41  2021        0.2
-  head.norm_and_logits         0.37    47        7.9
-  embed                        0.10    47        2.1
-  sample                       0.02    47        0.3
+  decode_step                 21.00    32      656.3
+  pre_stage                    0.63    31       20.2
+
+[timing] pre-warm phases (untraced steps before trace capture, expected to be higher and not totally representative of traced run):
+phase                      total(s)    n    avg(ms)
+  decode_step                 33.43    15     2228.5
+  blocks                      28.88    15     1925.6
+  block.attn                  17.90   645       27.8
+  block.ffn                    6.61   645       10.2
+  attn.topk                    4.33   645        6.7
+  attn.topk.indexer            4.13   315       13.1
+  attn.q                       3.96   645        6.1
+  attn.o                       2.92   645        4.5
+  attn.kv                      2.58   645        4.0
+  block.hc_pre                 2.24  1290        1.7
+  attn.compress                2.04   615        3.3
+  attn.sparse                  1.81   645        2.8
+  block.hc_post                1.72  1290        1.3
+  pre_stage                    0.61    16       38.3
+  block.norm                   0.37  1290        0.3
+  attn.kv_update               0.09   645        0.1
+  head                         0.05    15        3.6
+  head.norm_and_argmax_device  0.05    15        3.6        # tt-lang kernel 7x speedup expected 
+  embed                        0.02    15        1.5
 ```
 
 ## Architecture (where tt-lang vs ttnn)
@@ -61,7 +63,7 @@ embed                                                   ttnn (lookup + replicate
     │     ├── attn.compress   (compressor + emit branch)
     │     │     ├── compressor_slot_shift (state buffer rotation)              TT-LANG
     │     │     └── compressor_softmax_sum_norm (slice/concat/softmax/mul/sum/RMSNorm)  TT-LANG
-    │     ├── attn.topk       (window topk + indexer + compress-K topk)        ttnn (topk on host-side glue)
+    │     ├── attn.topk       (window topk + indexer + compress-K topk)        ttnn
     │     ├── attn.sparse     (gather + scaled DPA + sink-concat softmax)      ttnn (paged_flash_mla)
     │     └── attn.o          (block-diagonal wo_a + wo_b)                     ttnn
     ├── block.hc_post
@@ -74,9 +76,14 @@ embed                                                   ttnn (lookup + replicate
           └── all_reduce across mesh                                            ttnn CCL
 head
   ├── final RMSNorm                                                             TT-LANG (rmsnorm)
-  └── DeviceLMHead (matmul + reduce-scatter)                                    ttnn
-sample (greedy)                                                                 host
+  ├── DeviceLMHead (vocab-sharded matmul)                                       ttnn
+  └── per-chip topk(k=1) + 4-byte token id pull                                 ttnn (host pull only)
 ```
+
+The whole decode step is captured as a ttnn trace. Two traces are
+recorded — one for "no compressor emit" and one for the every-4th-step
+emit branch — and replayed in alternation. After warmup, replay is the
+only host work besides the 4-byte token id pull.
 
 ## tt-lang kernels in use
 
@@ -138,7 +145,7 @@ These run on ttnn op chains and are the next candidates:
 - **attn.topk** — the topk reduce + index gather is ttnn (`ttnn.topk`); writing topk in tt-lang is non-trivial.
 - **MoE routed-expert matmul** — `ttnn.matmul(x_bf16, w_bfp4_b)` directly. The matmul kernel itself is ttnn; its bfp4 unpack is internal. tt-lang can't currently fuse mixed-dtype matmul (bf16 act + bfp4_b weight).
 - **all_reduce / reduce_scatter** — ttnn CCL.
-- **`DeviceMoEGate`, `DeviceLMHead`** — custom ttnn ops with traces.
+- **`DeviceMoEGate`, `DeviceLMHead`** — ttnn op chains; argmax via `ttnn.topk(k=1)` with pre-allocated UINT16 indices for trace stability. A tt-lang two-pass streaming argmax kernel (~7× faster than `ttnn.topk(k=1)`: 2× faster than `ttnn.argmax+max`, which itself is 3× faster than `ttnn.topk(k=1)`) is a drop-in candidate.
 
 ## Layout
 
