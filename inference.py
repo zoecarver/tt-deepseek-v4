@@ -4730,6 +4730,27 @@ class DeviceAttention(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._upload_mapper,
         )
+        # Per-step kv_cache slot upload buffer + height-sharded L1 memory
+        # config used for paged_update_cache. The slot is `start_pos % win`,
+        # uploaded outside any future trace via copy_host_to_device_tensor.
+        # paged_update_cache accepts `update_idxs_tensor` as a device tensor,
+        # so the slot stays out of the trace replay's recorded constants.
+        self._kv_slot_tt = ttnn.from_torch(
+            torch.zeros(B, dtype=torch.int32),
+            device=self.mesh, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._upload_mapper,
+        )
+        self._kv_input_sharded_memcfg = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(
+                ttnn.CoreRangeSet(
+                    {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))}),
+                (32, D),
+                ttnn.ShardOrientation.ROW_MAJOR,
+            ),
+        )
 
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         """Single-token forward. Prefill is driven externally as a per-token
@@ -4883,9 +4904,15 @@ class DeviceAttention(nn.Module):
             )
 
         # Pre-stage all per-step host->device transfers up front so the rest
-        # of the body is pure device work. Today only the indexer topk path
-        # has one (T_active for the active bucket); future hoists from rotary
-        # indexing / kv_update slot computation will land here too.
+        # of the body is pure device work. Today: kv_cache slot for
+        # paged_update_cache and (when compressing) the indexer-topk
+        # T_active for the active bucket.
+        kv_slot_host = ttnn.from_torch(
+            torch.tensor([start_pos % win], dtype=torch.int32),
+            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=self._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(kv_slot_host, self._kv_slot_tt)
         if self.compress_ratio and device_indexer is not None:
             T_active_pre = (start_pos + 1) // self.compress_ratio
             if T_active_pre > 0:
@@ -5019,11 +5046,17 @@ class DeviceAttention(nn.Module):
 
         # KV cache update: write window slot from kv_tt; the device compressor
         # (when compress_ratio is set) writes compress slot at win + comp_idx
-        # into the same buffer.
+        # into the same buffer. paged_update_cache requires the input as a
+        # height-sharded L1 tensor of shape [1, B, 1, D] (note: outer dim 1
+        # is the trailing-batch convention) and reads `update_idxs_tensor`
+        # as a device tensor, so the slot stays trace-safe.
         with _phase("attn.kv_update"):
-            kv_4d = ttnn.reshape(kv_tt, [B, 1, 1, D])
-            ttnn.kv_cache.update_cache_for_token_(
-                self.kv_cache_tt, kv_4d, start_pos % win, 0
+            kv_4d = ttnn.reshape(kv_tt, [1, B, 1, D])
+            kv_4d_sharded = ttnn.to_memory_config(
+                kv_4d, memory_config=self._kv_input_sharded_memcfg)
+            ttnn.experimental.paged_update_cache(
+                self.kv_cache_tt, kv_4d_sharded,
+                update_idxs_tensor=self._kv_slot_tt,
             )
         if self.compress_ratio:
             with _phase("attn.compress"):
