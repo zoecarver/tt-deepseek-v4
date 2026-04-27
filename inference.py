@@ -4572,21 +4572,35 @@ class DeviceAttention(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._upload_mapper,
         )
-        # Window topk index lookup table: [1, 2*win, win] int32, replicated.
-        # Per-step we slice row s = _window_topk_row_for_pos(start_pos, win)
-        # to get [B=1, 1, win], reproducing get_window_topk_idxs without any
-        # host transfer. See _build_window_topk_table for the layout.
+        # Window topk index lookup table: [max_seq_len, win] bf16, replicated.
+        # `_win_idxs_padded_tt[start_pos]` already holds the per-position row
+        # produced by `_window_topk_row_for_pos(start_pos, win)`, so the
+        # per-step pick is `ttnn.embedding(start_pos_tt, _win_idxs_padded_tt)`
+        # — no Python-int slice index. window_size <= 256 fits exactly in
+        # bf16 (no rounding), and the int32 typecast inside the body
+        # restores the dtype downstream code expects.
         if B != 1:
             raise ValueError(
                 f"DeviceAttention only supports B=1, got B={B}; "
-                "_win_idxs_table_tt is sized for [1, 2*win, win]."
+                "_win_idxs_padded_tt is sized for [max_seq_len, win]."
             )
-        win_table = _build_window_topk_table(self.window_size).view(
-            1, 2 * self.window_size, self.window_size
-        )
-        self._win_idxs_table_tt = ttnn.from_torch(
-            win_table,
-            device=self.mesh, dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT,
+        if self.window_size > 256:
+            raise ValueError(
+                f"window_size {self.window_size} > 256: bf16 cannot represent "
+                "all integer index values exactly; switch the lookup table "
+                "back to int32 + a different gather op when this fires."
+            )
+        full_table = _build_window_topk_table(self.window_size)
+        win_idxs_padded = full_table[
+            torch.tensor(
+                [_window_topk_row_for_pos(p, self.window_size)
+                 for p in range(self.max_seq_len)],
+                dtype=torch.long,
+            )
+        ].to(torch.bfloat16).contiguous()
+        self._win_idxs_padded_tt = ttnn.from_torch(
+            win_idxs_padded,
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._upload_mapper,
         )
@@ -4950,11 +4964,16 @@ class DeviceAttention(nn.Module):
         #  * device_indexer absent (compress_ratio in {2, 128, ...}): slice
         #    the precomputed [win, win+1, ..., win+max_T-1] ramp on device.
         with _phase("attn.topk"):
-            win_row = _window_topk_row_for_pos(start_pos, win)
-            topk_idxs_dev = ttnn.slice(
-                self._win_idxs_table_tt,
-                [0, win_row, 0], [B, win_row + 1, win],
+            # Row pick via ttnn.embedding against the [max_seq_len, win]
+            # bf16 table; output is [1, 1, win] bf16 → typecast int32 →
+            # reshape to [B=1, 1, win] (same shape the int32 slice used to
+            # produce). Keeps the slice index on device for tracing.
+            win_idxs_bf16 = ttnn.embedding(
+                start_pos_tt, self._win_idxs_padded_tt,
+                layout=ttnn.TILE_LAYOUT,
             )
+            topk_idxs_dev = ttnn.typecast(win_idxs_bf16, dtype=ttnn.int32)
+            topk_idxs_dev = ttnn.reshape(topk_idxs_dev, [B, 1, win])
             topk_idxs_dev_K = win
             if self.compress_ratio:
                 T_active = (start_pos + 1) // self.compress_ratio
