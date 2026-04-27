@@ -664,7 +664,7 @@ class Block(nn.Module):
             self.hc_ffn_scale = nn.Parameter(torch.empty(3))
 
 
-def _block_forward(layer, x, start_pos: int,
+def _block_forward(layer, x, start_pos: int, start_pos_tt,
                    input_ids_tt,
                    B: int, S: int, mhc: int, hidden: int,
                    orig_dtype):
@@ -710,7 +710,7 @@ def _block_forward(layer, x, start_pos: int,
         ttnn.slice(norm_out_tt, [0, 0], [num_tokens, hidden],
                    output_tensor=mhc_attn._norm_slice_tt)
         bridge_tt = ttnn.reshape(mhc_attn._norm_slice_tt, [B, S, hidden])
-        attn_out_tt = attn_dev.forward_device(bridge_tt, start_pos)
+        attn_out_tt = attn_dev.forward_device(bridge_tt, start_pos, start_pos_tt)
     with _phase("block.hc_post"):
         x_2d = ttnn.reshape(attn_out_tt, [num_tokens, 1, hidden])
         x_repeated = ttnn.repeat(x_2d, ttnn.Shape([1, mhc, 1]))
@@ -827,6 +827,18 @@ class Transformer(nn.Module):
         ttnn.copy_host_to_device_tensor(ids_host, self._input_ids_tt)
         input_ids_tt = self._input_ids_tt
 
+        # Upload start_pos as a [1, 1] uint32 device tensor. Consumed by
+        # DeviceAttention rotary, DeviceIndexer rotary, and DeviceCompressor
+        # ape/freq pickers via ttnn.embedding — keeps the slice index on
+        # device so the surrounding op sequence is trace-stable.
+        sp_host = ttnn.from_torch(
+            torch.tensor([[start_pos]], dtype=torch.int32),
+            dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=self._input_ids_upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(sp_host, self._start_pos_tt)
+        start_pos_tt = self._start_pos_tt
+
         with _phase("embed"):
             embed_tt = self.embed(input_ids_tt)
             e_2d = ttnn.reshape(embed_tt, [num_tokens, hidden])
@@ -839,7 +851,8 @@ class Transformer(nn.Module):
             )
         with _phase("blocks"):
             for layer in self.layers:
-                a_tt = _block_forward(layer, a_tt, start_pos, input_ids_tt,
+                a_tt = _block_forward(layer, a_tt, start_pos, start_pos_tt,
+                                      input_ids_tt,
                                       B, S, mhc, hidden, orig_dtype)
         with _phase("head"):
             logits = self.head(a_tt, num_tokens)
@@ -4758,10 +4771,20 @@ class DeviceAttention(nn.Module):
         self._indexer_topk_trace_id_per_bucket[bucket] = trace_id
         self._indexer_topk_out_per_bucket[bucket] = out_tt
 
-    def forward_device(self, x_tt, start_pos: int):
+    def forward_device(self, x_tt, start_pos: int, start_pos_tt=None):
         """Pure-device attention body. x_tt is the pre-uploaded
         [B, 1, dim] device tensor; returns out_tt [B, 1, dim] device
         tensor. Caller is responsible for upload/download.
+
+        start_pos_tt: [1, 1] uint32 device tensor holding start_pos. Threaded
+        through from Transformer.forward and used by _rotary_tables to pick
+        cos/sin rows via ttnn.embedding so the rotary slice index lives on
+        device. The legacy Python-int start_pos is still required for the
+        compressor emit branch (`(start_pos+1) % ratio != 0`), kv_cache slot
+        args, and the indexer T_active stage; those will be hoisted next.
+
+        When called via the standalone `_decode` host-test wrapper (no chained
+        Transformer.forward), start_pos_tt is None and we synthesize it here.
 
         Requires offload_compressor_indexer: attn._device_compressor and
         (when compress_ratio is set) attn._device_indexer must be bound.
@@ -4770,6 +4793,14 @@ class DeviceAttention(nn.Module):
         attn = self.attn
         B = int(x_tt.shape[0])
         S = 1
+        if start_pos_tt is None:
+            start_pos_tt = ttnn.from_torch(
+                torch.tensor([[start_pos]], dtype=torch.int32),
+                device=self.mesh, dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+            )
         H, D = self.n_heads, self.head_dim
         rd = self.rope_head_dim
         win = self.window_size
@@ -4806,7 +4837,7 @@ class DeviceAttention(nn.Module):
             q_tt = ttnn.reshape(q_full_tt, [B, S, H, D])
             q_tt = _device_q_rsqrt_norm(ttnn, q_tt, self.eps)
 
-            cos_q, sin_q = self._rotary_tables(start_pos, S, q_dims=4)
+            cos_q, sin_q = self._rotary_tables(start_pos_tt, S, q_dims=4)
             # Rotate q[..., -rd:] by slicing -> rotating -> concatenating.
             ttnn.slice(q_tt, [0, 0, 0, 0], [B, S, H, D - rd],
                        output_tensor=self._q_nope_scratch_tt)
@@ -4822,7 +4853,7 @@ class DeviceAttention(nn.Module):
             kv_2d = ttnn.reshape(kv_tt, [B * S, D])
             kv_2d = self._rmsnorm_device(self.kv_norm_dev, kv_2d, B * S)
             kv_tt = ttnn.reshape(kv_2d, [B, S, D])
-            cos_kv, sin_kv = self._rotary_tables(start_pos, S, q_dims=3)
+            cos_kv, sin_kv = self._rotary_tables(start_pos_tt, S, q_dims=3)
             ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd],
                        output_tensor=self._kv_nope_scratch_tt)
             ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D],
@@ -4937,7 +4968,7 @@ class DeviceAttention(nn.Module):
 
         with _phase("attn.o"):
             # Inverse rotary on o[..., -rd:].
-            cos_o, sin_o = self._rotary_tables(start_pos, S, q_dims=4)
+            cos_o, sin_o = self._rotary_tables(start_pos_tt, S, q_dims=4)
             ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H, D - rd],
                        output_tensor=self._o_nope_scratch_tt)
             ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H, D],
@@ -4985,14 +5016,22 @@ class DeviceAttention(nn.Module):
             out = ttnn.slice(out, [0, 0], [num_rows, hidden])
         return out
 
-    def _rotary_tables(self, start_pos: int, S: int, q_dims: int):
-        """Slice cos/sin tables for [start_pos:start_pos+S] and reshape for
-        broadcasting against q (4D, [B,S,H,rd/2,1] post-unsqueeze) or kv
-        (3D, [B,S,rd/2,1])."""
+    def _rotary_tables(self, start_pos_tt, S: int, q_dims: int):
+        """Pick cos/sin rows for `start_pos_tt` via ttnn.embedding and reshape
+        for broadcasting against q (4D, [B,S,H,rd/2,1] post-unsqueeze) or kv
+        (3D, [B,S,rd/2,1]). start_pos_tt is a [1, 1] uint32 device tensor;
+        keeping the row index on device makes the surrounding rotary op
+        sequence trace-stable across decode positions. S must be 1 (decode)."""
         ttnn = self._ttnn
+        if S != 1:
+            raise ValueError(
+                f"_rotary_tables expects S=1 for the device decode path, got S={S}"
+            )
         rd_half = self.rope_head_dim // 2
-        cos = ttnn.slice(self.cos_full_tt, [start_pos, 0], [start_pos + S, rd_half])
-        sin = ttnn.slice(self.sin_full_tt, [start_pos, 0], [start_pos + S, rd_half])
+        cos = ttnn.embedding(
+            start_pos_tt, self.cos_full_tt, layout=ttnn.TILE_LAYOUT)
+        sin = ttnn.embedding(
+            start_pos_tt, self.sin_full_tt, layout=ttnn.TILE_LAYOUT)
         if q_dims == 4:
             cos = ttnn.reshape(cos, [1, S, 1, rd_half])
             sin = ttnn.reshape(sin, [1, S, 1, rd_half])
@@ -5499,6 +5538,20 @@ class Model:
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
         )
         self.transformer._input_ids_upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
+
+        # Single shared per-step start_pos upload buffer. Used by rotary
+        # cos/sin row pickers (DeviceAttention, DeviceIndexer) and the
+        # compressor (freq_idx, slot_in_ape) — every site that previously
+        # passed `start_pos` as a Python int into ttnn.slice now reads from
+        # this tensor via ttnn.embedding so the slice index lives on device
+        # and the surrounding op sequence is trace-stable across steps.
+        self.transformer._start_pos_tt = ttnn.from_torch(
+            torch.zeros(1, 1, dtype=torch.int32),
+            device=mesh, dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
 
         def _device_embed(self_embed, ids_tt):
             """Return a ttnn device tensor [B, S, hidden] bf16 TILE_LAYOUT,
