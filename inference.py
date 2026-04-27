@@ -562,12 +562,12 @@ class MoE(nn.Module):
           indices_tt: int32 [1, topk] replicated
           shared_out_tt: bf16 [1, dim] replicated (shared expert output)
 
-        Cached weights (attached by Model.offload_moe_routed_experts):
-          self._w1_tt:        bfp4_b [1, 1, per_chip, dim, inter] sharded
-          self._w1_scale_tt:  bf16   [1, 1, per_chip, dim/32, inter] sharded
-          self._w3_tt, self._w3_scale_tt: same shape as w1
-          self._w2_tt:        bfp4_b [1, 1, per_chip, inter, dim] sharded
-          self._w2_scale_tt:  bf16   [1, 1, per_chip, inter/32, dim] sharded
+        Cached weights (attached by Model.offload_moe_routed_experts;
+        natively quantized as bfp4_b — ttnn.matmul dequantizes each tile
+        on the fly using the format's intrinsic per-tile exponent):
+          self._w1_tt:        bfp4_b [1, per_chip, dim, inter] sharded
+          self._w3_tt:        bfp4_b [1, per_chip, dim, inter] sharded
+          self._w2_tt:        bfp4_b [1, per_chip, inter, dim] sharded
           self._chip_local_ids_tt: int32 [1, 1, per_chip] sharded
           self._n_per_chip: experts per chip (== n_routed_experts // mesh_size)
 
@@ -601,14 +601,10 @@ class MoE(nn.Module):
         # other isn't, so we repeat x along the per_chip dim explicitly.
         x_4d = ttnn.reshape(x_tt, [1, 1, 1, dim])
         x_grouped = ttnn.repeat(x_4d, [1, per_chip, 1, 1])  # [1, per_chip, 1, dim]
-        y1 = _fp4_gemm_via_bfp4(
-            ttnn, x_grouped, self._w1_tt, self._w1_scale_tt,
-            bf16_scratch=self._w13_bf16_scratch_tt,
-            out_y=self._fp4_y1_scratch_tt)
-        y3 = _fp4_gemm_via_bfp4(
-            ttnn, x_grouped, self._w3_tt, self._w3_scale_tt,
-            bf16_scratch=self._w13_bf16_scratch_tt,
-            out_y=self._fp4_y3_scratch_tt)
+        y1 = ttnn.matmul(x_grouped, self._w1_tt,
+                         optional_output_tensor=self._fp4_y1_scratch_tt)
+        y3 = ttnn.matmul(x_grouped, self._w3_tt,
+                         optional_output_tensor=self._fp4_y3_scratch_tt)
         if self.experts[0].swiglu_limit > 0:
             limit = float(self.experts[0].swiglu_limit)
             ttnn.clamp(y1, max=limit, output_tensor=y1)
@@ -616,10 +612,8 @@ class MoE(nn.Module):
         ttnn.silu(y1, output_tensor=y1)
         ttnn.multiply(y1, y3, output_tensor=y1)  # glu = silu(y1) * y3 (in-place)
 
-        y = _fp4_gemm_via_bfp4(
-            ttnn, y1, self._w2_tt, self._w2_scale_tt,
-            bf16_scratch=self._w2_bf16_scratch_tt,
-            out_y=self._fp4_y2_scratch_tt)
+        y = ttnn.matmul(y1, self._w2_tt,
+                        optional_output_tensor=self._fp4_y2_scratch_tt)
 
         ttnn.multiply(y, mask, output_tensor=y)  # y_masked (in-place)
 
@@ -4262,38 +4256,31 @@ def _remap_bfp4_lattice_to_fp4_mags(ttnn, b_tt):
     return ttnn.add(ttnn.add(two_b, step1), step15)
 
 
-def _fp4_gemm_via_bfp4(ttnn, x_tt, w_bfp4_tt, scale_compact_tt,
-                       *, bf16_scratch, out_y):
-    """y = x @ dequant(w_fp4, scale).
-
-    Shape-agnostic in the leading dims: works for both 2D (single-expert
-    [K, N] @ [..., K]) and 5D grouped-expert ([1, 1, E, K, N] @
-    [1, 1, 1, 1, K]) layouts. The leading dims of x and w broadcast.
-
-    x_tt: bf16, last-dim-K matching the weight.
-    w_bfp4_tt: bfp4_b [..., K, N] (matmul order), tile layout.
-    scale_compact_tt: bf16 [..., Kb, N] with Kb = K / FP4_BLOCK_K.
+def _dequant_to_native_bfp4(ttnn, w_bfp4_lattice_tt, scale_compact_tt,
+                             *, bf16_scratch):
+    """One-shot offload-time dequant: bfp4-lattice + compact-scale ->
+    native bfp4_b weight tensor whose intrinsic per-tile exponent captures
+    the actual weight magnitudes.
 
     Steps (all on device):
       1) typecast bfp4 -> bf16 (lossless; lattice values are bf16-exact)
       2) algebraic remap: bfp4 lattice -> fp4 e2m1 magnitudes
-      3) repeat_interleave the compact scale Kb -> K, multiply
-      4) bf16 @ bf16 matmul
+      3) repeat_interleave compact scale Kb -> K, multiply by remapped weights
+      4) typecast bf16 -> bfp4_b (re-quantize with native scale)
 
-    Per-step / per-layer / per-weight; called 240x per decode step (40 MoE
-    layers x 6 = w1/w1s + w3/w3s + w2/w2s).
-
-    bf16_scratch: pre-allocated bf16 tensor matching w_bfp4_tt shape, used
-        as typecast destination. Caller owns it; not deallocated.
-    out_y: pre-allocated bf16 matmul output. Caller owns it.
+    Run once per (layer, weight) at startup. The returned bfp4_b weight is
+    drop-in for `ttnn.matmul(x_bf16, w_bfp4_b)` -- no per-call dequant.
     """
-    ttnn.typecast(w_bfp4_tt, ttnn.bfloat16, output_tensor=bf16_scratch)
+    ttnn.typecast(w_bfp4_lattice_tt, ttnn.bfloat16, output_tensor=bf16_scratch)
     w_remap = _remap_bfp4_lattice_to_fp4_mags(ttnn, bf16_scratch)
     scale_expanded = ttnn.repeat_interleave(
         scale_compact_tt, repeats=FP4_BLOCK_K, dim=-2)
     w_scaled = ttnn.multiply(w_remap, scale_expanded)
-    ttnn.matmul(x_tt, w_scaled, optional_output_tensor=out_y)
-    return out_y
+    ttnn.deallocate(w_remap)
+    ttnn.deallocate(scale_expanded)
+    w_native = ttnn.typecast(w_scaled, ttnn.bfloat4_b)
+    ttnn.deallocate(w_scaled)
+    return w_native
 
 
 def _make_chip_local_ids_tt(ttnn, mesh, mesh_shape, n_experts: int):
@@ -4887,8 +4874,6 @@ class Model:
         rows, cols = mesh_shape
         n_chips = rows * cols
         self._device_routed_experts = []
-        self._routed_w13_bf16_scratch_tt = None
-        self._routed_w2_bf16_scratch_tt = None
         for layer in self.transformer.layers:
             ffn = layer.ffn
             if not isinstance(ffn, MoE):
@@ -4929,12 +4914,38 @@ class Model:
                 t = ttnn.load_tensor(str(ttnn_path), device=mesh)
                 return ttnn.reshape(t, [1, n_per_chip, Kb, N])
 
-            ffn._w1_tt = _load_w(paths["w1"], dim, inter)
-            ffn._w1_scale_tt = _load_s(paths["w1_scale"], kb_w1, inter)
-            ffn._w3_tt = _load_w(paths["w3"], dim, inter)
-            ffn._w3_scale_tt = _load_s(paths["w3_scale"], kb_w1, inter)
-            ffn._w2_tt = _load_w(paths["w2"], inter, dim)
-            ffn._w2_scale_tt = _load_s(paths["w2_scale"], kb_w2, dim)
+            # Per-(layer, weight) reusable bf16 scratch for the offload-time
+            # dequant of bfp4-lattice -> bf16 -> native bfp4_b. Scratch is the
+            # full sharded weight shape; freed after this layer's three weights
+            # are converted.
+            w13_scratch = ttnn.from_torch(
+                torch.zeros([1, n_per_chip, dim, inter], dtype=torch.bfloat16),
+                device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            )
+            w2_scratch = ttnn.from_torch(
+                torch.zeros([1, n_per_chip, inter, dim], dtype=torch.bfloat16),
+                device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            )
+
+            def _convert(name_w, name_s, K, N, Kb, scratch):
+                w_lat = _load_w(paths[name_w], K, N)
+                s_compact = _load_s(paths[name_s], Kb, N)
+                w_native = _dequant_to_native_bfp4(
+                    ttnn, w_lat, s_compact, bf16_scratch=scratch)
+                ttnn.deallocate(w_lat)
+                ttnn.deallocate(s_compact)
+                return w_native
+
+            ffn._w1_tt = _convert("w1", "w1_scale", dim, inter, kb_w1, w13_scratch)
+            ffn._w3_tt = _convert("w3", "w3_scale", dim, inter, kb_w1, w13_scratch)
+            ffn._w2_tt = _convert("w2", "w2_scale", inter, dim, kb_w2, w2_scratch)
+            ttnn.deallocate(w13_scratch)
+            ttnn.deallocate(w2_scratch)
+
             ffn._chip_local_ids_tt = _make_chip_local_ids_tt(
                 ttnn, mesh, mesh_shape, ffn.n_routed_experts)
             # Pre-shape chip_ids to [1, per_chip, 1, 1]: matches the per_chip
@@ -4944,8 +4955,8 @@ class Model:
                 ffn._chip_local_ids_tt, [1, n_per_chip, 1, 1])
             ffn._n_per_chip = n_per_chip
 
-            # Per-MoE pre-allocated matmul output scratches for _fp4_gemm_via_bfp4.
-            # Tiny (~32-64KB per chip per scratch); replicated, written each call.
+            # Per-MoE pre-allocated matmul output scratches. Tiny
+            # (~32-64KB per chip per scratch); replicated, written each call.
             def _alloc_y_scratch(N):
                 return ttnn.from_torch(
                     torch.zeros([1, n_per_chip, 1, N], dtype=torch.bfloat16),
@@ -4957,24 +4968,6 @@ class Model:
             ffn._fp4_y3_scratch_tt = _alloc_y_scratch(inter)
             ffn._fp4_y2_scratch_tt = _alloc_y_scratch(dim)
 
-            # Shared bf16 typecast destinations for fp4_gemm. Two shapes
-            # (w1/w3 use [K=dim, N=inter]; w2 uses [K=inter, N=dim]).
-            # Allocated once on the model and reused across every layer.
-            if self._routed_w13_bf16_scratch_tt is None:
-                self._routed_w13_bf16_scratch_tt = ttnn.from_torch(
-                    torch.zeros([1, n_per_chip, dim, inter], dtype=torch.bfloat16),
-                    device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
-                )
-                self._routed_w2_bf16_scratch_tt = ttnn.from_torch(
-                    torch.zeros([1, n_per_chip, inter, dim], dtype=torch.bfloat16),
-                    device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
-                )
-            ffn._w13_bf16_scratch_tt = self._routed_w13_bf16_scratch_tt
-            ffn._w2_bf16_scratch_tt = self._routed_w2_bf16_scratch_tt
             for expert in ffn.experts:
                 expert.w1.weight.data = torch.empty(0)
                 expert.w2.weight.data = torch.empty(0)
