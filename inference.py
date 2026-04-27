@@ -4308,7 +4308,16 @@ class DeviceCompressor(nn.Module):
 
         if (start_pos + 1) % ratio != 0:
             return None
+        return self._emit_body(B, d, rd, start_pos_tt)
 
+    def _emit_body(self, B: int, d: int, rd: int, start_pos_tt):
+        """Pure-device emit-step body. Runs only on positions where
+        `(start_pos + 1) % ratio == 0` — the caller branches on that on
+        host. Reads kv/score state from `*_state_*_tt`, writes the
+        compressed kv slot into `kv_cache_tt` and rotates state buffers
+        for the next step. The host-int `start_pos` is intentionally not
+        read here so the body is trace-stable across emit positions."""
+        ttnn = self._ttnn
         if self.overlap:
             # Fused slice/concat + softmax + weighted-sum + RMSNorm via
             # tt-lang kernel. Padding rows of score_state_*_tt hold -inf
