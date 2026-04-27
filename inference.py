@@ -735,8 +735,9 @@ def _block_forward(layer, x, start_pos: int,
         norm_out_tt = attn_norm_dn.forward_device(
             attn_norm_dn._x_upload_tt, num_tokens)
     with _phase("block.attn"):
-        sliced = ttnn.slice(norm_out_tt, [0, 0], [num_tokens, hidden])
-        bridge_tt = ttnn.reshape(sliced, [B, S, hidden])
+        ttnn.slice(norm_out_tt, [0, 0], [num_tokens, hidden],
+                   output_tensor=mhc_attn._norm_slice_tt)
+        bridge_tt = ttnn.reshape(mhc_attn._norm_slice_tt, [B, S, hidden])
         attn_out_tt = attn_dev.forward_device(bridge_tt, start_pos)
     with _phase("block.hc_post"):
         x_2d = ttnn.reshape(attn_out_tt, [num_tokens, 1, hidden])
@@ -763,9 +764,10 @@ def _block_forward(layer, x, start_pos: int,
         ffn_norm_out_tt = ffn_norm_dn.forward_device(
             ffn_norm_dn._x_upload_tt, num_tokens)
     with _phase("block.ffn"):
-        ffn_norm_sliced = ttnn.slice(
-            ffn_norm_out_tt, [0, 0], [num_tokens, hidden])
-        moe_out_tt = layer.ffn.forward_device(ffn_norm_sliced, input_ids)
+        ttnn.slice(ffn_norm_out_tt, [0, 0], [num_tokens, hidden],
+                   output_tensor=mhc_ffn._norm_slice_tt)
+        moe_out_tt = layer.ffn.forward_device(
+            mhc_ffn._norm_slice_tt, input_ids)
     with _phase("block.hc_post"):
         x_2d = ttnn.reshape(moe_out_tt, [num_tokens, 1, hidden])
         x_repeated = ttnn.repeat(x_2d, ttnn.Shape([1, mhc, 1]))
@@ -2362,6 +2364,15 @@ class DeviceMHC(nn.Module):
             torch.zeros(num_tokens * _MHC_TILE, self.hidden,
                         dtype=torch.float32),
             device=self.mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        # Pre-allocated destination for the post-norm slice that feeds the
+        # downstream attn / ffn forward. ttnn.slice accepts output_tensor=, so
+        # _block_forward can drop a per-call alloc here.
+        self._norm_slice_tt = ttnn.from_torch(
+            torch.zeros(num_tokens, self.hidden, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
