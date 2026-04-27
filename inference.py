@@ -710,7 +710,9 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
         ttnn.slice(norm_out_tt, [0, 0], [num_tokens, hidden],
                    output_tensor=mhc_attn._norm_slice_tt)
         bridge_tt = ttnn.reshape(mhc_attn._norm_slice_tt, [B, S, hidden])
-        attn_dev.pre_stage_decode(start_pos, B=B, S=S)
+        # pre_stage_decode is called by Transformer._run_blocks for ALL
+        # layers BEFORE the block loop, so the body here is pure device
+        # work (no host->device uploads inside what will be the trace).
         attn_out_tt = attn_dev.forward_device(bridge_tt, start_pos, start_pos_tt)
     with _phase("block.hc_post"):
         x_2d = ttnn.reshape(attn_out_tt, [num_tokens, 1, hidden])
@@ -841,6 +843,17 @@ class Transformer(nn.Module):
         )
         ttnn.copy_host_to_device_tensor(sp_host, self._start_pos_tt)
         start_pos_tt = self._start_pos_tt
+
+        # Stage all per-layer host->device uploads BEFORE running any
+        # blocks, so the block loop body becomes pure device work that
+        # can later be wrapped in a single trace_capture region. Each
+        # DeviceAttention.pre_stage_decode also recurses into its
+        # compressor and indexer, covering every per-step slot/T_active
+        # upload for the whole layer.
+        with _phase("pre_stage"):
+            for layer in self.layers:
+                attn_dev = layer.attn.forward.__self__
+                attn_dev.pre_stage_decode(start_pos, B=B, S=S)
 
         with _phase("embed"):
             embed_tt = self.embed(input_ids_tt)
