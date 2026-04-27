@@ -4181,6 +4181,55 @@ class DeviceCompressor(nn.Module):
             self.kv_cache_tt = ttnn.as_tensor(
                 kv_cache_init.view(B, 1, T_pad, d).contiguous(), **rep)
 
+        # Per-step slot upload buffers + height-sharded L1 memory config used
+        # by paged_update_cache. There are three slot families:
+        #   * `_state_slot_tt`:    state buffer slot (overlap → ratio +
+        #                          start_pos % ratio; non-overlap → start_pos
+        #                          % ratio).
+        #   * `_emit_slot_tt`:     kv_cache_tt write slot at emit positions
+        #                          (slot_offset + start_pos // ratio).
+        # Both are uploaded once per step before the body runs so the slots
+        # stay out of any future trace-replay's recorded constants.
+        slot_upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
+        self._state_slot_tt = ttnn.from_torch(
+            torch.zeros(B, dtype=torch.int32),
+            device=self.mesh, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=slot_upload_mapper,
+        )
+        self._emit_slot_tt = ttnn.from_torch(
+            torch.zeros(B, dtype=torch.int32),
+            device=self.mesh, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=slot_upload_mapper,
+        )
+        self._slot_upload_mapper = slot_upload_mapper
+        # State buffers (kv_state_*, score_state_*) and the shared kv_cache_tt
+        # all have last dim d, so a single height-sharded L1 memcfg with
+        # shard_width=d satisfies paged_update_cache for every site.
+        self._sharded_input_memcfg = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.L1,
+            ttnn.ShardSpec(
+                ttnn.CoreRangeSet(
+                    {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0))}),
+                (32, d),
+                ttnn.ShardOrientation.ROW_MAJOR,
+            ),
+        )
+
+    def _paged_update_cache(self, cache_tt, x_3d_tt, slot_tt, B: int, d: int):
+        """Reshape [B, 1, d] → [1, B, 1, d], convert to height-sharded L1,
+        then call paged_update_cache with the device-tensor slot. Slot has
+        already been uploaded by the caller (typically in the pre-stage
+        block of forward_device) so it lives outside any future trace."""
+        ttnn = self._ttnn
+        x_4d = ttnn.reshape(x_3d_tt, [1, B, 1, d])
+        x_sharded = ttnn.to_memory_config(
+            x_4d, memory_config=self._sharded_input_memcfg)
+        ttnn.experimental.paged_update_cache(
+            cache_tt, x_sharded, update_idxs_tensor=slot_tt)
+
     def forward_device(self, x_tt, B: int, start_pos: int, start_pos_tt=None):
         ttnn = self._ttnn
         ratio = self.compress_ratio
@@ -4199,14 +4248,30 @@ class DeviceCompressor(nn.Module):
                 mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
             )
 
+        # Upload per-step slot tensors before any device work so the slots
+        # are already on device by the time kv_cache writes execute. Both
+        # state and emit slots are staged unconditionally; non-emit steps
+        # simply ignore _emit_slot_tt.
+        slot_in_ape = start_pos % ratio
+        state_slot_int = (ratio + slot_in_ape) if self.overlap else slot_in_ape
+        comp_idx = start_pos // ratio
+        emit_slot_int = self.slot_offset + comp_idx
+        slot_host = ttnn.from_torch(
+            torch.tensor([state_slot_int], dtype=torch.int32),
+            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=self._slot_upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(slot_host, self._state_slot_tt)
+        emit_host = ttnn.from_torch(
+            torch.tensor([emit_slot_int], dtype=torch.int32),
+            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=self._slot_upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(emit_host, self._emit_slot_tt)
+
         kv_tt = self.wkv.forward_device(x_tt)
         score_tt = self.wgate.forward_device(x_tt)
 
-        # slot_in_ape (still a host int) parameterizes the kv_cache update
-        # slot below; the ape row pick has been moved to ttnn.embedding so
-        # the slice index is on device. Removing the kv_cache.slot host-int
-        # leak is task #160 (paged_update_cache).
-        slot_in_ape = start_pos % ratio
         # ape_padded_tt[start_pos] == ape_tt[start_pos % ratio]; lets the
         # row pick stay on device.
         ape_slot = ttnn.embedding(
@@ -4218,21 +4283,19 @@ class DeviceCompressor(nn.Module):
             kv_back  = ttnn.slice(kv_tt, [0, 0, d], [B, 1, c])
             score_front = ttnn.slice(score_tt, [0, 0, 0], [B, 1, d])
             score_back  = ttnn.slice(score_tt, [0, 0, d], [B, 1, c])
-            slot = ratio + slot_in_ape
-            ttnn.kv_cache.update_cache_for_token_(self.kv_state_front_tt,
-                                                  ttnn.reshape(kv_front, [B, 1, 1, d]), slot, 0)
-            ttnn.kv_cache.update_cache_for_token_(self.kv_state_back_tt,
-                                                  ttnn.reshape(kv_back, [B, 1, 1, d]), slot, 0)
-            ttnn.kv_cache.update_cache_for_token_(self.score_state_front_tt,
-                                                  ttnn.reshape(score_front, [B, 1, 1, d]), slot, 0)
-            ttnn.kv_cache.update_cache_for_token_(self.score_state_back_tt,
-                                                  ttnn.reshape(score_back, [B, 1, 1, d]), slot, 0)
+            self._paged_update_cache(
+                self.kv_state_front_tt, kv_front, self._state_slot_tt, B, d)
+            self._paged_update_cache(
+                self.kv_state_back_tt, kv_back, self._state_slot_tt, B, d)
+            self._paged_update_cache(
+                self.score_state_front_tt, score_front, self._state_slot_tt, B, d)
+            self._paged_update_cache(
+                self.score_state_back_tt, score_back, self._state_slot_tt, B, d)
         else:
-            slot = slot_in_ape
-            ttnn.kv_cache.update_cache_for_token_(self.kv_state_front_tt,
-                                                  ttnn.reshape(kv_tt, [B, 1, 1, d]), slot, 0)
-            ttnn.kv_cache.update_cache_for_token_(self.score_state_front_tt,
-                                                  ttnn.reshape(score_tt, [B, 1, 1, d]), slot, 0)
+            self._paged_update_cache(
+                self.kv_state_front_tt, kv_tt, self._state_slot_tt, B, d)
+            self._paged_update_cache(
+                self.score_state_front_tt, score_tt, self._state_slot_tt, B, d)
 
         if (start_pos + 1) % ratio != 0:
             return None
@@ -4300,10 +4363,8 @@ class DeviceCompressor(nn.Module):
         if self.rotate:
             kv_normed = _device_rotate_activation(ttnn, kv_normed, self.h_tt)
 
-        comp_idx = start_pos // ratio
-        kv_4d_out = ttnn.reshape(kv_normed, [B, 1, 1, d])
-        ttnn.kv_cache.update_cache_for_token_(self.kv_cache_tt, kv_4d_out,
-                                              self.slot_offset + comp_idx, 0)
+        self._paged_update_cache(
+            self.kv_cache_tt, kv_normed, self._emit_slot_tt, B, d)
 
         # Slot-shift via tt-lang kernel (compressor_slot_shift). One kernel
         # call per buffer (4 dispatches) replaces the old 16-dispatch loop
