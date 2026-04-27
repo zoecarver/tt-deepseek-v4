@@ -1660,6 +1660,9 @@ _MHC_TILE = 32
 _MHC_PAD_SENTINEL = -1e4
 # Fixed by the V4-Flash hc_split_sinkhorn reference (post = 2 * sigmoid(...)).
 _MHC_POST_MULT = 2.0
+# K-split fanout for the decode-only norm_fn ksplit kernel. 8 is the optimal
+# benchmarked point; higher Kp plateaus on speedup and PCC degrades.
+_MHC_NORM_FN_KP = 8
 
 
 def _mhc_pack_residual(residual: torch.Tensor, num_tokens_pad: int) -> torch.Tensor:
@@ -1888,6 +1891,163 @@ def _compile_mhc_norm_fn_kernel(num_out_tiles: int, K_tiles: int, rms_eps: float
     return norm_fn_kernel
 
 
+def _compile_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int, rms_eps: float,
+                                       inv_D: float, *, grid_cols: int = 8):
+    """Inlined from tt-lang-kernels/pre_norm_fn_ksplit.py.
+
+    K-axis-parallel version of pre_norm_fn for num_out_tiles=1 (decode).
+    Splits the K-loop across Kp cores; root gathers matmul + ssq partials,
+    finalizes inv_rms and writes the row. Optimal Kp=8 at V4-Flash decode
+    (D=16384, K_tiles=512): 0.25ms vs 0.69ms single-core (~2.8x speedup,
+    PCC 0.989).
+    """
+    if Kp < 2:
+        raise ValueError(f"ksplit kernel requires Kp >= 2, got {Kp}")
+    if K_tiles % Kp:
+        raise ValueError(f"K_tiles={K_tiles} not divisible by Kp={Kp}")
+    if Kp < grid_cols:
+        grid_cols = Kp
+    if Kp % grid_cols:
+        raise ValueError(f"Kp={Kp} not divisible by grid_cols={grid_cols}")
+    if Kp - 1 > 32:
+        raise ValueError(f"Kp={Kp} requires block_count={Kp-1} > 32")
+
+    K_BPN = K_tiles // Kp
+    COL = grid_cols
+    ROW = Kp // grid_cols
+
+    @ttl.operation(
+        grid=(COL, ROW),
+        options="--no-ttl-reduce-full-fp32",
+        fp32_dest_acc_en=True,
+    )
+    def norm_fn_ksplit_kernel(a, b, scaler, out):
+        c_reduce_pipes = [
+            ttl.Pipe(src=(col, row), dst=(0, 0))
+            for row in range(ROW)
+            for col in range(COL)
+            if not (col == 0 and row == 0)
+        ]
+        c_reduce_net = ttl.PipeNet(c_reduce_pipes)
+
+        sq_reduce_pipes = [
+            ttl.Pipe(src=(col, row), dst=(0, 0))
+            for row in range(ROW)
+            for col in range(COL)
+            if not (col == 0 and row == 0)
+        ]
+        sq_reduce_net = ttl.PipeNet(sq_reduce_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(b, shape=(1, 1), block_count=2)
+        sc_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        c_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        sq_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        inv_bc_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        asq_cb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
+        red_step_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+
+        recv_c_cb = ttl.make_dataflow_buffer_like(
+            out, shape=(1, 1), block_count=max(2, Kp - 1))
+        recv_sq_cb = ttl.make_dataflow_buffer_like(
+            scaler, shape=(1, 1), block_count=max(2, Kp - 1))
+
+        @ttl.compute()
+        def compute():
+            col_c, row_c = ttl.node(dims=2)
+            sc = sc_cb.wait()
+
+            a0 = a_cb.wait()
+            b0 = b_cb.wait()
+            c_cb.reserve().store(a0 @ b0)
+            asq_cb.reserve().store(a0 * a0)
+            sq_cb.reserve().store(
+                ttl.math.reduce_sum(asq_cb.wait(), sc, dims=[1])
+            )
+
+            for _ in range(K_BPN - 1):
+                ak = a_cb.wait()
+                bk = b_cb.wait()
+                prev_c = c_cb.wait()
+                c_cb.reserve().store(prev_c + ak @ bk)
+
+                asq_cb.reserve().store(ak * ak)
+                red_step_cb.reserve().store(
+                    ttl.math.reduce_sum(asq_cb.wait(), sc, dims=[1])
+                )
+                prev_sq = sq_cb.wait()
+                sq_cb.reserve().store(prev_sq + red_step_cb.wait())
+
+            if col_c == 0 and row_c == 0:
+                for _ in range(Kp - 1):
+                    prev_c = c_cb.wait()
+                    r = recv_c_cb.wait()
+                    new_c = c_cb.reserve()
+                    new_c.store(prev_c + r)
+                for _ in range(Kp - 1):
+                    prev_sq = sq_cb.wait()
+                    r = recv_sq_cb.wait()
+                    new_sq = sq_cb.reserve()
+                    new_sq.store(prev_sq + r)
+
+                sq_total = sq_cb.wait()
+                inv_bc = inv_bc_cb.reserve()
+                inv_bc.store(ttl.math.broadcast(
+                    ttl.math.rsqrt(
+                        sq_total * ttl.math.fill(sq_total, inv_D)
+                        + ttl.math.fill(sq_total, rms_eps)
+                    ),
+                    inv_bc, dims=[1],
+                ))
+                c_total = c_cb.wait()
+                out_cb.reserve().store(c_total * inv_bc_cb.wait())
+
+        @ttl.datamovement()
+        def dm_read():
+            col_c, row_c = ttl.node(dims=2)
+            k_p = row_c * COL + col_c
+
+            ttl.copy(scaler[0, 0], sc_cb.reserve()).wait()
+
+            for kb_local in range(K_BPN):
+                kc = k_p * K_BPN + kb_local
+                ttl.copy(a[0, kc], a_cb.reserve()).wait()
+                ttl.copy(b[kc, 0], b_cb.reserve()).wait()
+
+            is_root = (col_c == 0 and row_c == 0)
+            if is_root:
+                def recv_c(pipe):
+                    blk = recv_c_cb.reserve()
+                    ttl.copy(pipe, blk).wait()
+                c_reduce_net.if_dst(recv_c)
+
+                def recv_sq(pipe):
+                    blk = recv_sq_cb.reserve()
+                    ttl.copy(pipe, blk).wait()
+                sq_reduce_net.if_dst(recv_sq)
+            else:
+                p_c = c_cb.wait()
+                def send_c(pipe):
+                    ttl.copy(p_c, pipe).wait()
+                c_reduce_net.if_src(send_c)
+
+                p_sq = sq_cb.wait()
+                def send_sq(pipe):
+                    ttl.copy(p_sq, pipe).wait()
+                sq_reduce_net.if_src(send_sq)
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, row_c = ttl.node(dims=2)
+            if col_c == 0 and row_c == 0:
+                ttl.copy(out_cb.wait(), out[0, 0]).wait()
+
+    return norm_fn_ksplit_kernel
+
+
 def _compile_mhc_apply_mix_kernel(num_tokens: int, h_tiles: int):
     """Inlined from tt-lang-kernels/pre_apply_mix.py.
 
@@ -1958,6 +2118,81 @@ def _compile_mhc_apply_mix_kernel(num_tokens: int, h_tiles: int):
                         ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
 
     return apply_mix_kernel
+
+
+def _compile_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
+    """Inlined from tt-lang-kernels/pre_apply_mix_h.py.
+
+    h-axis-sharded variant: flattens (token, h_tile) into one work axis so
+    `grid="auto"` distributes across all cores. At decode (num_tokens=1,
+    h_tiles=128) this saturates ~130 BH cores (~0.18ms vs 0.25ms single-core,
+    1.36x, PCC 1.0). Each h-tile is independent — no reduce needed.
+    """
+    total_work = num_tokens * h_tiles
+
+    @ttl.operation(grid="auto")
+    def apply_mix_h_kernel(x, mix, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        work_per_core = -(-total_work // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        mix_dfb = ttl.make_dataflow_buffer_like(mix, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        mix_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        prod_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            sc = sc_dfb.wait()
+
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    mix_raw = mix_dfb.wait()
+                    mx = mix_bc_dfb.reserve()
+                    mx.store(ttl.math.broadcast(mix_raw, mx, dims=[1]))
+                    mix_bc = mix_bc_dfb.wait()
+
+                    x_tile = x_dfb.wait()
+                    prod_dfb.reserve().store(x_tile * mix_bc)
+                    red_dfb.reserve().store(
+                        ttl.math.reduce_sum(prod_dfb.wait(), sc, dims=[0])
+                    )
+                    out_dfb.reserve().store(red_dfb.wait())
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    global_t = global_w // h_tiles
+                    global_h = global_w % h_tiles
+                    ttl.copy(mix[global_t, 0], mix_dfb.reserve()).wait()
+                    ttl.copy(x[global_t, global_h], x_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    global_t = global_w // h_tiles
+                    global_h = global_w % h_tiles
+                    ttl.copy(out_dfb.wait(), out[global_t, global_h]).wait()
+
+    return apply_mix_h_kernel
 
 
 def _compile_mhc_split_mixes_kernel(num_tiles: int):
@@ -2389,9 +2624,17 @@ class DeviceMHC(nn.Module):
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
 
     def _norm_fn_kernel(self, num_out_tiles: int):
+        K_tiles = self.D // _MHC_TILE
+        if num_out_tiles == 1 and K_tiles % _MHC_NORM_FN_KP == 0:
+            return _compile_mhc_norm_fn_ksplit_kernel(
+                K_tiles=K_tiles,
+                Kp=_MHC_NORM_FN_KP,
+                rms_eps=self.norm_eps,
+                inv_D=1.0 / self.D,
+            )
         return _compile_mhc_norm_fn_kernel(
             num_out_tiles=num_out_tiles,
-            K_tiles=self.D // _MHC_TILE,
+            K_tiles=K_tiles,
             rms_eps=self.norm_eps,
             inv_D=1.0 / self.D,
         )
@@ -2407,10 +2650,12 @@ class DeviceMHC(nn.Module):
         )
 
     def _apply_mix_kernel(self, num_tokens: int):
+        h_tiles = self.hidden // _MHC_TILE
+        if num_tokens == 1:
+            return _compile_mhc_apply_mix_h_kernel(
+                num_tokens=num_tokens, h_tiles=h_tiles)
         return _compile_mhc_apply_mix_kernel(
-            num_tokens=num_tokens,
-            h_tiles=self.hidden // _MHC_TILE,
-        )
+            num_tokens=num_tokens, h_tiles=h_tiles)
 
     def _post_kernel(self, num_tokens: int):
         return _compile_mhc_post_kernel(
