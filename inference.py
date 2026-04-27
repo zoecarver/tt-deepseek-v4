@@ -2594,6 +2594,184 @@ def _compressor_shift_matrix(ratio: int, ratio_pad: int) -> torch.Tensor:
     return P
 
 
+def _compile_compressor_softmax_sum_norm_kernel(ratio: int, ratio_pad: int,
+                                                d: int, rms_eps: float):
+    """Inlined from tt-lang-kernels/compressor_softmax_sum_norm.py.
+
+    Fuses the slice+concat view + softmax + weighted-sum + RMSNorm for the
+    Compressor emit branch (overlap=True) into one tt-lang kernel:
+        score_view = mf*sc_front + mb*sc_back + mp*sc_front  # padding rows pull -inf
+        kv_view    = mf*kv_front + mb*kv_back                # padding rows zero
+        sm         = softmax(score_view, dim=0)              # over all 32 rows
+        kv_sum     = sum(kv_view * sm, dim=0)                # row 0 of [TILE, d]
+        rms        = rsqrt(mean(kv_sum^2) + rms_eps)
+        out        = kv_sum * gamma * rms                    # row 0 only
+
+    Replaces 8 ttnn ops (slice x4, concat x2, softmax, multiply, sum,
+    reshape, pad, RMSNorm) with one dispatch. Single core (grid=(1,1));
+    work is small (n_tiles=d//TILE) so ttnn-chain dispatch overhead
+    dominates the kernel's compute cost.
+    """
+    if ratio_pad != _RMS_TILE:
+        raise ValueError(
+            f"ratio_pad={ratio_pad} != TILE={_RMS_TILE} unsupported "
+            f"(V4-Flash uses 32)")
+    if d % _RMS_TILE != 0:
+        raise ValueError(f"d={d} not multiple of TILE={_RMS_TILE}")
+    if 2 * ratio > ratio_pad:
+        raise ValueError(f"2*ratio={2 * ratio} > ratio_pad={ratio_pad}")
+
+    n_tiles = d // _RMS_TILE
+    inv_d = 1.0 / d
+
+    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
+    def cssn_kernel(kv_front, kv_back, sc_front, sc_back,
+                    mask_front, mask_back, mask_pad,
+                    gamma, scaler, out):
+        kvf_dfb = ttl.make_dataflow_buffer_like(kv_front, shape=(1, 1), block_count=2)
+        kvb_dfb = ttl.make_dataflow_buffer_like(kv_back, shape=(1, 1), block_count=2)
+        scf_dfb = ttl.make_dataflow_buffer_like(sc_front, shape=(1, 1), block_count=2)
+        scb_dfb = ttl.make_dataflow_buffer_like(sc_back, shape=(1, 1), block_count=2)
+        mf_dfb = ttl.make_dataflow_buffer_like(mask_front, shape=(1, 1), block_count=1)
+        mb_dfb = ttl.make_dataflow_buffer_like(mask_back, shape=(1, 1), block_count=1)
+        mp_dfb = ttl.make_dataflow_buffer_like(mask_pad, shape=(1, 1), block_count=1)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        gamma_dfb = ttl.make_dataflow_buffer_like(gamma, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        sv_dfb = ttl.make_dataflow_buffer_like(sc_front, shape=(1, 1), block_count=2)
+        kv_dfb = ttl.make_dataflow_buffer_like(kv_front, shape=(1, 1), block_count=2)
+        max_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        max_bc_dfb = ttl.make_dataflow_buffer_like(sc_front, shape=(1, 1), block_count=2)
+        exp_dfb = ttl.make_dataflow_buffer_like(sc_front, shape=(1, 1), block_count=2)
+        sum_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        invsum_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        invsum_bc_dfb = ttl.make_dataflow_buffer_like(sc_front, shape=(1, 1), block_count=2)
+        sm_dfb = ttl.make_dataflow_buffer_like(sc_front, shape=(1, 1), block_count=2)
+        weighted_dfb = ttl.make_dataflow_buffer_like(kv_front, shape=(1, 1), block_count=2)
+        kv_sum_partial_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        kv_sum_stash_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=n_tiles)
+        ks_sq_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        ssq_step_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        ssq_acc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        rms_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        rms_bc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            sc = sc_dfb.wait()
+            mf = mf_dfb.wait()
+            mb = mb_dfb.wait()
+            mp = mp_dfb.wait()
+
+            for ct in range(n_tiles):
+                kvf = kvf_dfb.wait()
+                kvb = kvb_dfb.wait()
+                scf = scf_dfb.wait()
+                scb = scb_dfb.wait()
+
+                sv_dfb.reserve().store(mf * scf + mb * scb + mp * scf)
+                sv = sv_dfb.wait()
+
+                kv_dfb.reserve().store(mf * kvf + mb * kvb)
+                kvv = kv_dfb.wait()
+
+                max_dfb.reserve().store(ttl.math.reduce_max(sv, sc, dims=[0]))
+                row_max = max_dfb.wait()
+                max_bc = max_bc_dfb.reserve()
+                max_bc.store(ttl.math.broadcast(row_max, max_bc, dims=[0]))
+                row_max_bc = max_bc_dfb.wait()
+
+                exp_dfb.reserve().store(ttl.math.exp(sv - row_max_bc))
+                exp_view = exp_dfb.wait()
+
+                sum_dfb.reserve().store(ttl.math.reduce_sum(exp_view, sc, dims=[0]))
+                row_sum = sum_dfb.wait()
+                invsum_dfb.reserve().store(ttl.math.recip(row_sum))
+                row_invsum = invsum_dfb.wait()
+                invsum_bc = invsum_bc_dfb.reserve()
+                invsum_bc.store(ttl.math.broadcast(row_invsum, invsum_bc, dims=[0]))
+                row_invsum_bc = invsum_bc_dfb.wait()
+
+                sm_dfb.reserve().store(exp_view * row_invsum_bc)
+                sm = sm_dfb.wait()
+
+                weighted_dfb.reserve().store(kvv * sm)
+                w = weighted_dfb.wait()
+
+                kv_sum_partial_dfb.reserve().store(
+                    ttl.math.reduce_sum(w, sc, dims=[0])
+                )
+                ks = kv_sum_partial_dfb.wait()
+                kv_sum_stash_dfb.reserve().store(ks)
+
+                ks_sq_dfb.reserve().store(ks * ks)
+                ssq_step_dfb.reserve().store(
+                    ttl.math.reduce_sum(ks_sq_dfb.wait(), sc, dims=[0, 1])
+                )
+                step = ssq_step_dfb.wait()
+                if ct == 0:
+                    ssq_acc_dfb.reserve().store(step)
+                else:
+                    prev = ssq_acc_dfb.wait()
+                    ssq_acc_dfb.reserve().store(prev + step)
+
+            ssq = ssq_acc_dfb.wait()
+            rms_dfb.reserve().store(
+                ttl.math.rsqrt(
+                    ssq * ttl.math.fill(ssq, inv_d) + ttl.math.fill(ssq, rms_eps)
+                )
+            )
+            rms_scalar = rms_dfb.wait()
+            rms_bc = rms_bc_dfb.reserve()
+            rms_bc.store(ttl.math.broadcast(rms_scalar, rms_bc, dims=[0, 1]))
+            rms_full = rms_bc_dfb.wait()
+
+            for ct in range(n_tiles):
+                ks = kv_sum_stash_dfb.wait()
+                g = gamma_dfb.wait()
+                out_dfb.reserve().store(ks * g * rms_full)
+
+        @ttl.datamovement()
+        def dm_read():
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            ttl.copy(mask_front[0, 0], mf_dfb.reserve()).wait()
+            ttl.copy(mask_back[0, 0], mb_dfb.reserve()).wait()
+            ttl.copy(mask_pad[0, 0], mp_dfb.reserve()).wait()
+
+            for ct in range(n_tiles):
+                ttl.copy(kv_front[0, ct], kvf_dfb.reserve()).wait()
+                ttl.copy(kv_back[0, ct], kvb_dfb.reserve()).wait()
+                ttl.copy(sc_front[0, ct], scf_dfb.reserve()).wait()
+                ttl.copy(sc_back[0, ct], scb_dfb.reserve()).wait()
+
+            for ct in range(n_tiles):
+                ttl.copy(gamma[0, ct], gamma_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            for ct in range(n_tiles):
+                ttl.copy(out_dfb.wait(), out[0, ct]).wait()
+
+    return cssn_kernel
+
+
+def _compressor_softmax_sum_norm_masks(ratio: int):
+    """Build the three [TILE, TILE] mask tiles used by cssn_kernel.
+
+    mask_front[i, j] = 1 if i < ratio
+    mask_back [i, j] = 1 if ratio <= i < 2*ratio
+    mask_pad  [i, j] = 1 if i >= 2*ratio
+    """
+    mf = torch.zeros(_RMS_TILE, _RMS_TILE, dtype=torch.bfloat16)
+    mb = torch.zeros(_RMS_TILE, _RMS_TILE, dtype=torch.bfloat16)
+    mp = torch.zeros(_RMS_TILE, _RMS_TILE, dtype=torch.bfloat16)
+    mf[:ratio, :] = 1.0
+    mb[ratio:2 * ratio, :] = 1.0
+    mp[2 * ratio:, :] = 1.0
+    return mf, mb, mp
+
+
 # ============================================================================
 # tt-lang kernel cache + named decode-path globals
 # ============================================================================
@@ -2698,6 +2876,15 @@ def _get_ttl_compressor_slot_shift_kernel(num_buffers: int, ratio_pad: int, d: i
     )
 
 
+def _get_ttl_compressor_softmax_sum_norm_kernel(ratio: int, ratio_pad: int,
+                                                 d: int, rms_eps: float):
+    return _cached_kernel(
+        ("compressor_softmax_sum_norm", ratio, ratio_pad, d, rms_eps),
+        lambda: _compile_compressor_softmax_sum_norm_kernel(
+            ratio, ratio_pad, d, rms_eps),
+    )
+
+
 # Named decode-path kernels. Set by `prebuild_ttl_decode_kernels(args)`.
 # Each name encodes the shape it serves so call sites read like
 # `ttl_rmsnorm_M32_h4096(x, gamma, sc, out)`.
@@ -2719,6 +2906,11 @@ ttl_mhc_post_N1_h128 = None               # decode (num_tokens=1, h_tiles=128)
 ttl_compressor_slot_shift_B1_pad32_d512 = None  # attention compressor (head_dim=512)
 ttl_compressor_slot_shift_B1_pad32_d128 = None  # indexer compressor (index_head_dim=128)
 
+# Fused slice/concat + softmax + weighted-sum + RMSNorm kernel for the
+# Compressor emit branch (overlap=True). One dispatch replaces ~8 ttnn ops.
+ttl_compressor_softmax_sum_norm_pad32_d512 = None  # attention compressor
+ttl_compressor_softmax_sum_norm_pad32_d128 = None  # indexer compressor
+
 
 def prebuild_ttl_decode_kernels(args: "ModelArgs"):
     """Eagerly build every tt-lang kernel the decode path uses and bind them
@@ -2735,6 +2927,8 @@ def prebuild_ttl_decode_kernels(args: "ModelArgs"):
     global ttl_mhc_apply_mix_h_N1_h128, ttl_mhc_post_N1_h128
     global ttl_compressor_slot_shift_B1_pad32_d512
     global ttl_compressor_slot_shift_B1_pad32_d128
+    global ttl_compressor_softmax_sum_norm_pad32_d512
+    global ttl_compressor_softmax_sum_norm_pad32_d128
 
     eps = args.norm_eps
     ttl_rmsnorm_M32_h4096 = _get_ttl_rmsnorm_kernel(
@@ -2761,6 +2955,16 @@ def prebuild_ttl_decode_kernels(args: "ModelArgs"):
         1, _RMS_TILE, args.head_dim)
     ttl_compressor_slot_shift_B1_pad32_d128 = _get_ttl_compressor_slot_shift_kernel(
         1, _RMS_TILE, args.index_head_dim)
+
+    # Compressor emit branch (overlap=True ↔ compress_ratio=4). The kernel
+    # softmaxes over all 32 ratio_pad rows; padding rows pull -inf from the
+    # score buffer (preserved by slot-shift) and 0 from the kv buffer.
+    ttl_compressor_softmax_sum_norm_pad32_d512 = (
+        _get_ttl_compressor_softmax_sum_norm_kernel(
+            4, _RMS_TILE, args.head_dim, eps))
+    ttl_compressor_softmax_sum_norm_pad32_d128 = (
+        _get_ttl_compressor_softmax_sum_norm_kernel(
+            4, _RMS_TILE, args.index_head_dim, eps))
 
 
 class DeviceMHC(nn.Module):
@@ -3642,6 +3846,11 @@ class DeviceCompressor(nn.Module):
         self.score_state_front_out_tt = None
         self.score_state_back_out_tt = None
         self.shift_P_tt = None
+        # Constants for the fused softmax+sum+RMSNorm kernel (overlap=True only).
+        self.cssn_mask_front_tt = None
+        self.cssn_mask_back_tt = None
+        self.cssn_mask_pad_tt = None
+        self.cssn_out_tt = None
         self.kv_cache_tt = kv_cache_tt
         self._owns_kv_cache = kv_cache_tt is None
 
@@ -3718,6 +3927,14 @@ class DeviceCompressor(nn.Module):
             P_cpu = _compressor_shift_matrix(self.compress_ratio, ratio_pad)
             self.shift_P_tt = ttnn.as_tensor(P_cpu.contiguous(), **rep)
 
+            mf_cpu, mb_cpu, mp_cpu = _compressor_softmax_sum_norm_masks(
+                self.compress_ratio)
+            self.cssn_mask_front_tt = ttnn.as_tensor(mf_cpu.contiguous(), **rep)
+            self.cssn_mask_back_tt = ttnn.as_tensor(mb_cpu.contiguous(), **rep)
+            self.cssn_mask_pad_tt = ttnn.as_tensor(mp_cpu.contiguous(), **rep)
+            self.cssn_out_tt = ttnn.as_tensor(
+                torch.zeros(_RMS_TILE, d, dtype=torch.bfloat16).contiguous(), **rep)
+
         if self._owns_kv_cache:
             T = comp.kv_cache.shape[1]
             T_pad = -(-T // 32) * 32
@@ -3769,31 +3986,51 @@ class DeviceCompressor(nn.Module):
         if (start_pos + 1) % ratio != 0:
             return None
 
-        # TODO(tt-lang): fuse the slice/concat view + softmax-sum + RMSNorm
-        # into one `compressor_softmax_sum_norm` kernel. See
-        # device-compressor-indexer/README.md candidate #1.
         if self.overlap:
-            front_kv = ttnn.slice(self.kv_state_front_tt, [0, 0, 0, 0],     [B, 1, ratio,     d])
-            back_kv  = ttnn.slice(self.kv_state_back_tt,  [0, 0, ratio, 0], [B, 1, 2 * ratio, d])
-            kv_view = ttnn.concat([front_kv, back_kv], dim=2)
-            front_sc = ttnn.slice(self.score_state_front_tt, [0, 0, 0, 0],     [B, 1, ratio,     d])
-            back_sc  = ttnn.slice(self.score_state_back_tt,  [0, 0, ratio, 0], [B, 1, 2 * ratio, d])
-            score_view = ttnn.concat([front_sc, back_sc], dim=2)
+            # Fused slice/concat + softmax + weighted-sum + RMSNorm via
+            # tt-lang kernel. Padding rows of score_state_*_tt hold -inf
+            # (preserved by the slot-shift kernel), so a 32-row softmax
+            # behaves as a 2*ratio-row softmax. Output row 0 is the valid
+            # normalized kv_sum.
+            ratio_pad = self.ratio_pad
+            if d == 512:
+                cssn = ttl_compressor_softmax_sum_norm_pad32_d512
+            elif d == 128:
+                cssn = ttl_compressor_softmax_sum_norm_pad32_d128
+            else:
+                raise ValueError(
+                    f"no compressor_softmax_sum_norm kernel built for d={d}")
+            if cssn is None:
+                raise RuntimeError(
+                    "compressor_softmax_sum_norm kernel not pre-built; "
+                    "call prebuild_ttl_decode_kernels(args) first")
+            cssn(
+                ttnn.reshape(self.kv_state_front_tt, [ratio_pad, d]),
+                ttnn.reshape(self.kv_state_back_tt, [ratio_pad, d]),
+                ttnn.reshape(self.score_state_front_tt, [ratio_pad, d]),
+                ttnn.reshape(self.score_state_back_tt, [ratio_pad, d]),
+                self.cssn_mask_front_tt,
+                self.cssn_mask_back_tt,
+                self.cssn_mask_pad_tt,
+                self.norm_dev.gamma_tt,
+                self.norm_dev.sc_tt,
+                self.cssn_out_tt,
+            )
+            kv_2d = ttnn.slice(self.cssn_out_tt, [0, 0], [B, d])
+            kv_normed = ttnn.reshape(kv_2d, [B, 1, d])
         else:
             kv_view = self.kv_state_front_tt
             score_view = self.score_state_front_tt
-
-        sm_tt = ttnn.softmax(score_view, dim=-2)
-        weighted = ttnn.multiply(kv_view, sm_tt)
-        kv_sum = ttnn.sum(weighted, dim=-2, keepdim=True)
-
-        kv_2d = ttnn.reshape(kv_sum, [B, d])
-        if B < _RMS_TILE:
-            kv_2d = ttnn.pad(kv_2d, padding=[(0, _RMS_TILE - B), (0, 0)], value=0.0)
-        kv_2d = self.norm_dev.forward_device(kv_2d, B)
-        if B < _RMS_TILE:
-            kv_2d = ttnn.slice(kv_2d, [0, 0], [B, d])
-        kv_normed = ttnn.reshape(kv_2d, [B, 1, d])
+            sm_tt = ttnn.softmax(score_view, dim=-2)
+            weighted = ttnn.multiply(kv_view, sm_tt)
+            kv_sum = ttnn.sum(weighted, dim=-2, keepdim=True)
+            kv_2d = ttnn.reshape(kv_sum, [B, d])
+            if B < _RMS_TILE:
+                kv_2d = ttnn.pad(kv_2d, padding=[(0, _RMS_TILE - B), (0, 0)], value=0.0)
+            kv_2d = self.norm_dev.forward_device(kv_2d, B)
+            if B < _RMS_TILE:
+                kv_2d = ttnn.slice(kv_2d, [0, 0], [B, d])
+            kv_normed = ttnn.reshape(kv_2d, [B, 1, d])
 
         rd_half = rd // 2
         freq_idx = start_pos + 1 - ratio
