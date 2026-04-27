@@ -914,21 +914,28 @@ class DeviceLMHead:
         self.mesh = mesh
         self.mesh_shape = tuple(mesh.shape)
         vocab, dim = cpu_weight.shape
-        if vocab % self.mesh_shape[1] != 0:
-            raise ValueError(f"vocab {vocab} not divisible by mesh axis 1 {self.mesh_shape[1]}")
+        # Shard vocab across all chips (1D flat over the 2D mesh). Pad to
+        # num_chips * TILE so each chip's slice is tile-aligned.
+        TILE = 32
+        num_chips = self.mesh_shape[0] * self.mesh_shape[1]
+        chunk = num_chips * TILE
+        vocab_padded = -(-vocab // chunk) * chunk
         self.vocab = vocab
+        self.vocab_padded = vocab_padded
         self.dim = dim
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
         self.hc_mult = hc_mult
         w_dv = _weight_to_bf16(cpu_weight).transpose(0, 1).contiguous()  # [dim, vocab]
+        if vocab_padded != vocab:
+            w_dv = F.pad(w_dv, (0, vocab_padded - vocab))
         self.w_tt = ttnn.as_tensor(
             w_dv,
             device=mesh,
             layout=ttnn.TILE_LAYOUT,
             dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1)),
+            mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=-1),
         )
         self.norm_tt = None
         if norm_weight is not None:
@@ -984,10 +991,10 @@ class DeviceLMHead:
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
         self._matmul_out_tt = ttnn.from_torch(
-            torch.zeros(1, 1, self.vocab, dtype=torch.bfloat16),
+            torch.zeros(1, 1, self.vocab_padded, dtype=torch.bfloat16),
             device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(None, -1)),
+            mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=-1),
         )
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
         self._trace_id = None
@@ -1031,11 +1038,9 @@ class DeviceLMHead:
         self._compute_body()
         y = ttnn.to_torch(
             self._matmul_out_tt,
-            mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(0, -1)),
+            mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=-1),
         )
-        if y.shape[0] != B:
-            y = y[: B]
-        return y[:, 0, :].float()  # [B, vocab]
+        return y[:1, 0, :self.vocab].float()  # [B, vocab]
 
     def forward_a_tt(self, a_tt, num_tokens: int) -> torch.Tensor:
         """Pure-device head: a_tt [num_tokens_pad, mhc*hidden] fp32 -> logits torch [B=1, vocab].
@@ -1078,9 +1083,9 @@ class DeviceLMHead:
                     optional_output_tensor=self._matmul_out_tt)
         out = ttnn.to_torch(
             self._matmul_out_tt,
-            mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(0, -1)),
+            mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=-1),
         )
-        return out[:1, 0, :].float()  # [1, vocab]
+        return out[:1, 0, :self.vocab].float()  # [1, vocab]
 
 
 class DeviceColLinear(nn.Module):
