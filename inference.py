@@ -4039,11 +4039,22 @@ class DeviceCompressor(nn.Module):
             kv_init_front.view(B, 1, ratio_pad, d).contiguous(), **rep)
         self.score_state_front_tt = ttnn.as_tensor(
             score_init_front.view(B, 1, ratio_pad, d).contiguous(), **rep)
+        # 2D view shares memory with the 4D buffer; lets the slot_shift +
+        # cssn kernels read/write without per-call ttnn.reshape (those are
+        # trace-hostile). 4D view is still used by kv_cache.update_cache_.
+        self.kv_state_front_2d_tt = ttnn.reshape(
+            self.kv_state_front_tt, [ratio_pad, d])
+        self.score_state_front_2d_tt = ttnn.reshape(
+            self.score_state_front_tt, [ratio_pad, d])
         if self.overlap:
             self.kv_state_back_tt = ttnn.as_tensor(
                 kv_init_back.view(B, 1, ratio_pad, d).contiguous(), **rep)
             self.score_state_back_tt = ttnn.as_tensor(
                 score_init_back.view(B, 1, ratio_pad, d).contiguous(), **rep)
+            self.kv_state_back_2d_tt = ttnn.reshape(
+                self.kv_state_back_tt, [ratio_pad, d])
+            self.score_state_back_2d_tt = ttnn.reshape(
+                self.score_state_back_tt, [ratio_pad, d])
 
             # Slot-shift double buffers: zeros for kv (data-side), -inf for
             # score (matches the score-state padding semantic). Pads beyond
@@ -4059,6 +4070,14 @@ class DeviceCompressor(nn.Module):
                 ninf_pad.view(B, 1, ratio_pad, d).contiguous(), **rep)
             self.score_state_back_out_tt = ttnn.as_tensor(
                 ninf_pad.view(B, 1, ratio_pad, d).contiguous(), **rep)
+            self.kv_state_front_out_2d_tt = ttnn.reshape(
+                self.kv_state_front_out_tt, [ratio_pad, d])
+            self.kv_state_back_out_2d_tt = ttnn.reshape(
+                self.kv_state_back_out_tt, [ratio_pad, d])
+            self.score_state_front_out_2d_tt = ttnn.reshape(
+                self.score_state_front_out_tt, [ratio_pad, d])
+            self.score_state_back_out_2d_tt = ttnn.reshape(
+                self.score_state_back_out_tt, [ratio_pad, d])
             P_cpu = _compressor_shift_matrix(self.compress_ratio, ratio_pad)
             self.shift_P_tt = ttnn.as_tensor(P_cpu.contiguous(), **rep)
 
@@ -4127,7 +4146,6 @@ class DeviceCompressor(nn.Module):
             # (preserved by the slot-shift kernel), so a 32-row softmax
             # behaves as a 2*ratio-row softmax. Output row 0 is the valid
             # normalized kv_sum.
-            ratio_pad = self.ratio_pad
             if d == 512:
                 cssn = ttl_compressor_softmax_sum_norm_pad32_d512
             elif d == 128:
@@ -4140,10 +4158,10 @@ class DeviceCompressor(nn.Module):
                     "compressor_softmax_sum_norm kernel not pre-built; "
                     "call prebuild_ttl_decode_kernels(args) first")
             cssn(
-                ttnn.reshape(self.kv_state_front_tt, [ratio_pad, d]),
-                ttnn.reshape(self.kv_state_back_tt, [ratio_pad, d]),
-                ttnn.reshape(self.score_state_front_tt, [ratio_pad, d]),
-                ttnn.reshape(self.score_state_back_tt, [ratio_pad, d]),
+                self.kv_state_front_2d_tt,
+                self.kv_state_back_2d_tt,
+                self.score_state_front_2d_tt,
+                self.score_state_back_2d_tt,
                 self.cssn_mask_front_tt,
                 self.cssn_mask_back_tt,
                 self.cssn_mask_pad_tt,
@@ -4201,23 +4219,28 @@ class DeviceCompressor(nn.Module):
                 raise RuntimeError(
                     "compressor_slot_shift kernel not pre-built; "
                     "call prebuild_ttl_decode_kernels(args) first")
-            ratio_pad = self.ratio_pad
-            P_2d = ttnn.reshape(self.shift_P_tt, [ratio_pad, ratio_pad])
-            for in_attr, out_attr in (
-                ("kv_state_front_tt", "kv_state_front_out_tt"),
-                ("kv_state_back_tt", "kv_state_back_out_tt"),
-                ("score_state_front_tt", "score_state_front_out_tt"),
-                ("score_state_back_tt", "score_state_back_out_tt"),
-            ):
-                buf_in = getattr(self, in_attr)
-                buf_out = getattr(self, out_attr)
+            for base in ("kv_state_front", "kv_state_back",
+                         "score_state_front", "score_state_back"):
+                in_4d = f"{base}_tt"
+                out_4d = f"{base}_out_tt"
+                in_2d = f"{base}_2d_tt"
+                out_2d = f"{base}_out_2d_tt"
                 slot_shift(
-                    ttnn.reshape(buf_in, [ratio_pad, d]),
-                    P_2d,
-                    ttnn.reshape(buf_out, [ratio_pad, d]),
+                    getattr(self, in_2d),
+                    self.shift_P_tt,
+                    getattr(self, out_2d),
                 )
-                setattr(self, in_attr, buf_out)
-                setattr(self, out_attr, buf_in)
+                # Swap both 4D (used by kv_cache.update_cache_) and 2D
+                # (used by slot_shift / cssn) attrs together so they stay
+                # aliased to the same underlying buffers.
+                buf_in_4d = getattr(self, in_4d)
+                buf_out_4d = getattr(self, out_4d)
+                buf_in_2d = getattr(self, in_2d)
+                buf_out_2d = getattr(self, out_2d)
+                setattr(self, in_4d, buf_out_4d)
+                setattr(self, out_4d, buf_in_4d)
+                setattr(self, in_2d, buf_out_2d)
+                setattr(self, out_2d, buf_in_2d)
 
         return kv_normed
 
