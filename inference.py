@@ -851,11 +851,7 @@ class Transformer(nn.Module):
                 a_tt = _block_forward(layer, a_tt, start_pos, input_ids,
                                       B, S, mhc, hidden, orig_dtype)
         with _phase("head"):
-            out_packed = _readback_replicated_2d(
-                ttnn, a_tt, mhc_attn.mesh, mhc_attn.mesh_shape)
-            y = _mhc_unpack_a_tt(out_packed, num_tokens, mhc, hidden)
-            h = y.view(B, S, mhc, hidden).to(orig_dtype)
-            logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+            logits = self.head(a_tt, num_tokens)
         return logits
 
 
@@ -902,7 +898,12 @@ class DeviceLMHead:
 
     def __init__(self, mesh, cpu_weight: torch.Tensor,
                  norm_weight: Optional[torch.Tensor] = None,
-                 norm_eps: float = 1e-6):
+                 norm_eps: float = 1e-6,
+                 hc_fn: Optional[torch.Tensor] = None,
+                 hc_scale: Optional[torch.Tensor] = None,
+                 hc_base: Optional[torch.Tensor] = None,
+                 hc_eps: float = 1e-6,
+                 hc_mult: int = 1):
         import ttnn
         self._ttnn = ttnn
         self.mesh = mesh
@@ -913,6 +914,8 @@ class DeviceLMHead:
         self.vocab = vocab
         self.dim = dim
         self.norm_eps = norm_eps
+        self.hc_eps = hc_eps
+        self.hc_mult = hc_mult
         w_dv = _weight_to_bf16(cpu_weight).transpose(0, 1).contiguous()  # [dim, vocab]
         self.w_tt = ttnn.as_tensor(
             w_dv,
@@ -932,6 +935,32 @@ class DeviceLMHead:
                 layout=ttnn.TILE_LAYOUT,
                 dtype=ttnn.bfloat16,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            )
+
+        self.hc_fn_t_tt = None
+        self.hc_scale_tt = None
+        self.hc_base_tt = None
+        if hc_fn is not None:
+            # hc_fn: [mhc, mhc*hidden] fp32. Transpose to [mhc*hidden, mhc] for matmul.
+            hc_fn_t = hc_fn.to(torch.float32).transpose(0, 1).contiguous()
+            self.hc_fn_t_tt = ttnn.as_tensor(
+                hc_fn_t, device=mesh, layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            )
+            # hc_scale: [1] fp32 -> broadcastable [1, 1].
+            scale_2d = hc_scale.to(torch.float32).reshape(1, 1).contiguous()
+            self.hc_scale_tt = ttnn.as_tensor(
+                scale_2d, device=mesh, layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            )
+            # hc_base: [mhc] fp32 -> [1, mhc] for elementwise add against [num_tokens, mhc].
+            base_2d = hc_base.to(torch.float32).reshape(1, hc_mult).contiguous()
+            self.hc_base_tt = ttnn.as_tensor(
+                base_2d, device=mesh, layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
             )
 
@@ -1002,6 +1031,51 @@ class DeviceLMHead:
         if y.shape[0] != B:
             y = y[: B]
         return y[:, 0, :].float()  # [B, vocab]
+
+    def forward_a_tt(self, a_tt, num_tokens: int) -> torch.Tensor:
+        """Pure-device head: a_tt [num_tokens_pad, mhc*hidden] fp32 -> logits torch [B=1, vocab].
+        Runs hc_combiner + final RMSNorm + lm_head matmul on device."""
+        ttnn = self._ttnn
+        if self.hc_fn_t_tt is None:
+            raise ValueError("forward_a_tt requires hc_fn/scale/base; pass them to DeviceLMHead.")
+        mhc = self.hc_mult
+        hidden = self.dim
+        D = mhc * hidden
+        last = num_tokens - 1
+        # Slice last token row: [1, mhc*hidden] fp32.
+        x_2d = ttnn.slice(a_tt, [last, 0], [last + 1, D])
+        # mixes = x_2d @ hc_fn_t_tt -> [1, mhc] fp32.
+        mixes = ttnn.matmul(x_2d, self.hc_fn_t_tt)
+        # rsqrt(mean(x^2) + eps): mean over last dim of [1, D].
+        sq = ttnn.multiply(x_2d, x_2d)
+        sq_mean = ttnn.mean(sq, dim=-1, keepdim=True)  # [1, 1]
+        sq_mean_eps = ttnn.add(sq_mean, self.norm_eps)
+        rsqrt_val = ttnn.rsqrt(sq_mean_eps)  # [1, 1]
+        # pre = sigmoid(mixes * rsqrt * hc_scale + hc_base) + hc_eps -> [1, mhc].
+        scaled = ttnn.multiply(mixes, rsqrt_val)
+        scaled = ttnn.multiply(scaled, self.hc_scale_tt)
+        scaled = ttnn.add(scaled, self.hc_base_tt)
+        pre = ttnn.sigmoid(scaled)
+        pre = ttnn.add(pre, self.hc_eps)
+        # y = pre @ x_view, where x_view is x_2d viewed as [mhc, hidden].
+        x_3d = ttnn.reshape(x_2d, [1, mhc, hidden])
+        pre_3d = ttnn.reshape(pre, [1, 1, mhc])
+        y_3d = ttnn.matmul(pre_3d, x_3d)  # [1, 1, hidden] fp32
+        y_bf16 = ttnn.typecast(y_3d, dtype=ttnn.bfloat16)
+        # RMSNorm + lm_head matmul.
+        if self.norm_tt is not None:
+            y_4d = ttnn.reshape(y_bf16, (1, 1, 1, hidden))
+            y_normed = ttnn.rms_norm(y_4d, weight=self.norm_tt, epsilon=self.norm_eps)
+            y_normed = ttnn.reshape(y_normed, (1, 1, hidden))
+        else:
+            y_normed = y_bf16
+        ttnn.matmul(y_normed, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._matmul_out_tt)
+        out = ttnn.to_torch(
+            self._matmul_out_tt,
+            mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(0, -1)),
+        )
+        return out[:1, 0, :].float()  # [1, vocab]
 
 
 class DeviceColLinear(nn.Module):
@@ -3868,29 +3942,36 @@ class Model:
             print(f"[load] cache written in {time.time()-t0:.1f}s")
 
     def offload_lm_head(self, mesh):
-        """Move the lm_head matmul and the final RMSNorm to a 1xN mesh.
+        """Move hc_combiner + final RMSNorm + lm_head matmul to a 1xN mesh.
 
         Must be called after load_weights(). Shards the lm_head column-parallel
-        across vocab; replicates the tiny final-norm weight on each chip.
-        ParallelHead.forward is rebound to skip the CPU norm and pass the
-        unnormalized last-token hidden straight to the device (norm + matmul
-        fused there).
-        """
+        across vocab; replicates the tiny final-norm weight, hc_fn/scale/base
+        on each chip. ParallelHead.forward is rebound to take the residual
+        a_tt device tensor directly (no CPU round-trip)."""
         head = self.transformer.head
         final_norm = self.transformer.norm
-        self._device_lm_head = DeviceLMHead(mesh, head.weight.data,
-                                            norm_weight=final_norm.weight.data,
-                                            norm_eps=final_norm.eps)
+        transformer = self.transformer
+        self._device_lm_head = DeviceLMHead(
+            mesh, head.weight.data,
+            norm_weight=final_norm.weight.data,
+            norm_eps=final_norm.eps,
+            hc_fn=transformer.hc_head_fn.data,
+            hc_scale=transformer.hc_head_scale.data,
+            hc_base=transformer.hc_head_base.data,
+            hc_eps=transformer.hc_eps,
+            hc_mult=transformer.hc_mult,
+        )
         dlh = self._device_lm_head
 
-        def _device_head_forward(self_head, x, hc_fn, hc_scale, hc_base, norm):
-            with _phase("head.hc_combiner"):
-                x = self_head.hc_head(x, hc_fn, hc_scale, hc_base)  # still CPU
+        def _device_head_forward(self_head, a_tt, num_tokens):
             with _phase("head.norm_and_logits"):
-                return dlh(x[:, -1].contiguous())
+                return dlh.forward_a_tt(a_tt, num_tokens)
         head.forward = _device_head_forward.__get__(head, type(head))
         final_norm.weight.data = torch.empty(0)  # device owns it
         head.weight.data = torch.empty(0)
+        transformer.hc_head_fn.data = torch.empty(0)
+        transformer.hc_head_scale.data = torch.empty(0)
+        transformer.hc_head_base.data = torch.empty(0)
 
     def offload_attn_wq_b(self, mesh):
         """Column-parallel shard wq_b (Q-LoRA up) on n_heads*head_dim."""
