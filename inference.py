@@ -5442,6 +5442,13 @@ class Model:
         self.tokenizer = tokenizer
         self.ckpt_dir = ckpt_dir
         self.transformer = Transformer(args)
+        # Trace state. The first 16 decode steps run untraced so every
+        # lazy _alloc_decode_tensors path fires; the next no-emit step
+        # captures `_trace_no_emit = (trace_id, argmax_tt, max_tt)`,
+        # subsequent no-emit steps replay it. Emit steps stay untraced
+        # (second trace will be added once this path is solid).
+        self._trace_warmup_remaining = 16
+        self._trace_no_emit = None
 
     @classmethod
     def from_hf(cls, repo_id: str, max_seq_len: int = 512, max_batch_size: int = 1):
@@ -6282,9 +6289,45 @@ class Model:
 
     @torch.inference_mode()
     def step_decode(self, token_id: int, pos: int) -> int:
-        """Single greedy decode step. Returns next token id (on-device argmax)."""
+        """Single greedy decode step. Returns next token id.
+
+        After 16 untraced warmup steps, captures a single trace of the
+        no-emit body (embed -> blocks -> head argmax/max) and replays it
+        on every subsequent no-emit step. Emit steps ((pos+1)%4==0) stay
+        on the untraced path until a second trace is added.
+        """
+        import ttnn
         ids = torch.tensor([[token_id]], dtype=torch.long)
-        return self.transformer.forward_argmax(ids, start_pos=pos)
+        transformer = self.transformer
+        head = transformer.head
+        is_emit = (pos + 1) % 4 == 0
+
+        B, S, num_tokens, num_tokens_pad = transformer._decode_uploads(ids, pos)
+
+        if is_emit or self._trace_warmup_remaining > 0:
+            if self._trace_warmup_remaining > 0:
+                self._trace_warmup_remaining -= 1
+            local_argmax_tt, local_max_tt = transformer._decode_argmax_body(
+                B, S, num_tokens, num_tokens_pad, pos)
+            return head.argmax_pull(local_argmax_tt, local_max_tt)
+
+        if self._trace_no_emit is None:
+            mesh = self._device_lm_head.mesh
+            print(f"[trace] capturing no-emit decode body at pos={pos} ...")
+            t0 = time.time()
+            trace_id = ttnn.begin_trace_capture(mesh, cq_id=0)
+            argmax_tt, max_tt = transformer._decode_argmax_body(
+                B, S, num_tokens, num_tokens_pad, pos)
+            ttnn.end_trace_capture(mesh, trace_id, cq_id=0)
+            self._trace_no_emit = (trace_id, argmax_tt, max_tt)
+            print(f"[trace] captured no-emit trace id={trace_id} in "
+                  f"{time.time()-t0:.1f}s")
+            return head.argmax_pull(argmax_tt, max_tt)
+
+        trace_id, argmax_tt, max_tt = self._trace_no_emit
+        ttnn.execute_trace(self._device_lm_head.mesh, trace_id,
+                           cq_id=0, blocking=True)
+        return head.argmax_pull(argmax_tt, max_tt)
 
     @torch.inference_mode()
     def prefill(self, tokens: list[int]) -> int:
@@ -6378,7 +6421,10 @@ def main():
     print(f"[phase] mesh opened in {time.time() - t0:.1f}s")
 
     import ttnn
-    _set_phase_sync(lambda: ttnn.synchronize_device(mesh))
+    # Phase sync is intentionally left None: synchronize_device calls inside
+    # `_phase()` would be recorded into the captured decode trace as device
+    # ops. Per-phase wall times become coarse-grained, but only the global
+    # generate() timing matters once tracing is in place.
 
     n_layers = len(model.transformer.layers)
     print("[phase] sharding lm_head on mesh ...")
