@@ -710,6 +710,7 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
         ttnn.slice(norm_out_tt, [0, 0], [num_tokens, hidden],
                    output_tensor=mhc_attn._norm_slice_tt)
         bridge_tt = ttnn.reshape(mhc_attn._norm_slice_tt, [B, S, hidden])
+        attn_dev.pre_stage_decode(start_pos, B=B, S=S)
         attn_out_tt = attn_dev.forward_device(bridge_tt, start_pos, start_pos_tt)
     with _phase("block.hc_post"):
         x_2d = ttnn.reshape(attn_out_tt, [num_tokens, 1, hidden])
@@ -4230,6 +4231,35 @@ class DeviceCompressor(nn.Module):
         ttnn.experimental.paged_update_cache(
             cache_tt, x_sharded, update_idxs_tensor=slot_tt)
 
+    def pre_stage_decode(self, start_pos: int, B: int = 1):
+        """Per-step host->device uploads. Must be called once per decode
+        step before forward_device so the staging happens outside any future
+        trace_capture region; forward_device assumes both slots are already
+        on device.
+
+        Allocates device buffers lazily (mirroring forward_device's
+        bootstrap), so callers don't have to special-case the first call.
+        """
+        ttnn = self._ttnn
+        ratio = self.compress_ratio
+        if self.kv_state_front_tt is None:
+            self._alloc_decode_tensors(B)
+        slot_in_ape = start_pos % ratio
+        state_slot_int = (ratio + slot_in_ape) if self.overlap else slot_in_ape
+        emit_slot_int = self.slot_offset + (start_pos // ratio)
+        slot_host = ttnn.from_torch(
+            torch.tensor([state_slot_int], dtype=torch.int32),
+            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=self._slot_upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(slot_host, self._state_slot_tt)
+        emit_host = ttnn.from_torch(
+            torch.tensor([emit_slot_int], dtype=torch.int32),
+            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=self._slot_upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(emit_host, self._emit_slot_tt)
+
     def forward_device(self, x_tt, B: int, start_pos: int, start_pos_tt=None):
         ttnn = self._ttnn
         ratio = self.compress_ratio
@@ -4247,27 +4277,6 @@ class DeviceCompressor(nn.Module):
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
             )
-
-        # Upload per-step slot tensors before any device work so the slots
-        # are already on device by the time kv_cache writes execute. Both
-        # state and emit slots are staged unconditionally; non-emit steps
-        # simply ignore _emit_slot_tt.
-        slot_in_ape = start_pos % ratio
-        state_slot_int = (ratio + slot_in_ape) if self.overlap else slot_in_ape
-        comp_idx = start_pos // ratio
-        emit_slot_int = self.slot_offset + comp_idx
-        slot_host = ttnn.from_torch(
-            torch.tensor([state_slot_int], dtype=torch.int32),
-            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
-            mesh_mapper=self._slot_upload_mapper,
-        )
-        ttnn.copy_host_to_device_tensor(slot_host, self._state_slot_tt)
-        emit_host = ttnn.from_torch(
-            torch.tensor([emit_slot_int], dtype=torch.int32),
-            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
-            mesh_mapper=self._slot_upload_mapper,
-        )
-        ttnn.copy_host_to_device_tensor(emit_host, self._emit_slot_tt)
 
         kv_tt = self.wkv.forward_device(x_tt)
         score_tt = self.wgate.forward_device(x_tt)
@@ -4837,6 +4846,7 @@ class DeviceAttention(nn.Module):
         )
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
 
+        self.pre_stage_decode(start_pos, B=B, S=S)
         out_tt = self.forward_device(self._x_upload_tt, start_pos)
 
         out = _readback_replicated_2d(
@@ -4921,6 +4931,38 @@ class DeviceAttention(nn.Module):
         self._indexer_topk_trace_id_per_bucket[bucket] = trace_id
         self._indexer_topk_out_per_bucket[bucket] = out_tt
 
+    def pre_stage_decode(self, start_pos: int, B: int = 1, S: int = 1):
+        """Per-step host->device uploads for this attention layer (and its
+        device_compressor / device_indexer if bound). Must be called once
+        per decode step before forward_device so the staging happens
+        outside any future trace_capture region; forward_device assumes
+        the kv_slot, state/emit slots, and indexer T_active are already
+        staged on device.
+        """
+        ttnn = self._ttnn
+        attn = self.attn
+        win = self.window_size
+        kv_slot_host = ttnn.from_torch(
+            torch.tensor([start_pos % win], dtype=torch.int32),
+            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=self._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(kv_slot_host, self._kv_slot_tt)
+        device_comp = getattr(attn, "_device_compressor", None)
+        if device_comp is not None:
+            device_comp.pre_stage_decode(start_pos, B=B)
+        device_indexer = getattr(attn, "_device_indexer", None)
+        if device_indexer is not None and device_indexer.dc is not None:
+            # Indexer owns its own DeviceCompressor (separate kv/score state
+            # from attn._device_compressor); stage its slot uploads too.
+            device_indexer.dc.pre_stage_decode(start_pos, B=B)
+        if self.compress_ratio and device_indexer is not None:
+            T_active_pre = (start_pos + 1) // self.compress_ratio
+            if T_active_pre > 0:
+                bucket_pre = _pick_indexer_topk_bucket(T_active_pre)
+                self._stage_indexer_topk_inputs(
+                    B, S, bucket_pre, T_active_pre)
+
     def forward_device(self, x_tt, start_pos: int, start_pos_tt=None):
         """Pure-device attention body. x_tt is the pre-uploaded
         [B, 1, dim] device tensor; returns out_tt [B, 1, dim] device
@@ -4964,22 +5006,9 @@ class DeviceAttention(nn.Module):
                 "run offload_compressor_indexer."
             )
 
-        # Pre-stage all per-step host->device transfers up front so the rest
-        # of the body is pure device work. Today: kv_cache slot for
-        # paged_update_cache and (when compressing) the indexer-topk
-        # T_active for the active bucket.
-        kv_slot_host = ttnn.from_torch(
-            torch.tensor([start_pos % win], dtype=torch.int32),
-            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
-            mesh_mapper=self._upload_mapper,
-        )
-        ttnn.copy_host_to_device_tensor(kv_slot_host, self._kv_slot_tt)
-        if self.compress_ratio and device_indexer is not None:
-            T_active_pre = (start_pos + 1) // self.compress_ratio
-            if T_active_pre > 0:
-                bucket_pre = _pick_indexer_topk_bucket(T_active_pre)
-                self._stage_indexer_topk_inputs(
-                    B, S, bucket_pre, T_active_pre)
+        # Per-step host->device uploads have already been staged by
+        # pre_stage_decode (called by the orchestrator before forward_device,
+        # outside any future trace region). Body below is pure device work.
 
         # Q path: wq_a -> q_norm -> wq_b -> per-head rsqrt-norm -> rotary.
         with _phase("attn.q"):
