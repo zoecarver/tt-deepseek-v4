@@ -1335,7 +1335,6 @@ class DeviceRMSNorm(nn.Module):
         (hidden,) = g.shape
         self.hidden = hidden
         self.eps = float(eps)
-        self._kernels: dict = {}
 
         rep = dict(
             device=mesh,
@@ -1386,16 +1385,12 @@ class DeviceRMSNorm(nn.Module):
         ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
 
     def _kernel(self, num_row_tiles: int):
-        k = self._kernels.get(num_row_tiles)
-        if k is None:
-            k = _compile_rmsnorm_kernel(
-                num_row_tiles=num_row_tiles,
-                h_tiles=self.hidden // _RMS_TILE,
-                rms_eps=self.eps,
-                inv_D=1.0 / self.hidden,
-            )
-            self._kernels[num_row_tiles] = k
-        return k
+        return _compile_rmsnorm_kernel(
+            num_row_tiles=num_row_tiles,
+            h_tiles=self.hidden // _RMS_TILE,
+            rms_eps=self.eps,
+            inv_D=1.0 / self.hidden,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ttnn = self._ttnn
@@ -2127,8 +2122,6 @@ class DeviceMHC(nn.Module):
         self.sk_eps_mask_tt = ttnn.as_tensor(
             _mhc_sinkhorn_eps_mask_tile(self.hc_mult, self.hc_eps), **rep)
 
-        self._kernels: dict = {}
-
         # Device tensors stashed by hc_pre and consumed by the matching
         # hc_post call. None when no hc_pre has run yet.
         self._stash_a_tt = None
@@ -2172,59 +2165,34 @@ class DeviceMHC(nn.Module):
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
 
     def _norm_fn_kernel(self, num_out_tiles: int):
-        key = ("norm_fn", num_out_tiles)
-        k = self._kernels.get(key)
-        if k is None:
-            k = _compile_mhc_norm_fn_kernel(
-                num_out_tiles=num_out_tiles,
-                K_tiles=self.D // _MHC_TILE,
-                rms_eps=self.norm_eps,
-                inv_D=1.0 / self.D,
-            )
-            self._kernels[key] = k
-        return k
+        return _compile_mhc_norm_fn_kernel(
+            num_out_tiles=num_out_tiles,
+            K_tiles=self.D // _MHC_TILE,
+            rms_eps=self.norm_eps,
+            inv_D=1.0 / self.D,
+        )
 
     def _split_mixes_kernel(self, num_out_tiles: int):
-        key = ("split_mixes", num_out_tiles)
-        k = self._kernels.get(key)
-        if k is None:
-            k = _compile_mhc_split_mixes_kernel(num_tiles=num_out_tiles)
-            self._kernels[key] = k
-        return k
+        return _compile_mhc_split_mixes_kernel(num_tiles=num_out_tiles)
 
     def _sinkhorn_kernel(self, num_slices: int):
-        key = ("sinkhorn", num_slices, self.sinkhorn_iters)
-        k = self._kernels.get(key)
-        if k is None:
-            k = _compile_mhc_sinkhorn_kernel(
-                num_slices=num_slices,
-                repeat=self.sinkhorn_iters,
-                eps=self.hc_eps,
-            )
-            self._kernels[key] = k
-        return k
+        return _compile_mhc_sinkhorn_kernel(
+            num_slices=num_slices,
+            repeat=self.sinkhorn_iters,
+            eps=self.hc_eps,
+        )
 
     def _apply_mix_kernel(self, num_tokens: int):
-        key = ("apply_mix", num_tokens)
-        k = self._kernels.get(key)
-        if k is None:
-            k = _compile_mhc_apply_mix_kernel(
-                num_tokens=num_tokens,
-                h_tiles=self.hidden // _MHC_TILE,
-            )
-            self._kernels[key] = k
-        return k
+        return _compile_mhc_apply_mix_kernel(
+            num_tokens=num_tokens,
+            h_tiles=self.hidden // _MHC_TILE,
+        )
 
     def _post_kernel(self, num_tokens: int):
-        key = ("post", num_tokens)
-        k = self._kernels.get(key)
-        if k is None:
-            k = _compile_mhc_post_kernel(
-                num_tokens=num_tokens,
-                h_tiles=self.hidden // _MHC_TILE,
-            )
-            self._kernels[key] = k
-        return k
+        return _compile_mhc_post_kernel(
+            num_tokens=num_tokens,
+            h_tiles=self.hidden // _MHC_TILE,
+        )
 
     def _rep_tensor(self, t: torch.Tensor):
         ttnn = self._ttnn
