@@ -3015,20 +3015,25 @@ class DeviceMHC(nn.Module):
 
 
 class DeviceSharedExpert(nn.Module):
-    """V4-Flash shared-expert SwiGLU on a 1xN mesh (replicated weights).
+    """V4-Flash shared-expert SwiGLU sharded TP=N across the full mesh.
 
-    Each chip holds full copies of w1, w2, w3 (~48MB per layer bf16) and
-    runs the full forward:
+    w1/w3 are col-parallel on inter_dim (each chip holds [dim, inter_dim/N]),
+    w2 is row-parallel on inter_dim (each chip holds [inter_dim/N, dim]).
+    Pipeline:
 
-        y1 = x @ w1^T
-        y3 = x @ w3^T
-        y1 = clamp(y1, max=limit);  y3 = clamp(y3, -limit, +limit)
-        mid = silu(y1) * y3
-        out = mid @ w2^T
+        y1 = x @ w1^T              # [1, inter/N] sharded on each chip
+        y3 = x @ w3^T              # [1, inter/N] sharded on each chip
+        clamp y1, y3                # elementwise on local shards
+        mid = silu(y1) * y3        # elementwise on local shards
+        partial = mid @ w2^T       # [1, dim] partial sum on each chip
+        out = all_reduce(partial)  # [1, dim] replicated
 
-    Activations are replicated; output read back from chip 0. This is
-    correctness-first TP (no CCL); compute is duplicated 4x but the
-    shared expert is small relative to the mesh's aggregate throughput.
+    Kills the 32x DRAM duplication of the full weights (~62 GB across 43
+    layers) and gives ~32x compute reduction on the per-layer SwiGLU body.
+    The clamp interacts only with local activations (it bounds y1/y3 before
+    the silu*y3 product, all of which is elementwise on local shards), so
+    the partial sums fed into all_reduce are mathematically identical to
+    the original replicated path.
     """
 
     def __init__(self, mesh, cpu_w1: torch.Tensor, cpu_w2: torch.Tensor,
@@ -3047,49 +3052,76 @@ class DeviceSharedExpert(nn.Module):
         self.inter_dim = inter_dim
         self.swiglu_limit = float(swiglu_limit)
 
-        common_rep = dict(
+        num_chips = self.mesh_shape[0] * self.mesh_shape[1]
+        if inter_dim % num_chips != 0:
+            raise ValueError(
+                f"DeviceSharedExpert requires inter_dim={inter_dim} divisible by "
+                f"num_chips={num_chips}"
+            )
+        self._num_chips = num_chips
+        self.inter_per_chip = inter_dim // num_chips
+
+        common = dict(
             device=mesh,
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
         )
+        # w1, w3: stored as [dim, inter_dim] after transpose. Shard last dim
+        # (inter_dim) across all chips → each chip holds [dim, inter/N].
+        col_shard = ttnn.ShardTensorToMesh(mesh, dim=-1)
+        # w2: stored as [inter_dim, dim] after transpose. Shard first dim
+        # (inter_dim) across all chips → each chip holds [inter/N, dim].
+        row_shard = ttnn.ShardTensorToMesh(mesh, dim=0)
         self.w1_tt = ttnn.as_tensor(
-            _weight_to_bf16(cpu_w1).transpose(0, 1).contiguous(), **common_rep)
+            _weight_to_bf16(cpu_w1).transpose(0, 1).contiguous(),
+            mesh_mapper=col_shard, **common)
         self.w3_tt = ttnn.as_tensor(
-            _weight_to_bf16(cpu_w3).transpose(0, 1).contiguous(), **common_rep)
+            _weight_to_bf16(cpu_w3).transpose(0, 1).contiguous(),
+            mesh_mapper=col_shard, **common)
         self.w2_tt = ttnn.as_tensor(
-            _weight_to_bf16(cpu_w2).transpose(0, 1).contiguous(), **common_rep)
+            _weight_to_bf16(cpu_w2).transpose(0, 1).contiguous(),
+            mesh_mapper=row_shard, **common)
         self._alloc_decode_tensors()
 
     def _alloc_decode_tensors(self):
-        """Pre-allocate per-step buffers for the M=1 SwiGLU pipeline. Every
-        ttnn op below feeds output_tensor= / optional_output_tensor=."""
+        """Pre-allocate per-step buffers for the M=1 SwiGLU pipeline. y1/y3/
+        silu/mid hold [1, inter_per_chip] on each chip (shard layout); the
+        partial matmul output is replicated-shaped [1, dim] but each chip
+        holds a partial sum until all_reduce."""
         ttnn = self._ttnn
-        common_rep = dict(
+        common = dict(
             device=self.mesh,
             dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
+        col_shard = ttnn.ShardTensorToMesh(self.mesh, dim=-1)
+        replicate = ttnn.ReplicateTensorToMesh(self.mesh)
         self._x_upload_tt = ttnn.from_torch(
-            torch.zeros(1, self.dim, dtype=torch.bfloat16), **common_rep)
+            torch.zeros(1, self.dim, dtype=torch.bfloat16),
+            mesh_mapper=replicate, **common)
         self._y1_tt = ttnn.from_torch(
-            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16), **common_rep)
+            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16),
+            mesh_mapper=col_shard, **common)
         self._y3_tt = ttnn.from_torch(
-            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16), **common_rep)
+            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16),
+            mesh_mapper=col_shard, **common)
         self._silu_tt = ttnn.from_torch(
-            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16), **common_rep)
+            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16),
+            mesh_mapper=col_shard, **common)
         self._mid_tt = ttnn.from_torch(
-            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16), **common_rep)
-        self._out_tt = ttnn.from_torch(
-            torch.zeros(1, self.dim, dtype=torch.bfloat16), **common_rep)
-        self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
+            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16),
+            mesh_mapper=col_shard, **common)
+        self._partial_tt = ttnn.from_torch(
+            torch.zeros(1, self.dim, dtype=torch.bfloat16),
+            mesh_mapper=replicate, **common)
+        self._upload_mapper = replicate
 
     def forward_device(self, x_tt):
         """Pure-device shared-expert SwiGLU. x_tt: [M=1, dim] bf16 device
-        tensor. Returns self._out_tt (filled in place). No host transfers."""
+        tensor (replicated). Returns out_tt [1, dim] replicated (post
+        all_reduce). No host transfers."""
         ttnn = self._ttnn
         ttnn.matmul(x_tt, self.w1_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._y1_tt)
@@ -3103,8 +3135,8 @@ class DeviceSharedExpert(nn.Module):
         ttnn.multiply(self._silu_tt, self._y3_tt, output_tensor=self._mid_tt)
         ttnn.matmul(self._mid_tt, self.w2_tt,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    optional_output_tensor=self._out_tt)
-        return self._out_tt
+                    optional_output_tensor=self._partial_tt)
+        return ttnn.all_reduce(self._partial_tt)
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """x: [M=1, dim] -> [M=1, dim]. weights matches Expert.forward
