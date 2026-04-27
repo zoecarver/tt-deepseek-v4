@@ -3506,6 +3506,50 @@ class DeviceAttention(nn.Module):
         else:
             self._compress_idxs_ramp_tt = None
 
+        # Pre-allocated slice destinations for the rotary split/recombine
+        # pattern. Each forward_device call slices q/kv/o into nope+rope
+        # halves before/after rotary; ttnn.slice accepts output_tensor=, so
+        # these scratches absorb 6 per-call allocs.
+        H, D = self.n_heads, self.head_dim
+        rd = self.rope_head_dim
+        S = 1
+        self._q_nope_scratch_tt = ttnn.from_torch(
+            torch.zeros(B, S, H, D - rd, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._upload_mapper,
+        )
+        self._q_rope_scratch_tt = ttnn.from_torch(
+            torch.zeros(B, S, H, rd, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._upload_mapper,
+        )
+        self._kv_nope_scratch_tt = ttnn.from_torch(
+            torch.zeros(B, S, D - rd, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._upload_mapper,
+        )
+        self._kv_rope_scratch_tt = ttnn.from_torch(
+            torch.zeros(B, S, rd, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._upload_mapper,
+        )
+        self._o_nope_scratch_tt = ttnn.from_torch(
+            torch.zeros(B, S, H, D - rd, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._upload_mapper,
+        )
+        self._o_rope_scratch_tt = ttnn.from_torch(
+            torch.zeros(B, S, H, rd, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._upload_mapper,
+        )
+
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         """Single-token forward. Prefill is driven externally as a per-token
         loop, so seqlen is always 1 and start_pos==0 is handled by _decode."""
@@ -3574,10 +3618,13 @@ class DeviceAttention(nn.Module):
 
         cos_q, sin_q = self._rotary_tables(start_pos, S, q_dims=4)
         # Rotate q[..., -rd:] by slicing -> rotating -> concatenating.
-        q_nope = ttnn.slice(q_tt, [0, 0, 0, 0], [B, S, H, D - rd])
-        q_rope = ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, S, H, D])
-        q_rope = _device_apply_rotary_interleaved(ttnn, q_rope, cos_q, sin_q, inverse=False)
-        q_tt = ttnn.concat([q_nope, q_rope], dim=-1)
+        ttnn.slice(q_tt, [0, 0, 0, 0], [B, S, H, D - rd],
+                   output_tensor=self._q_nope_scratch_tt)
+        ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, S, H, D],
+                   output_tensor=self._q_rope_scratch_tt)
+        q_rope = _device_apply_rotary_interleaved(
+            ttnn, self._q_rope_scratch_tt, cos_q, sin_q, inverse=False)
+        q_tt = ttnn.concat([self._q_nope_scratch_tt, q_rope], dim=-1)
 
         # KV path: wkv -> kv_norm -> rotary.
         kv_tt = attn.wkv.forward_device(x_tt)                 # [B, S, D]
@@ -3585,10 +3632,13 @@ class DeviceAttention(nn.Module):
         kv_2d = self._rmsnorm_device(self.kv_norm_dev, kv_2d, B * S)
         kv_tt = ttnn.reshape(kv_2d, [B, S, D])
         cos_kv, sin_kv = self._rotary_tables(start_pos, S, q_dims=3)
-        kv_nope = ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd])
-        kv_rope = ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D])
-        kv_rope = _device_apply_rotary_interleaved(ttnn, kv_rope, cos_kv, sin_kv, inverse=False)
-        kv_tt = ttnn.concat([kv_nope, kv_rope], dim=-1)
+        ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd],
+                   output_tensor=self._kv_nope_scratch_tt)
+        ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D],
+                   output_tensor=self._kv_rope_scratch_tt)
+        kv_rope = _device_apply_rotary_interleaved(
+            ttnn, self._kv_rope_scratch_tt, cos_kv, sin_kv, inverse=False)
+        kv_tt = ttnn.concat([self._kv_nope_scratch_tt, kv_rope], dim=-1)
 
         # Device-side act_quant on the nope region (bf16 round-trip; no fp8
         # cast under the bf16-everywhere precision policy). After this, kv_tt
@@ -3662,10 +3712,13 @@ class DeviceAttention(nn.Module):
 
         # Inverse rotary on o[..., -rd:].
         cos_o, sin_o = self._rotary_tables(start_pos, S, q_dims=4)
-        o_nope = ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H, D - rd])
-        o_rope = ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H, D])
-        o_rope = _device_apply_rotary_interleaved(ttnn, o_rope, cos_o, sin_o, inverse=True)
-        o_tt = ttnn.concat([o_nope, o_rope], dim=-1)
+        ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H, D - rd],
+                   output_tensor=self._o_nope_scratch_tt)
+        ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H, D],
+                   output_tensor=self._o_rope_scratch_tt)
+        o_rope = _device_apply_rotary_interleaved(
+            ttnn, self._o_rope_scratch_tt, cos_o, sin_o, inverse=True)
+        o_tt = ttnn.concat([self._o_nope_scratch_tt, o_rope], dim=-1)
 
         # Group reshape: [B, S, H, D] -> [G, B*S, H*D/G] for batched matmul.
         per_group = (H * D) // self.n_groups
