@@ -4498,23 +4498,32 @@ class Model:
             self._device_shared_experts.append(dse)
 
     def offload_embedding(self, mesh):
-        """Move token embedding to the 1xN mesh (replicated).
+        """Move token embedding to the mesh, dim-sharded along the col axis.
 
-        Replaces Transformer.embed.forward with a ttnn.embedding call. The
-        weight is tiny-ish for V4 (vocab=129280 * dim=4096 bf16 ~1GB) and
-        fits comfortably when replicated per chip.
+        Replaces Transformer.embed.forward with a per-chip ttnn.embedding call
+        on a hidden-axis-sharded weight, followed by an all_gather along
+        cluster_axis=1. Per-chip table size is `[vocab, hidden/n_cols]`
+        (~125MB on Galaxy vs ~1GB replicated). Output is replicated across the
+        col axis after the gather, matching the previous calling contract.
         """
         import ttnn
         embed = self.transformer.embed
         w = _weight_to_bf16(embed.weight).contiguous()
         mesh_shape = tuple(mesh.shape)
+        n_cols = mesh_shape[1]
+        vocab, hidden = w.shape
+        if hidden % n_cols != 0:
+            raise ValueError(
+                f"embedding hidden={hidden} not divisible by mesh cols={n_cols}"
+            )
         w_tt = ttnn.as_tensor(
             w,
             device=mesh,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            mesh_mapper=ttnn.ShardTensor2dMesh(
+                mesh, mesh_shape=mesh_shape, dims=(None, -1)),
         )
 
         def _device_embed(self_embed, x: torch.Tensor):
@@ -4530,7 +4539,9 @@ class Model:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
             )
-            return ttnn.embedding(ids_tt, w_tt, layout=ttnn.TILE_LAYOUT)
+            embed_local = ttnn.embedding(ids_tt, w_tt, layout=ttnn.TILE_LAYOUT)
+            return ttnn.all_gather(embed_local, dim=-1, cluster_axis=1,
+                                   num_links=1)
 
         embed.forward = _device_embed.__get__(embed, type(embed))
         embed.weight.data = torch.empty(0)  # device owns it
