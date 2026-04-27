@@ -505,6 +505,11 @@ def main():
                    help="At end, load back and PCC-check one expert per layer.")
     p.add_argument("--limit-layers", type=int, default=0,
                    help="If >0, only process this many layers (for testing).")
+    p.add_argument("--include-layers", type=str, default="",
+                   help="Comma-separated list of layer indices to process (e.g. "
+                        "'0,1,2'). Bypasses --n-hash-layers filter. When set, "
+                        "merges new entries into an existing manifest.json "
+                        "rather than overwriting it.")
     p.add_argument("--workers", type=int, default=3,
                    help="Threads per layer (1=serial w1->w3->w2; 3=full intra-layer parallel).")
     p.add_argument("--profile", action="store_true",
@@ -528,7 +533,16 @@ def main():
           flush=True)
 
     layers = sorted(_scan_routed_experts(state).keys())
-    if args.n_hash_layers > 0:
+    include = None
+    if args.include_layers:
+        include = {int(x) for x in args.include_layers.split(",") if x.strip()}
+        missing = include - set(layers)
+        if missing:
+            raise ValueError(
+                f"--include-layers references layers not in state dict: "
+                f"{sorted(missing)}")
+        layers = sorted(include)
+    elif args.n_hash_layers > 0:
         layers = [L for L in layers if L >= args.n_hash_layers]
     if args.limit_layers:
         layers = layers[:args.limit_layers]
@@ -544,20 +558,30 @@ def main():
         trace_region_size=10_000_000,
     )
 
-    manifest = {
-        "format_version": 1,
-        "model": "DeepSeek-V4-Flash routed-experts (lossless bfp4_b storage of fp4 e2m1 nibbles)",
-        "mesh_shape": [args.mesh_rows, args.mesh_cols],
-        "n_experts": args.n_experts,
-        "dim": args.dim,
-        "inter_dim": args.inter_dim,
-        "n_hash_layers": args.n_hash_layers,
-        "fp4_block_size": FP4_BLOCK_K,
-        "tile_size": TILE,
-        "weight_dtype": "bfloat4_b",
-        "scale_dtype": "bfloat16_compact_KbN",
-        "layers": [],
-    }
+    manifest_path = out_dir / "manifest.json"
+    if include is not None and manifest_path.is_file():
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        manifest["layers"] = [
+            entry for entry in manifest.get("layers", [])
+            if entry["layer"] not in include
+        ]
+        manifest["n_hash_layers"] = args.n_hash_layers
+    else:
+        manifest = {
+            "format_version": 1,
+            "model": "DeepSeek-V4-Flash routed-experts (lossless bfp4_b storage of fp4 e2m1 nibbles)",
+            "mesh_shape": [args.mesh_rows, args.mesh_cols],
+            "n_experts": args.n_experts,
+            "dim": args.dim,
+            "inter_dim": args.inter_dim,
+            "n_hash_layers": args.n_hash_layers,
+            "fp4_block_size": FP4_BLOCK_K,
+            "tile_size": TILE,
+            "weight_dtype": "bfloat4_b",
+            "scale_dtype": "bfloat16_compact_KbN",
+            "layers": [],
+        }
 
     try:
         wall0 = time.perf_counter()
@@ -600,7 +624,7 @@ def main():
             )
             summary["walltime_s"] = round(time.perf_counter() - t0, 2)
             manifest["layers"].append(summary)
-            with open(out_dir / "manifest.json", "w") as f:
+            with open(manifest_path, "w") as f:
                 json.dump(manifest, f, indent=2)
             print(f"[layer {L}] done in {summary['walltime_s']}s "
                   f"(cumulative {time.perf_counter()-wall0:.1f}s)",

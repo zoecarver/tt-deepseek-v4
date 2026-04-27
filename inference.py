@@ -543,13 +543,14 @@ class MoE(nn.Module):
         ttnn.copy(x_tt, shared_dev._x_upload_tt)
         shared_out_tt = shared_dev.forward_device()
 
-        use_cached = (
-            getattr(self, "_w1_tt", None) is not None and not self.gate.hash
-        )
+        use_cached = getattr(self, "_w1_tt", None) is not None
         if use_cached:
             gate_dev = self.gate._device_gate
             ttnn.copy(x_tt, gate_dev._x_upload_tt)
-            weights_tt, indices_tt = gate_dev.forward_device()
+            if self.gate.hash:
+                weights_tt, indices_tt = gate_dev.forward_device(input_ids)
+            else:
+                weights_tt, indices_tt = gate_dev.forward_device()
             return self._forward_device_routed_cached(
                 x_tt, weights_tt, indices_tt, shared_out_tt)
 
@@ -1283,6 +1284,127 @@ class DeviceMoEGate(nn.Module):
         indices = _readback_replicated_2d(
             ttnn, indices_tt, self.mesh, self.mesh_shape)[:M].long()
         return weights, indices
+
+
+class HashDeviceMoEGate(nn.Module):
+    """Hash-routed MoE gate (vocab-lookup indices) on a 1xN mesh.
+
+    Hash-gate layers (layer_id < n_hash_layers) score with the same
+    sqrt(softplus(x @ W^T)) as the regular gate, but pick indices from a
+    fixed [vocab, topk] table indexed by input_ids — no topk(scores), no
+    bias. This class runs the whole pipeline on device so MoE.forward_device
+    can take Path D (cached bfp4_b experts) for hash layers too.
+
+    Parallel to DeviceMoEGate; we keep them as separate classes since the
+    bias/topk plumbing diverges enough to make a unified version messy.
+    """
+
+    def __init__(self, mesh, cpu_weight: torch.Tensor,
+                 cpu_tid2eid: torch.Tensor,
+                 topk: int, route_scale: float, score_func: str,
+                 n_routed_experts: int):
+        super().__init__()
+        import ttnn
+        if score_func != "sqrtsoftplus":
+            raise ValueError(
+                f"HashDeviceMoEGate v1 only supports score_func="
+                f"'sqrtsoftplus', got {score_func!r}")
+        if cpu_tid2eid.dtype != torch.int32:
+            raise ValueError(
+                f"tid2eid expected int32, got {cpu_tid2eid.dtype}")
+        if int(cpu_tid2eid.max().item()) >= n_routed_experts:
+            raise ValueError("tid2eid has out-of-range expert id")
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        n_experts, dim = cpu_weight.shape
+        self.n_experts = n_experts
+        self.dim = dim
+        self.topk = topk
+        self.route_scale = float(route_scale)
+
+        common_rep = dict(
+            device=mesh,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        w_kn = _weight_to_bf16(cpu_weight).transpose(0, 1).contiguous()
+        self.w_tt = ttnn.as_tensor(w_kn, **common_rep)
+        # tid2eid stored as bf16: expert ids 0..255 round-trip exactly through
+        # bf16 (bf16 represents every integer up to 256), so the embedding
+        # lookup is lossless. Cast back to int32 after the lookup so the
+        # downstream gather/eq sees the right dtype.
+        tid2eid_bf16 = cpu_tid2eid.to(torch.bfloat16).contiguous()
+        self.tid2eid_tt = ttnn.as_tensor(
+            tid2eid_bf16,
+            device=mesh,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        self._alloc_decode_tensors()
+
+    def _alloc_decode_tensors(self):
+        ttnn = self._ttnn
+        common_rep = dict(
+            device=self.mesh,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        self._x_upload_tt = ttnn.from_torch(
+            torch.zeros(1, self.dim, dtype=torch.bfloat16), **common_rep)
+        self._raw_tt = ttnn.from_torch(
+            torch.zeros(1, self.n_experts, dtype=torch.bfloat16),
+            **common_rep)
+        self._input_ids_tt = ttnn.from_torch(
+            torch.zeros(1, 1, dtype=torch.int32),
+            device=self.mesh,
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
+
+    def _compute_body(self):
+        """Run the full pipeline assuming _x_upload_tt and _input_ids_tt are
+        already filled. Returns (weights_tt [1, topk] bf16,
+        indices_tt [1, topk] uint32) replicated."""
+        ttnn = self._ttnn
+        x_tt = self._x_upload_tt
+        ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._raw_tt)
+        scores_tt = ttnn.sqrt(ttnn.softplus(self._raw_tt))
+        idx_lookup = ttnn.embedding(
+            self._input_ids_tt, self.tid2eid_tt, layout=ttnn.TILE_LAYOUT)
+        # ttnn.gather requires uint32/uint16 index. Path D's selection mask
+        # typecasts to int32 anyway, so returning uint32 is fine downstream.
+        idx_u32 = ttnn.typecast(idx_lookup, ttnn.uint32)
+        idx_2d = ttnn.reshape(idx_u32, [1, self.topk])
+        gathered_tt = ttnn.gather(scores_tt, dim=-1, index=idx_2d)
+        wsum_tt = ttnn.sum(gathered_tt, dim=-1, keepdim=True)
+        normed_tt = ttnn.div(gathered_tt, wsum_tt)
+        weights_tt = ttnn.multiply(normed_tt, self.route_scale)
+        return weights_tt, idx_2d
+
+    def forward_device(self, input_ids: torch.Tensor):
+        """Upload input_ids and run the gate body. Caller must have already
+        copied x into self._x_upload_tt. Returns (weights_tt, indices_tt)."""
+        ttnn = self._ttnn
+        ids = input_ids.reshape(1, 1).to(torch.int32).contiguous()
+        host_mesh = ttnn.from_torch(
+            ids,
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=self._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(host_mesh, self._input_ids_tt)
+        return self._compute_body()
 
 
 _RMS_TILE = 32
@@ -4253,8 +4375,6 @@ class Model:
             ffn = layer.ffn
             if not isinstance(ffn, MoE):
                 continue
-            if ffn.gate.hash:
-                continue
             n_per_chip = ffn.n_routed_experts // n_chips
             if ffn.n_routed_experts % n_chips != 0:
                 raise ValueError(
@@ -4316,11 +4436,11 @@ class Model:
             self._device_routed_experts.append(ffn)
 
     def offload_moe_gate(self, mesh):
-        """Move every non-hash MoE gate to the 1xN mesh.
+        """Move every MoE gate to the 1xN mesh (hash + non-hash).
 
-        Gate is tiny (n_experts x dim bf16, ~2MB + n_experts bias) -- replicated
-        on every chip. Rebinds Gate.forward to call the device gate. Hash gates
-        (layer < n_hash_layers) keep their CPU lookup path.
+        Gate is tiny (n_experts x dim bf16, ~2MB) — replicated on every chip.
+        Hash gates additionally hold a [vocab, topk] tid2eid lookup (~3MB)
+        for input_ids → expert-ids on device.
         """
         self._device_moe_gates = []
         for layer in self.transformer.layers:
@@ -4329,19 +4449,26 @@ class Model:
                 continue
             gate = ffn.gate
             if gate.hash:
-                continue
+                dg = HashDeviceMoEGate(
+                    mesh, gate.weight, gate.tid2eid,
+                    topk=gate.topk, route_scale=gate.route_scale,
+                    score_func=gate.score_func,
+                    n_routed_experts=ffn.n_routed_experts,
+                )
+                gate.tid2eid.data = torch.empty(0)  # device owns it
+                gate._device_gate = dg
+            else:
+                dg = DeviceMoEGate(
+                    mesh, gate.weight, gate.bias,
+                    topk=gate.topk, route_scale=gate.route_scale,
+                    score_func=gate.score_func,
+                )
 
-            dg = DeviceMoEGate(
-                mesh, gate.weight, gate.bias,
-                topk=gate.topk, route_scale=gate.route_scale,
-                score_func=gate.score_func,
-            )
+                def _device_gate_forward(self_gate, x, input_ids=None, _dg=dg):
+                    return _dg(x)
 
-            def _device_gate_forward(self_gate, x, input_ids=None, _dg=dg):
-                return _dg(x)
-
-            gate.forward = _device_gate_forward.__get__(gate, type(gate))
-            gate._device_gate = dg
+                gate.forward = _device_gate_forward.__get__(gate, type(gate))
+                gate._device_gate = dg
             self._device_moe_gates.append(dg)
 
     def offload_attn_wo_b(self, mesh):
