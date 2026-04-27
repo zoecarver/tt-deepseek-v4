@@ -991,10 +991,7 @@ class DeviceLMHead:
             mesh_mapper=self._upload_mapper,
         )
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
-        if self._trace_id is None:
-            self._capture_trace()
-        else:
-            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
+        self._compute_body()
         y = ttnn.to_torch(
             self._matmul_out_tt,
             mesh_composer=ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(0, -1)),
@@ -1186,12 +1183,7 @@ class DeviceMoEGate(nn.Module):
     def forward_device(self):
         """Pure-device gate body: assumes self._x_upload_tt is already filled.
         Returns (weights_tt, indices_tt) device tensors. No host transfers."""
-        ttnn = self._ttnn
-        if self._trace_id is None:
-            self._capture_trace()
-        else:
-            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
-        return self._weights_tt, self._indices_tt
+        return self._compute_body()
 
     def forward(self, x: torch.Tensor):
         """x: [M=1, dim] -> (weights [1, topk] float32, indices [1, topk] int64).
@@ -1423,10 +1415,7 @@ class DeviceRMSNorm(nn.Module):
                 mesh_mapper=self._upload_mapper,
             )
             ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
-            if self._trace_id is None:
-                self._capture_trace()
-            else:
-                ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
+            self._compute_body()
             out_tt = self._out_tt
         else:
             rep = dict(
@@ -2580,11 +2569,7 @@ class DeviceSharedExpert(nn.Module):
         """Pure-device shared-expert body: assumes self._x_upload_tt is
         already filled. Returns the output device tensor self._out_tt.
         No host transfers."""
-        ttnn = self._ttnn
-        if self._trace_id is None:
-            self._capture_trace()
-        else:
-            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
+        self._compute_body()
         return self._out_tt
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
