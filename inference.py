@@ -828,21 +828,24 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
         with _phase("embed"):
-            h = self.embed(input_ids)
-            h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-            B, S, mhc, hidden = h.shape
-            orig_dtype = h.dtype
-            num_tokens = B * S
-            num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
             mhc_attn = self.layers[0]._device_mhc_attn
             ttnn = mhc_attn._ttnn
-            a_packed = _mhc_pack_residual(h, num_tokens_pad)
-            host_mesh = ttnn.from_torch(
-                a_packed, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
-                mesh_mapper=mhc_attn._upload_mapper,
+            mhc = self.hc_mult
+            hidden = mhc_attn.hidden
+            B, S = input_ids.shape
+            num_tokens = B * S
+            num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
+            orig_dtype = torch.bfloat16
+
+            embed_tt = self.embed(input_ids)
+            e_2d = ttnn.reshape(embed_tt, [num_tokens, hidden])
+            e_fp32 = ttnn.typecast(e_2d, dtype=ttnn.float32)
+            e_repeated = ttnn.repeat(e_fp32, ttnn.Shape([1, mhc]))
+            a_tt = ttnn.pad(
+                e_repeated,
+                padding=[(0, num_tokens_pad - num_tokens), (0, 0)],
+                value=0.0,
             )
-            ttnn.copy_host_to_device_tensor(host_mesh, mhc_attn._a_upload_tt)
-            a_tt = mhc_attn._a_upload_tt
         with _phase("blocks"):
             for layer in self.layers:
                 a_tt = _block_forward(layer, a_tt, start_pos, input_ids,
@@ -3986,7 +3989,10 @@ class Model:
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
         )
 
-        def _device_embed(self_embed, x: torch.Tensor) -> torch.Tensor:
+        def _device_embed(self_embed, x: torch.Tensor):
+            """Return a ttnn device tensor [B, S, hidden] bf16 TILE_LAYOUT,
+            replicated across the mesh. Caller is responsible for unpacking
+            shape and downstream on-device repeat/pad."""
             ids = x.to(torch.int32).contiguous()
             ids_tt = ttnn.as_tensor(
                 ids,
@@ -3996,10 +4002,7 @@ class Model:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
             )
-            y_tt = ttnn.embedding(ids_tt, w_tt, layout=ttnn.TILE_LAYOUT)
-            y = _readback_replicated_2d(ttnn, y_tt, mesh, mesh_shape)
-            B = x.shape[0]
-            return y[:B].to(torch.bfloat16)
+            return ttnn.embedding(ids_tt, w_tt, layout=ttnn.TILE_LAYOUT)
 
         embed.forward = _device_embed.__get__(embed, type(embed))
         embed.weight.data = torch.empty(0)  # device owns it
