@@ -2772,6 +2772,125 @@ def _compressor_softmax_sum_norm_masks(ratio: int):
     return mf, mb, mp
 
 
+def _compile_act_quant_block_kernel(M_pad: int, N: int, BLOCK: int = 64,
+                                     fp8_max: float = 448.0, eps: float = 1e-4):
+    """Inlined from tt-lang-kernels/act_quant_block.py.
+
+    Per-block max-abs scale round-trip in bf16:
+        amax = max(|x|, dim=last(block))
+        s    = max(amax, eps) / fp8_max
+        out  = clamp(x / s, -fp8_max, fp8_max) * s
+    Replaces 9 ttnn ops in `_device_act_quant_block` (reshape, abs, max,
+    maximum, multiply, divide, clamp, multiply, reshape) with 1 dispatch.
+    Block matches the V4-Flash decode shape M_pad=32 N=448 (head_dim - rope).
+    """
+    if N % BLOCK != 0:
+        raise ValueError(f"N={N} not divisible by BLOCK={BLOCK}")
+    if BLOCK % _RMS_TILE != 0:
+        raise ValueError(f"BLOCK={BLOCK} not multiple of TILE={_RMS_TILE}")
+    if M_pad % _RMS_TILE != 0:
+        raise ValueError(f"M_pad={M_pad} not multiple of TILE={_RMS_TILE}")
+
+    M_tiles = M_pad // _RMS_TILE
+    NB = N // BLOCK
+    BLOCK_TILES = BLOCK // _RMS_TILE
+    total_work = M_tiles * NB
+    inv_fp8_max = 1.0 / fp8_max
+
+    @ttl.operation(grid="auto", fp32_dest_acc_en=True)
+    def act_quant_kernel(x, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        work_per_core = -(-total_work // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BLOCK_TILES), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, BLOCK_TILES), block_count=2)
+
+        abs_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BLOCK_TILES), block_count=2)
+        amax_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        amax_eps_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        inv_s_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        s_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        inv_s_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BLOCK_TILES), block_count=2)
+        s_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BLOCK_TILES), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            sc = sc_dfb.wait()
+
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    x_blk = x_dfb.wait()
+                    abs_dfb.reserve().store(ttl.math.abs(x_blk))
+                    amax_dfb.reserve().store(
+                        ttl.math.reduce_max(abs_dfb.wait(), sc, dims=[1])
+                    )
+                    amax = amax_dfb.wait()
+                    amax_eps_dfb.reserve().store(
+                        amax + ttl.math.fill(amax, eps)
+                    )
+                    amax_eps = amax_eps_dfb.wait()
+
+                    inv_s_dfb.reserve().store(
+                        ttl.math.recip(amax_eps)
+                        * ttl.math.fill(amax_eps, fp8_max)
+                    )
+                    inv_s = inv_s_dfb.wait()
+                    inv_s_bc_blk = inv_s_bc_dfb.reserve()
+                    inv_s_bc_blk.store(
+                        ttl.math.broadcast(inv_s, inv_s_bc_blk, dims=[1])
+                    )
+                    inv_s_bc = inv_s_bc_dfb.wait()
+
+                    s_dfb.reserve().store(
+                        amax_eps * ttl.math.fill(amax_eps, inv_fp8_max)
+                    )
+                    s = s_dfb.wait()
+                    s_bc_blk = s_bc_dfb.reserve()
+                    s_bc_blk.store(
+                        ttl.math.broadcast(s, s_bc_blk, dims=[1])
+                    )
+                    s_bc = s_bc_dfb.wait()
+
+                    out_dfb.reserve().store(x_blk * inv_s_bc * s_bc)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    m = global_w // NB
+                    nb = global_w % NB
+                    c0 = nb * BLOCK_TILES
+                    c1 = c0 + BLOCK_TILES
+                    blk = x_dfb.reserve()
+                    ttl.copy(x[m:m+1, c0:c1], blk).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    m = global_w // NB
+                    nb = global_w % NB
+                    c0 = nb * BLOCK_TILES
+                    c1 = c0 + BLOCK_TILES
+                    ttl.copy(out_dfb.wait(), out[m:m+1, c0:c1]).wait()
+
+    return act_quant_kernel
+
+
 # ============================================================================
 # tt-lang kernel cache + named decode-path globals
 # ============================================================================
@@ -2885,6 +3004,14 @@ def _get_ttl_compressor_softmax_sum_norm_kernel(ratio: int, ratio_pad: int,
     )
 
 
+def _get_ttl_act_quant_block_kernel(M_pad: int, N: int, BLOCK: int = 64,
+                                     fp8_max: float = 448.0, eps: float = 1e-4):
+    return _cached_kernel(
+        ("act_quant_block", M_pad, N, BLOCK, fp8_max, eps),
+        lambda: _compile_act_quant_block_kernel(M_pad, N, BLOCK, fp8_max, eps),
+    )
+
+
 # Named decode-path kernels. Set by `prebuild_ttl_decode_kernels(args)`.
 # Each name encodes the shape it serves so call sites read like
 # `ttl_rmsnorm_M32_h4096(x, gamma, sc, out)`.
@@ -2911,6 +3038,10 @@ ttl_compressor_slot_shift_B1_pad32_d128 = None  # indexer compressor (index_head
 ttl_compressor_softmax_sum_norm_pad32_d512 = None  # attention compressor
 ttl_compressor_softmax_sum_norm_pad32_d128 = None  # indexer compressor
 
+# Block-wise act_quant round-trip used in the indexer kv path (head_dim - rope).
+# 1 dispatch replaces 9 ttnn ops in `_device_act_quant_block`.
+ttl_act_quant_block_M32_N448_B64 = None  # head_dim=512 - rope_head_dim=64
+
 
 def prebuild_ttl_decode_kernels(args: "ModelArgs"):
     """Eagerly build every tt-lang kernel the decode path uses and bind them
@@ -2929,6 +3060,7 @@ def prebuild_ttl_decode_kernels(args: "ModelArgs"):
     global ttl_compressor_slot_shift_B1_pad32_d128
     global ttl_compressor_softmax_sum_norm_pad32_d512
     global ttl_compressor_softmax_sum_norm_pad32_d128
+    global ttl_act_quant_block_M32_N448_B64
 
     eps = args.norm_eps
     ttl_rmsnorm_M32_h4096 = _get_ttl_rmsnorm_kernel(
@@ -2965,6 +3097,9 @@ def prebuild_ttl_decode_kernels(args: "ModelArgs"):
     ttl_compressor_softmax_sum_norm_pad32_d128 = (
         _get_ttl_compressor_softmax_sum_norm_kernel(
             4, _RMS_TILE, args.index_head_dim, eps))
+
+    ttl_act_quant_block_M32_N448_B64 = _get_ttl_act_quant_block_kernel(
+        _RMS_TILE, args.head_dim - args.rope_head_dim, 64)
 
 
 class DeviceMHC(nn.Module):
@@ -4382,6 +4517,21 @@ class DeviceAttention(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._upload_mapper,
         )
+        # Scratch for the act_quant_block tt-lang kernel: persistent output
+        # buffer (kernel writes into it; we then slice row 0). The scaler is
+        # a [TILE, TILE] tile of ones used as the block-reduce sentinel.
+        self._act_quant_out_tt = ttnn.from_torch(
+            torch.zeros(_RMS_TILE, D - rd, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._upload_mapper,
+        )
+        self._act_quant_sc_tt = ttnn.from_torch(
+            torch.ones(_RMS_TILE, _RMS_TILE, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=self._upload_mapper,
+        )
 
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         """Single-token forward. Prefill is driven externally as a per-token
@@ -4476,12 +4626,27 @@ class DeviceAttention(nn.Module):
             kv_tt = ttnn.concat([self._kv_nope_scratch_tt, kv_rope], dim=-1)
 
             # Device-side act_quant on the nope region (bf16 round-trip; no fp8
-            # cast under the bf16-everywhere precision policy). After this, kv_tt
-            # mirrors what CPU `act_quant(..., inplace=True)` would produce in bf16.
-            kv_nope_q = _device_act_quant_block(
-                ttnn,
+            # cast under the bf16-everywhere precision policy). One tt-lang
+            # kernel dispatch replaces the 9-op chain in `_device_act_quant_block`.
+            # The kernel only reads tile (0, 0..NB); a logical-[B*S, N] input in
+            # TILE_LAYOUT shares the [1 tile-row, N/TILE] grid with [TILE, N], so
+            # no host-side pad is required.
+            if ttl_act_quant_block_M32_N448_B64 is None:
+                raise RuntimeError(
+                    "act_quant_block kernel not pre-built; "
+                    "call prebuild_ttl_decode_kernels(args) first")
+            nope_2d = ttnn.reshape(
                 ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd]),
-                block_size=64,
+                [B * S, D - rd],
+            )
+            ttl_act_quant_block_M32_N448_B64(
+                nope_2d,
+                self._act_quant_sc_tt,
+                self._act_quant_out_tt,
+            )
+            kv_nope_q = ttnn.reshape(
+                ttnn.slice(self._act_quant_out_tt, [0, 0], [B * S, D - rd]),
+                [B, S, D - rd],
             )
             kv_rope_only = ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D])
             kv_tt = ttnn.concat([kv_nope_q, kv_rope_only], dim=-1)
