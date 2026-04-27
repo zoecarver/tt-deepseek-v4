@@ -329,6 +329,20 @@ def _window_topk_row_for_pos(start_pos: int, window_size: int) -> int:
     return window_size + (start_pos % window_size)
 
 
+_INDEXER_TOPK_BUCKETS = (128, 256, 384, 512, 640, 768, 896, 1024)
+
+
+def _pick_indexer_topk_bucket(t_active: int) -> int:
+    """Round t_active up to one of the 128-step buckets. Within a bucket the
+    indexer pad+mask path runs at constant slice end and constant K, which is
+    the trace-friendliness payoff: one host comparison replaces both the
+    dynamic ttnn.slice end and the dynamic ttnn.topk K."""
+    for bk in _INDEXER_TOPK_BUCKETS:
+        if t_active <= bk:
+            return bk
+    return _INDEXER_TOPK_BUCKETS[-1]
+
+
 class Compressor(nn.Module):
     def __init__(self, args: ModelArgs, compress_ratio: int = 4, head_dim: int = 512, rotate: bool = False):
         super().__init__()
@@ -4528,6 +4542,43 @@ class DeviceAttention(nn.Module):
         else:
             self._compress_idxs_ramp_tt = None
 
+        # Indexer topk pad+mask buckets (only the layer with device_indexer).
+        # Per bucket bk:
+        #  * `_topk_ramp_int_per_bucket[bk]`: persistent int32 ramp [0..bk-1]
+        #    of shape [B, 1, bk] on device, written once at construction.
+        #  * `_t_active_persistent_per_bucket[bk]`: persistent int32 device
+        #    buffer of shape [B, 1, bk]. Per step the host stages T_active
+        #    via ttnn.copy_host_to_device_tensor, then the in-body code reads
+        #    the persistent handle so no ttnn.from_torch sits inside the
+        #    indexer topk path (which is the in-progress trace target).
+        # Within a bucket the slice end and topk K are compile-time constants.
+        self._topk_ramp_int_per_bucket = {}
+        self._t_active_persistent_per_bucket = {}
+        if self.compress_ratio == 4:
+            max_T_for_buckets = self.max_seq_len // self.compress_ratio
+            for bk in _INDEXER_TOPK_BUCKETS:
+                if bk > max_T_for_buckets and bk != _INDEXER_TOPK_BUCKETS[0]:
+                    continue
+                ramp_bk = (
+                    torch.arange(bk, dtype=torch.int32)
+                    .view(1, 1, bk)
+                    .expand(B, 1, bk)
+                    .contiguous()
+                )
+                self._topk_ramp_int_per_bucket[bk] = ttnn.from_torch(
+                    ramp_bk, device=self.mesh, dtype=ttnn.int32,
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=self._upload_mapper,
+                )
+                self._t_active_persistent_per_bucket[bk] = ttnn.from_torch(
+                    torch.zeros((B, 1, bk), dtype=torch.int32),
+                    device=self.mesh, dtype=ttnn.int32,
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=self._upload_mapper,
+                )
+
         # Pre-allocated slice destinations for the rotary split/recombine
         # pattern. Each forward_device call slices q/kv/o into nope+rope
         # halves before/after rotary; ttnn.slice accepts output_tensor=, so
@@ -4727,14 +4778,61 @@ class DeviceAttention(nn.Module):
                             score_tt = device_indexer.forward_device_score(
                                 x_tt, qr_tt, B, start_pos
                             )
-                            k = min(device_indexer.index_topk, T_active)
-                            score_valid_tt = ttnn.slice(
-                                score_tt, [0, 0, 0], [B, S, T_active])
-                            _, cmp_idxs_tt = ttnn.topk(
-                                score_valid_tt, k=k, dim=-1,
+                            # Bucketed pad+mask: pick a bucket on host so the
+                            # slice end and topk K are compile-time constants
+                            # within the bucket. Replaces the dynamic-slice +
+                            # dynamic-K path that leaked T_active and k into
+                            # device dispatches per layer per step.
+                            bucket = _pick_indexer_topk_bucket(T_active)
+                            k_fixed = min(device_indexer.index_topk, bucket)
+                            # Stage T_active into the persistent device buffer
+                            # for this bucket *before* the in-body ops, so the
+                            # body itself contains no ttnn.from_torch and the
+                            # indexer topk path remains trace-friendly. The
+                            # follow-on slice end and topk K are compile-time
+                            # constants within the bucket.
+                            t_active_host = torch.full(
+                                (B, S, bucket), T_active, dtype=torch.int32)
+                            t_active_host_mesh = ttnn.from_torch(
+                                t_active_host,
+                                dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT,
+                                mesh_mapper=self._upload_mapper,
+                            )
+                            t_active_tt = self._t_active_persistent_per_bucket[bucket]
+                            ttnn.copy_host_to_device_tensor(
+                                t_active_host_mesh, t_active_tt)
+                            score_slice_tt = ttnn.slice(
+                                score_tt, [0, 0, 0], [B, S, bucket])
+                            # On-device mask:
+                            #   lt(ramp, T_active) -> bf16 -> sub(1) -> mul(1e4)
+                            # gives 0 at valid positions and -1e4 at invalid
+                            # ones. Add to score, then fixed-K topk.
+                            ramp_int_tt = self._topk_ramp_int_per_bucket[bucket]
+                            mask_bool = ttnn.lt(ramp_int_tt, t_active_tt)
+                            mask_bf16 = ttnn.typecast(
+                                mask_bool, dtype=ttnn.bfloat16)
+                            mask_minus_1 = ttnn.subtract(mask_bf16, 1.0)
+                            mask_add = ttnn.multiply(mask_minus_1, 1e4)
+                            masked_tt = ttnn.add(score_slice_tt, mask_add)
+                            vals_tt, idxs_tt = ttnn.topk(
+                                masked_tt, k=k_fixed, dim=-1,
                                 largest=True, sorted=True)
-                            cmp_idxs_int = ttnn.typecast(cmp_idxs_tt, dtype=ttnn.int32)
-                            cmp_idxs_int = ttnn.add(cmp_idxs_int, win)
+                            # Sentinel: indices whose topk value sits below
+                            # the mask floor are masked positions; convert
+                            # them to -1 so SparseAttn treats them as invalid
+                            # (-inf in the per-token attn mask) instead of
+                            # gathering uninitialised cache slots.
+                            invalid_bf16 = ttnn.lt(vals_tt, -1000.0)
+                            invalid_int = ttnn.typecast(
+                                invalid_bf16, dtype=ttnn.int32)
+                            idxs_int = ttnn.typecast(idxs_tt, dtype=ttnn.int32)
+                            idxs_winned = ttnn.add(idxs_int, win)
+                            idxs_plus_1 = ttnn.add(idxs_winned, 1)
+                            correction = ttnn.multiply(
+                                idxs_plus_1, invalid_int)
+                            cmp_idxs_int = ttnn.subtract(
+                                idxs_winned, correction)
+                            k = k_fixed
                     else:
                         cmp_idxs_int = ttnn.slice(
                             self._compress_idxs_ramp_tt,
