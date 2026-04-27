@@ -1593,12 +1593,33 @@ class DeviceRMSNorm(nn.Module):
         ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
 
     def _kernel(self, num_row_tiles: int):
-        return _compile_rmsnorm_kernel(
-            num_row_tiles=num_row_tiles,
-            h_tiles=self.hidden // _RMS_TILE,
-            rms_eps=self.eps,
-            inv_D=1.0 / self.hidden,
+        # At decode (num_row_tiles=1) prefer the pre-built named global for
+        # this hidden size. For prefill (num_row_tiles > 1) the shape isn't
+        # pre-built; fall through to the cache helper, which still shares
+        # the compile across all 86 layers in the same prefill pass.
+        if num_row_tiles == 1:
+            kernel = self._decode_kernel
+            if kernel is not None:
+                return kernel
+        return _get_ttl_rmsnorm_kernel(
+            num_row_tiles, self.hidden // _RMS_TILE, self.eps, 1.0 / self.hidden,
         )
+
+    @property
+    def _decode_kernel(self):
+        """Named decode-path global matching this instance's hidden size,
+        or None if no pre-built variant matches (e.g. an unusual hidden
+        encountered before prebuild_ttl_decode_kernels ran)."""
+        h = self.hidden
+        if h == 4096:
+            return ttl_rmsnorm_M32_h4096
+        if h == 1024:
+            return ttl_rmsnorm_M32_h1024
+        if h == 512:
+            return ttl_rmsnorm_M32_h512
+        if h == 128:
+            return ttl_rmsnorm_M32_h128
+        return None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ttnn = self._ttnn
@@ -2488,6 +2509,155 @@ def _compile_mhc_post_kernel(num_tokens: int, h_tiles: int):
     return post_kernel
 
 
+# ============================================================================
+# tt-lang kernel cache + named decode-path globals
+# ============================================================================
+# Each `_compile_*_kernel` factory above returns a fresh `@ttl.operation`
+# wrapper, and ttl's JIT keys its compiled-program cache off the wrapper
+# identity. So calling a factory N times at the same shape yields N cold JIT
+# compiles. Compile cost dominates wall time at K=512, h=128 (fold of 84s/2tok
+# -> 322s/2tok was traced to the previous per-instance cache being removed).
+#
+# Strategy:
+#   1. Module-level dict `_TTL_KERNEL_CACHE` keyed on the full factory
+#      signature. One compile per unique signature, shared across every
+#      DeviceRMSNorm and every DeviceMHC instance.
+#   2. Named globals (`ttl_rmsnorm_M32_h4096`, etc.) for each known decode-path
+#      kernel. Populated by `prebuild_ttl_decode_kernels(args)` after the
+#      model is constructed. Call sites reference these names directly so
+#      code flow is explicit.
+#   3. `_get_*` cache helpers for prefill and any shape not pre-built — they
+#      hit the same module-level dict, so a prefill compile is shared across
+#      all 86 layers.
+#
+# Naming convention: `ttl_<kernel-name>_<key-shape-fields>` in element units
+# (M32_h4096 = 32 rows by 4096-wide hidden). This matches how the kernels
+# are debugged at the source level.
+
+_TTL_KERNEL_CACHE: dict = {}
+
+
+def _cached_kernel(key, factory):
+    k = _TTL_KERNEL_CACHE.get(key)
+    if k is None:
+        k = factory()
+        _TTL_KERNEL_CACHE[key] = k
+    return k
+
+
+def _get_ttl_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
+                             rms_eps: float, inv_D: float):
+    return _cached_kernel(
+        ("rmsnorm", num_row_tiles, h_tiles, rms_eps, inv_D),
+        lambda: _compile_rmsnorm_kernel(num_row_tiles, h_tiles, rms_eps, inv_D),
+    )
+
+
+def _get_ttl_mhc_norm_fn_kernel(num_out_tiles: int, K_tiles: int,
+                                 rms_eps: float, inv_D: float):
+    return _cached_kernel(
+        ("mhc_norm_fn", num_out_tiles, K_tiles, rms_eps, inv_D),
+        lambda: _compile_mhc_norm_fn_kernel(
+            num_out_tiles, K_tiles, rms_eps, inv_D),
+    )
+
+
+def _get_ttl_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
+                                        rms_eps: float, inv_D: float):
+    return _cached_kernel(
+        ("mhc_norm_fn_ksplit", K_tiles, Kp, rms_eps, inv_D),
+        lambda: _compile_mhc_norm_fn_ksplit_kernel(
+            K_tiles, Kp, rms_eps, inv_D),
+    )
+
+
+def _get_ttl_mhc_split_mixes_kernel(num_tiles: int):
+    return _cached_kernel(
+        ("mhc_split_mixes", num_tiles),
+        lambda: _compile_mhc_split_mixes_kernel(num_tiles),
+    )
+
+
+def _get_ttl_mhc_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
+    return _cached_kernel(
+        ("mhc_sinkhorn", num_slices, repeat, eps),
+        lambda: _compile_mhc_sinkhorn_kernel(num_slices, repeat, eps),
+    )
+
+
+def _get_ttl_mhc_apply_mix_kernel(num_tokens: int, h_tiles: int):
+    return _cached_kernel(
+        ("mhc_apply_mix", num_tokens, h_tiles),
+        lambda: _compile_mhc_apply_mix_kernel(num_tokens, h_tiles),
+    )
+
+
+def _get_ttl_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
+    return _cached_kernel(
+        ("mhc_apply_mix_h", num_tokens, h_tiles),
+        lambda: _compile_mhc_apply_mix_h_kernel(num_tokens, h_tiles),
+    )
+
+
+def _get_ttl_mhc_post_kernel(num_tokens: int, h_tiles: int):
+    return _cached_kernel(
+        ("mhc_post", num_tokens, h_tiles),
+        lambda: _compile_mhc_post_kernel(num_tokens, h_tiles),
+    )
+
+
+# Named decode-path kernels. Set by `prebuild_ttl_decode_kernels(args)`.
+# Each name encodes the shape it serves so call sites read like
+# `ttl_rmsnorm_M32_h4096(x, gamma, sc, out)`.
+
+ttl_rmsnorm_M32_h4096 = None    # attn_norm, ffn_norm (hidden=4096)
+ttl_rmsnorm_M32_h1024 = None    # q_norm (q_lora_rank=1024)
+ttl_rmsnorm_M32_h512  = None    # kv_norm, attn.compressor.norm (head_dim=512)
+ttl_rmsnorm_M32_h128  = None    # indexer.compressor.norm (index_head_dim=128)
+
+ttl_mhc_norm_fn_ksplit_K512_Kp8 = None   # decode (D=16384 -> K_tiles=512)
+ttl_mhc_split_mixes_M1 = None             # decode (num_tokens_pad=32 -> 1 tile)
+ttl_mhc_sinkhorn_N1_R20 = None            # decode (num_tokens=1, sinkhorn=20)
+ttl_mhc_apply_mix_h_N1_h128 = None        # decode (num_tokens=1, h_tiles=128)
+ttl_mhc_post_N1_h128 = None               # decode (num_tokens=1, h_tiles=128)
+
+
+def prebuild_ttl_decode_kernels(args: "ModelArgs"):
+    """Eagerly build every tt-lang kernel the decode path uses and bind them
+    to module globals. Called once after model construction so the first
+    decode step doesn't pay 7+ JIT compiles up front.
+
+    Prefill kernels (variable num_tokens) are not pre-built here; they go
+    through the `_get_*` cache helpers, which still get the cross-layer
+    sharing benefit (one compile for all 86 layers per Mt value)."""
+    global ttl_rmsnorm_M32_h4096, ttl_rmsnorm_M32_h1024
+    global ttl_rmsnorm_M32_h512, ttl_rmsnorm_M32_h128
+    global ttl_mhc_norm_fn_ksplit_K512_Kp8, ttl_mhc_split_mixes_M1
+    global ttl_mhc_sinkhorn_N1_R20
+    global ttl_mhc_apply_mix_h_N1_h128, ttl_mhc_post_N1_h128
+
+    eps = args.norm_eps
+    ttl_rmsnorm_M32_h4096 = _get_ttl_rmsnorm_kernel(
+        1, args.dim // _RMS_TILE, eps, 1.0 / args.dim)
+    ttl_rmsnorm_M32_h1024 = _get_ttl_rmsnorm_kernel(
+        1, args.q_lora_rank // _RMS_TILE, eps, 1.0 / args.q_lora_rank)
+    ttl_rmsnorm_M32_h512 = _get_ttl_rmsnorm_kernel(
+        1, args.head_dim // _RMS_TILE, eps, 1.0 / args.head_dim)
+    ttl_rmsnorm_M32_h128 = _get_ttl_rmsnorm_kernel(
+        1, args.index_head_dim // _RMS_TILE, eps, 1.0 / args.index_head_dim)
+
+    D = args.hc_mult * args.dim
+    K_tiles = D // _MHC_TILE
+    h_tiles = args.dim // _MHC_TILE
+    ttl_mhc_norm_fn_ksplit_K512_Kp8 = _get_ttl_mhc_norm_fn_ksplit_kernel(
+        K_tiles, _MHC_NORM_FN_KP, eps, 1.0 / D)
+    ttl_mhc_split_mixes_M1 = _get_ttl_mhc_split_mixes_kernel(1)
+    ttl_mhc_sinkhorn_N1_R20 = _get_ttl_mhc_sinkhorn_kernel(
+        1, args.hc_sinkhorn_iters, args.hc_eps)
+    ttl_mhc_apply_mix_h_N1_h128 = _get_ttl_mhc_apply_mix_h_kernel(1, h_tiles)
+    ttl_mhc_post_N1_h128 = _get_ttl_mhc_post_kernel(1, h_tiles)
+
+
 class DeviceMHC(nn.Module):
     """MHC pre + post on a 1xN mesh via tt-lang fused kernels (fp32 throughout).
 
@@ -2631,42 +2801,39 @@ class DeviceMHC(nn.Module):
     def _norm_fn_kernel(self, num_out_tiles: int):
         K_tiles = self.D // _MHC_TILE
         if num_out_tiles == 1 and K_tiles % _MHC_NORM_FN_KP == 0:
-            return _compile_mhc_norm_fn_ksplit_kernel(
-                K_tiles=K_tiles,
-                Kp=_MHC_NORM_FN_KP,
-                rms_eps=self.norm_eps,
-                inv_D=1.0 / self.D,
-            )
-        return _compile_mhc_norm_fn_kernel(
-            num_out_tiles=num_out_tiles,
-            K_tiles=K_tiles,
-            rms_eps=self.norm_eps,
-            inv_D=1.0 / self.D,
-        )
+            if ttl_mhc_norm_fn_ksplit_K512_Kp8 is not None and K_tiles == 512:
+                return ttl_mhc_norm_fn_ksplit_K512_Kp8
+            return _get_ttl_mhc_norm_fn_ksplit_kernel(
+                K_tiles, _MHC_NORM_FN_KP, self.norm_eps, 1.0 / self.D)
+        return _get_ttl_mhc_norm_fn_kernel(
+            num_out_tiles, K_tiles, self.norm_eps, 1.0 / self.D)
 
     def _split_mixes_kernel(self, num_out_tiles: int):
-        return _compile_mhc_split_mixes_kernel(num_tiles=num_out_tiles)
+        if ttl_mhc_split_mixes_M1 is not None and num_out_tiles == 1:
+            return ttl_mhc_split_mixes_M1
+        return _get_ttl_mhc_split_mixes_kernel(num_out_tiles)
 
     def _sinkhorn_kernel(self, num_slices: int):
-        return _compile_mhc_sinkhorn_kernel(
-            num_slices=num_slices,
-            repeat=self.sinkhorn_iters,
-            eps=self.hc_eps,
-        )
+        if (ttl_mhc_sinkhorn_N1_R20 is not None
+                and num_slices == 1 and self.sinkhorn_iters == 20):
+            return ttl_mhc_sinkhorn_N1_R20
+        return _get_ttl_mhc_sinkhorn_kernel(
+            num_slices, self.sinkhorn_iters, self.hc_eps)
 
     def _apply_mix_kernel(self, num_tokens: int):
         h_tiles = self.hidden // _MHC_TILE
         if num_tokens == 1:
-            return _compile_mhc_apply_mix_h_kernel(
-                num_tokens=num_tokens, h_tiles=h_tiles)
-        return _compile_mhc_apply_mix_kernel(
-            num_tokens=num_tokens, h_tiles=h_tiles)
+            if ttl_mhc_apply_mix_h_N1_h128 is not None and h_tiles == 128:
+                return ttl_mhc_apply_mix_h_N1_h128
+            return _get_ttl_mhc_apply_mix_h_kernel(num_tokens, h_tiles)
+        return _get_ttl_mhc_apply_mix_kernel(num_tokens, h_tiles)
 
     def _post_kernel(self, num_tokens: int):
-        return _compile_mhc_post_kernel(
-            num_tokens=num_tokens,
-            h_tiles=self.hidden // _MHC_TILE,
-        )
+        h_tiles = self.hidden // _MHC_TILE
+        if (ttl_mhc_post_N1_h128 is not None
+                and num_tokens == 1 and h_tiles == 128):
+            return ttl_mhc_post_N1_h128
+        return _get_ttl_mhc_post_kernel(num_tokens, h_tiles)
 
     def _rep_tensor(self, t: torch.Tensor):
         ttnn = self._ttnn
@@ -5141,6 +5308,12 @@ def main():
         t0 = time.time()
         method(mesh)
         print(f"[phase] {label} offloaded in {time.time() - t0:.1f}s")
+
+    print("[phase] prebuilding tt-lang decode kernels ...")
+    t0 = time.time()
+    prebuild_ttl_decode_kernels(model.args)
+    print(f"[phase] prebuilt {len(_TTL_KERNEL_CACHE)} tt-lang kernels in "
+          f"{time.time() - t0:.1f}s")
 
     n_alloc_modules = sum(1 for _ in model._iter_device_modules())
     print(f"[phase] {n_alloc_modules} device modules registered for "
