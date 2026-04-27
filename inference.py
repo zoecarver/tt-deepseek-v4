@@ -2376,6 +2376,18 @@ class DeviceMHC(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
+        # Pre-allocated slice scratch for hc_pre_device / hc_post_device's
+        # a_sliced ([1, mhc*hidden] fp32, tile-aligned). The other slices in
+        # this chain (comb_sliced, pre_sliced, post_sliced) target sub-tile
+        # widths (mhc=4 or mhc*mhc=16), which slice's preallocated-output
+        # path rejects (padded_shape mismatch), so they keep per-call allocs.
+        self._a_sliced_scratch_tt = ttnn.from_torch(
+            torch.zeros(num_tokens, self.hc_mult * self.hidden,
+                        dtype=torch.float32),
+            device=self.mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
 
     def _norm_fn_kernel(self, num_out_tiles: int):
@@ -2477,8 +2489,9 @@ class DeviceMHC(nn.Module):
         )
         mix_tt = ttnn.reshape(mix_padded, [num_tokens * _MHC_TILE, _MHC_TILE])
 
-        a_sliced = ttnn.slice(a_tt, [0, 0], [num_tokens, mhc * hidden])
-        a_3d = ttnn.reshape(a_sliced, [num_tokens, mhc, hidden])
+        ttnn.slice(a_tt, [0, 0], [num_tokens, mhc * hidden],
+                   output_tensor=self._a_sliced_scratch_tt)
+        a_3d = ttnn.reshape(self._a_sliced_scratch_tt, [num_tokens, mhc, hidden])
         x_padded = ttnn.pad(
             a_3d,
             padding=[(0, 0), (0, _MHC_TILE - mhc), (0, 0)],
@@ -2567,8 +2580,9 @@ class DeviceMHC(nn.Module):
         self._stash_post_tt = None
         self._stash_comb_sk_tt = None
 
-        a_sliced = ttnn.slice(a_tt_stashed, [0, 0], [num_tokens, mhc * hidden])
-        a_3d = ttnn.reshape(a_sliced, [num_tokens, mhc, hidden])
+        ttnn.slice(a_tt_stashed, [0, 0], [num_tokens, mhc * hidden],
+                   output_tensor=self._a_sliced_scratch_tt)
+        a_3d = ttnn.reshape(self._a_sliced_scratch_tt, [num_tokens, mhc, hidden])
         res_padded = ttnn.pad(
             a_3d,
             padding=[(0, 0), (0, _MHC_TILE - mhc), (0, 0)],
