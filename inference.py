@@ -4668,6 +4668,25 @@ class DeviceAttention(nn.Module):
             ttnn, out_tt, self.mesh, self.mesh_shape)[:B]
         return out.to(x.dtype)
 
+    def _stage_indexer_topk_inputs(self, B: int, S: int, bucket: int,
+                                    T_active: int):
+        """Stage T_active into the persistent per-bucket int32 buffer used by
+        the indexer pad+mask path. Lives here (separate from the body) so the
+        host->device copy stays outside any future trace_capture region; the
+        traced body just reads `_t_active_persistent_per_bucket[bucket]`."""
+        ttnn = self._ttnn
+        t_active_host = torch.full(
+            (B, S, bucket), T_active, dtype=torch.int32)
+        t_active_host_mesh = ttnn.from_torch(
+            t_active_host,
+            dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=self._upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(
+            t_active_host_mesh,
+            self._t_active_persistent_per_bucket[bucket],
+        )
+
     def forward_device(self, x_tt, start_pos: int):
         """Pure-device attention body. x_tt is the pre-uploaded
         [B, 1, dim] device tensor; returns out_tt [B, 1, dim] device
@@ -4692,6 +4711,17 @@ class DeviceAttention(nn.Module):
                 "attn._device_compressor when compress_ratio is set; "
                 "run offload_compressor_indexer."
             )
+
+        # Pre-stage all per-step host->device transfers up front so the rest
+        # of the body is pure device work. Today only the indexer topk path
+        # has one (T_active for the active bucket); future hoists from rotary
+        # indexing / kv_update slot computation will land here too.
+        if self.compress_ratio and device_indexer is not None:
+            T_active_pre = (start_pos + 1) // self.compress_ratio
+            if T_active_pre > 0:
+                bucket_pre = _pick_indexer_topk_bucket(T_active_pre)
+                self._stage_indexer_topk_inputs(
+                    B, S, bucket_pre, T_active_pre)
 
         # Q path: wq_a -> q_norm -> wq_b -> per-head rsqrt-norm -> rotary.
         with _phase("attn.q"):
@@ -4785,22 +4815,12 @@ class DeviceAttention(nn.Module):
                             # device dispatches per layer per step.
                             bucket = _pick_indexer_topk_bucket(T_active)
                             k_fixed = min(device_indexer.index_topk, bucket)
-                            # Stage T_active into the persistent device buffer
-                            # for this bucket *before* the in-body ops, so the
-                            # body itself contains no ttnn.from_torch and the
-                            # indexer topk path remains trace-friendly. The
-                            # follow-on slice end and topk K are compile-time
-                            # constants within the bucket.
-                            t_active_host = torch.full(
-                                (B, S, bucket), T_active, dtype=torch.int32)
-                            t_active_host_mesh = ttnn.from_torch(
-                                t_active_host,
-                                dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT,
-                                mesh_mapper=self._upload_mapper,
-                            )
+                            # T_active was staged at the top of forward_device
+                            # via _stage_indexer_topk_inputs; this body reads
+                            # the persistent handle so it stays free of any
+                            # ttnn.from_torch. Slice end and topk K are
+                            # compile-time constants within the bucket.
                             t_active_tt = self._t_active_persistent_per_bucket[bucket]
-                            ttnn.copy_host_to_device_tensor(
-                                t_active_host_mesh, t_active_tt)
                             score_slice_tt = ttnn.slice(
                                 score_tt, [0, 0, 0], [B, S, bucket])
                             # On-device mask:
