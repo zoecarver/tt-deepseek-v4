@@ -807,53 +807,64 @@ class Transformer(nn.Module):
             self.hc_head_base = nn.Parameter(torch.empty(args.hc_mult))
             self.hc_head_scale = nn.Parameter(torch.empty(1))
 
-    def _run_blocks(self, input_ids: torch.Tensor, start_pos: int):
-        """Shared decode/prefill body: upload ids+start_pos, embed, run all
-        blocks. Returns (a_tt, num_tokens) so the caller can dispatch either
-        the full-logits head or the on-device argmax head."""
+    def _decode_uploads(self, input_ids: torch.Tensor, start_pos: int):
+        """Per-step host->device uploads + per-layer pre_stage_decode.
+
+        Owns every host->device transfer in the decode hot path so the
+        downstream body (`_decode_argmax_body` / `_decode_logits_body`) is
+        pure device work and can be captured under a trace.
+        Returns (B, S, num_tokens, num_tokens_pad) which the body needs.
+        """
         mhc_attn = self.layers[0]._device_mhc_attn
         ttnn = mhc_attn._ttnn
-        mhc = self.hc_mult
-        hidden = mhc_attn.hidden
         B, S = input_ids.shape
         num_tokens = B * S
         num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
-        orig_dtype = torch.bfloat16
 
-        # Upload token ids ONCE per step into the pre-allocated [B, S] uint32
-        # device tensor. _device_embed and any hash-gate MoE layer consumes
-        # this same tensor; no other host->device transfers exist in the
-        # decode hot path.
+        # Token ids: pre-allocated [B, S] uint32 device tensor consumed by
+        # _device_embed and any hash-gate MoE layer.
         ids_host = ttnn.from_torch(
             input_ids.to(torch.int32).contiguous(),
             dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT,
             mesh_mapper=self._input_ids_upload_mapper,
         )
         ttnn.copy_host_to_device_tensor(ids_host, self._input_ids_tt)
-        input_ids_tt = self._input_ids_tt
 
-        # Upload start_pos as a [1, 1] uint32 device tensor. Consumed by
-        # DeviceAttention rotary, DeviceIndexer rotary, and DeviceCompressor
-        # ape/freq pickers via ttnn.embedding — keeps the slice index on
-        # device so the surrounding op sequence is trace-stable.
+        # start_pos: pre-allocated [1, 1] uint32 device tensor consumed by
+        # the rotary cos/sin / ape pickers via ttnn.embedding.
         sp_host = ttnn.from_torch(
             torch.tensor([[start_pos]], dtype=torch.int32),
             dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT,
             mesh_mapper=self._input_ids_upload_mapper,
         )
         ttnn.copy_host_to_device_tensor(sp_host, self._start_pos_tt)
-        start_pos_tt = self._start_pos_tt
 
-        # Stage all per-layer host->device uploads BEFORE running any
-        # blocks, so the block loop body becomes pure device work that
-        # can later be wrapped in a single trace_capture region. Each
-        # DeviceAttention.pre_stage_decode also recurses into its
-        # compressor and indexer, covering every per-step slot/T_active
-        # upload for the whole layer.
+        # Per-layer slot / T_active uploads. Each DeviceAttention.pre_stage_decode
+        # also recurses into its compressor and indexer.
         with _phase("pre_stage"):
             for layer in self.layers:
                 attn_dev = layer.attn.forward.__self__
                 attn_dev.pre_stage_decode(start_pos, B=B, S=S)
+        return B, S, num_tokens, num_tokens_pad
+
+    def _decode_blocks_body(self, B: int, S: int, num_tokens: int,
+                             num_tokens_pad: int, start_pos: int):
+        """Pure-device body: embed → all blocks. Reads pre-uploaded
+        `_input_ids_tt` / `_start_pos_tt`; returns the residual stream
+        device tensor `a_tt` (rank-2 fp32, packed for the head).
+
+        `start_pos` is the host int used only for compile-time-constant
+        decisions (T_active bucket, emit branch); it is NOT read for any
+        per-step value inside the body — those come from the device
+        `_start_pos_tt` and the per-layer slot/T_active buffers.
+        """
+        mhc_attn = self.layers[0]._device_mhc_attn
+        ttnn = mhc_attn._ttnn
+        mhc = self.hc_mult
+        hidden = mhc_attn.hidden
+        orig_dtype = torch.bfloat16
+        input_ids_tt = self._input_ids_tt
+        start_pos_tt = self._start_pos_tt
 
         with _phase("embed"):
             embed_tt = self.embed(input_ids_tt)
@@ -870,11 +881,26 @@ class Transformer(nn.Module):
                 a_tt = _block_forward(layer, a_tt, start_pos, start_pos_tt,
                                       input_ids_tt,
                                       B, S, mhc, hidden, orig_dtype)
-        return a_tt, num_tokens
+        return a_tt
+
+    def _decode_argmax_body(self, B: int, S: int, num_tokens: int,
+                              num_tokens_pad: int, start_pos: int):
+        """Pure-device decode body for greedy sampling. Runs all blocks +
+        the lm_head logits body + per-chip argmax/max. Returns
+        `(local_argmax_tt, local_max_tt)` — both small device tensors that
+        the caller pulls to host outside any trace region.
+        """
+        a_tt = self._decode_blocks_body(
+            B, S, num_tokens, num_tokens_pad, start_pos)
+        with _phase("head"):
+            return self.head.forward_argmax_device(a_tt, num_tokens)
 
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
-        a_tt, num_tokens = self._run_blocks(input_ids, start_pos)
+        B, S, num_tokens, num_tokens_pad = self._decode_uploads(
+            input_ids, start_pos)
+        a_tt = self._decode_blocks_body(
+            B, S, num_tokens, num_tokens_pad, start_pos)
         with _phase("head"):
             logits = self.head(a_tt, num_tokens)
         return logits
@@ -882,13 +908,15 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def forward_argmax(self, input_ids: torch.Tensor, start_pos: int = 0) -> int:
         """Decode end-to-end and return the next greedy token id directly.
-
-        Same body as `forward` but uses the on-device argmax head, so the
-        only host download per step is a 4-byte token id. Requires
-        offload_lm_head to have run (which binds head.forward_argmax)."""
-        a_tt, num_tokens = self._run_blocks(input_ids, start_pos)
-        with _phase("head"):
-            return self.head.forward_argmax(a_tt, num_tokens)
+        Untraced path: uploads → device body → host pull. Trace mode is
+        driven by `Model.step_decode` which captures/dispatches the body
+        under `begin_trace_capture` / `execute_trace`.
+        Requires offload_lm_head (binds head.forward_argmax_device)."""
+        B, S, num_tokens, num_tokens_pad = self._decode_uploads(
+            input_ids, start_pos)
+        local_argmax_tt, local_max_tt = self._decode_argmax_body(
+            B, S, num_tokens, num_tokens_pad, start_pos)
+        return self.head.argmax_pull(local_argmax_tt, local_max_tt)
 
 
 # ==============================================================================
@@ -1028,12 +1056,10 @@ class DeviceLMHead:
             mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=-1),
         )
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
-        self._trace_id = None
 
     def _compute_body(self):
         """Pure-device norm + matmul. Reads `_x_upload_tt`, writes
-        `_matmul_out_tt`. Called once outside trace as warmup, then again
-        inside `begin_trace_capture` / `end_trace_capture`."""
+        `_matmul_out_tt`."""
         ttnn = self._ttnn
         x_tt = self._x_upload_tt
         if self.norm_tt is not None:
@@ -1042,16 +1068,6 @@ class DeviceLMHead:
             x_tt = ttnn.reshape(x_tt, (1, 1, self.dim))
         ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._matmul_out_tt)
-
-    def _capture_trace(self):
-        """Warmup outside trace (lets ttnn.rms_norm do its lazy host upload),
-        then record the same op sequence into a replayable trace."""
-        ttnn = self._ttnn
-        self._compute_body()
-        ttnn.synchronize_device(self.mesh)
-        self._trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
-        self._compute_body()
-        ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
 
     def __call__(self, x_last: torch.Tensor) -> torch.Tensor:
         # x_last: [B=1, dim] — unnormalized if norm_tt is set, else normalized.
@@ -1125,19 +1141,10 @@ class DeviceLMHead:
         )
         return out[:1, 0, :self.vocab].float()  # [1, vocab]
 
-    def forward_a_tt_argmax(self, a_tt, num_tokens: int) -> int:
-        """On-device greedy sampling: hc_combiner + lm_head + per-chip argmax.
-
-        Runs the same logits body as forward_a_tt, but reduces the sharded
-        vocab logits per-chip (argmax over the local 4K-element chunk + max
-        value) and only downloads two 32-element tensors (~128 bytes total).
-        Host computes the global argmax by picking the chip with the highest
-        max value and offsetting by chip_index * vocab_per_chip.
-
-        We tried gathering full logits and running ttnn.argmax over 130K
-        elements: cost was ~640ms per step. Per-chip reduction is ~3ms.
-
-        Returns the next greedy token id as a Python int.
+    def forward_argmax_device(self, a_tt, num_tokens: int):
+        """Pure-device half of greedy sampling: logits body + per-chip
+        argmax/max. Returns (local_argmax_tt, local_max_tt) — both still on
+        device. Safe to call inside a captured trace.
         """
         ttnn = self._ttnn
         logits_tt = self._logits_body(a_tt, num_tokens)
@@ -1145,6 +1152,13 @@ class DeviceLMHead:
         # Each chip operates on its [1, 1, vocab_per_chip] shard.
         local_argmax_tt = ttnn.argmax(logits_tt, dim=-1)
         local_max_tt = ttnn.max(logits_tt, dim=-1)
+        return local_argmax_tt, local_max_tt
+
+    def argmax_pull(self, local_argmax_tt, local_max_tt) -> int:
+        """Host half of greedy sampling: pull the two small tensors and
+        compute the global token id. Must run outside any trace region.
+        """
+        ttnn = self._ttnn
         # Pull both to host as [1, num_chips] tensors. mesh-iteration order
         # along dim=-1 matches the ShardTensorToMesh(dim=-1) order used for
         # the lm_head weight, so chip i holds vocab range
@@ -1165,6 +1179,22 @@ class DeviceLMHead:
                 "less than every padding entry"
             )
         return token_id
+
+    def forward_a_tt_argmax(self, a_tt, num_tokens: int) -> int:
+        """On-device greedy sampling: hc_combiner + lm_head + per-chip argmax.
+
+        Reduces sharded vocab logits per-chip (argmax over the local
+        4K-element chunk + max value) and only downloads two 32-element
+        tensors (~128 bytes total). Host picks the chip with the highest
+        max value and offsets by chip_index * vocab_per_chip.
+
+        We tried gathering full logits and running ttnn.argmax over 130K
+        elements: cost was ~640ms per step. Per-chip reduction is ~3ms.
+
+        Returns the next greedy token id as a Python int.
+        """
+        local_argmax_tt, local_max_tt = self.forward_argmax_device(a_tt, num_tokens)
+        return self.argmax_pull(local_argmax_tt, local_max_tt)
 
 
 class DeviceColLinear(nn.Module):
@@ -1664,19 +1694,10 @@ class DeviceRMSNorm(nn.Module):
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
-        self._trace_id = None
 
     def _compute_body(self):
         """Replay-shape: the fused kernel writes _out_tt from _x_upload_tt."""
         self._kernel(1)(self._x_upload_tt, self.gamma_tt, self.sc_tt, self._out_tt)
-
-    def _capture_trace(self):
-        ttnn = self._ttnn
-        self._compute_body()  # warmup so any lazy host uploads happen first
-        ttnn.synchronize_device(self.mesh)
-        self._trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
-        self._compute_body()
-        ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
 
     def _kernel(self, num_row_tiles: int):
         # At decode (num_row_tiles=1) prefer the pre-built named global for
@@ -3729,11 +3750,6 @@ class DeviceSharedExpert(nn.Module):
             torch.zeros(1, self.dim, dtype=torch.bfloat16),
             mesh_mapper=replicate, **common)
         self._upload_mapper = replicate
-        # Trace state: captured on first forward_device call. ttnn.all_reduce
-        # allocates its own output buffer (no output_tensor= support); the
-        # captured handle is stored in _ar_out_tt and reused via execute_trace.
-        self._trace_id = None
-        self._ar_out_tt = None
 
     def _compute_body(self):
         """Pure-device SwiGLU body that reads from the stable _x_upload_tt
@@ -3760,26 +3776,12 @@ class DeviceSharedExpert(nn.Module):
     def forward_device(self, x_tt):
         """Pure-device shared-expert SwiGLU. x_tt: [M=1, dim] bf16 device
         tensor (replicated). Returns out_tt [1, dim] replicated (post
-        all_reduce). No host transfers.
-
-        First call captures a trace; subsequent calls stage x_tt into the
-        stable _x_upload_tt buffer via device-to-device copy and execute the
-        trace with blocking=True. Per-layer instances each capture their
-        own trace.
+        all_reduce). No host transfers. The body runs inline so this layer
+        can be embedded inside an outer whole-decode-step trace.
         """
         ttnn = self._ttnn
         ttnn.copy(x_tt, self._x_upload_tt)
-        if self._trace_id is None:
-            # Warmup outside trace so any lazy device allocations settle.
-            self._compute_body()
-            ttnn.synchronize_device(self.mesh)
-            self._trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
-            self._ar_out_tt = self._compute_body()
-            ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
-            ttnn.synchronize_device(self.mesh)
-        else:
-            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
-        return self._ar_out_tt
+        return self._compute_body()
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """x: [M=1, dim] -> [M=1, dim]. weights matches Expert.forward
@@ -4339,23 +4341,21 @@ class DeviceCompressor(nn.Module):
         )
         ttnn.copy_host_to_device_tensor(emit_host, self._emit_slot_tt)
 
-    def forward_device(self, x_tt, B: int, start_pos: int, start_pos_tt=None):
+    def forward_device(self, x_tt, B: int, start_pos: int, start_pos_tt):
         ttnn = self._ttnn
         ratio = self.compress_ratio
         d = self.head_dim
         c = self.cdim
         rd = self.rope_head_dim
 
-        if self.kv_state_front_tt is None:
-            self._alloc_decode_tensors(B)
         if start_pos_tt is None:
-            start_pos_tt = ttnn.from_torch(
-                torch.tensor([[start_pos]], dtype=torch.int32),
-                device=self.mesh, dtype=ttnn.uint32,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
-            )
+            raise ValueError(
+                "DeviceCompressor.forward_device requires start_pos_tt "
+                "(no host->device upload inside the trace body).")
+        if self.kv_state_front_tt is None:
+            raise RuntimeError(
+                "DeviceCompressor decode buffers not allocated; "
+                "call pre_stage_decode at least once before forward_device.")
 
         kv_tt = self.wkv.forward_device(x_tt)
         score_tt = self.wgate.forward_device(x_tt)
@@ -4541,24 +4541,20 @@ class DeviceIndexer(nn.Module):
         return
 
     def forward_device_score(self, x_tt, qr_tt, B: int, start_pos: int,
-                              start_pos_tt=None):
+                              start_pos_tt):
         ttnn = self._ttnn
         H = self.n_heads
         D = self.head_dim
         rd = self.rope_head_dim
+        if start_pos_tt is None:
+            raise ValueError(
+                "DeviceIndexer.forward_device_score requires start_pos_tt "
+                "(no host->device upload inside the trace body).")
 
         q_tt = self.wq_b.forward_device(qr_tt)
         q_tt = ttnn.reshape(q_tt, [B, 1, H, D])
 
         rd_half = rd // 2
-        if start_pos_tt is None:
-            start_pos_tt = ttnn.from_torch(
-                torch.tensor([[start_pos]], dtype=torch.int32),
-                device=self.mesh, dtype=ttnn.uint32,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
-            )
         cos = ttnn.embedding(
             start_pos_tt, self.cos_full_tt, layout=ttnn.TILE_LAYOUT)
         sin = ttnn.embedding(
@@ -4804,17 +4800,13 @@ class DeviceAttention(nn.Module):
                     mesh_mapper=self._upload_mapper,
                 )
 
-        # Per-bucket trace state for the attn.topk indexer body. Captured
-        # lazily on the first call where T_active hits a given bucket; bucket
-        # selection happens on host so each bucket maps to a separate trace.
-        # The body reads `_indexer_score_in_tt` (staged via ttnn.copy from
-        # device_indexer.forward_device_score's output) and the persistent
-        # ramp / T_active buffers; the result handle returned by ttnn.topk +
-        # sentinel chain is captured into `_indexer_topk_out_per_bucket[bk]`
-        # on the capture pass and reused via execute_trace thereafter.
-        self._indexer_score_in_tt = None  # alloc lazily once T_pad is known
-        self._indexer_topk_trace_id_per_bucket = {}
-        self._indexer_topk_out_per_bucket = {}
+        # Inputs for the attn.topk indexer body. The body runs inline (no
+        # per-bucket inner trace) so the whole attention forward can be
+        # captured under one outer decode-step trace. `_indexer_score_in_tt`
+        # is the persistent staging buffer the score from
+        # `device_indexer.forward_device_score` is copied into via
+        # `ttnn.copy`; alloc'd lazily once T_pad is known.
+        self._indexer_score_in_tt = None
 
         # Pre-allocated slice destinations for the rotary split/recombine
         # pattern. Each forward_device call slices q/kv/o into nope+rope
@@ -4989,22 +4981,6 @@ class DeviceAttention(nn.Module):
         cmp_idxs_int = ttnn.subtract(idxs_winned, correction)
         return cmp_idxs_int
 
-    def _capture_indexer_topk_trace(self, bucket: int, k_fixed: int, win: int,
-                                     B: int, S: int):
-        """Warmup the indexer-topk body once outside the trace, then capture
-        a trace and store both the trace id and the output handle so future
-        replays can hand back the same persistent index tensor."""
-        ttnn = self._ttnn
-        # Warmup pass — primes JIT, allocations, and the device queue.
-        self._indexer_topk_body(bucket, k_fixed, win, B, S)
-        ttnn.synchronize_device(self.mesh)
-        trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
-        out_tt = self._indexer_topk_body(bucket, k_fixed, win, B, S)
-        ttnn.end_trace_capture(self.mesh, trace_id, cq_id=0)
-        ttnn.synchronize_device(self.mesh)
-        self._indexer_topk_trace_id_per_bucket[bucket] = trace_id
-        self._indexer_topk_out_per_bucket[bucket] = out_tt
-
     def pre_stage_decode(self, start_pos: int, B: int = 1, S: int = 1):
         """Per-step host->device uploads for this attention layer (and its
         device_compressor / device_indexer if bound). Must be called once
@@ -5037,20 +5013,16 @@ class DeviceAttention(nn.Module):
                 self._stage_indexer_topk_inputs(
                     B, S, bucket_pre, T_active_pre)
 
-    def forward_device(self, x_tt, start_pos: int, start_pos_tt=None):
+    def forward_device(self, x_tt, start_pos: int, start_pos_tt):
         """Pure-device attention body. x_tt is the pre-uploaded
         [B, 1, dim] device tensor; returns out_tt [B, 1, dim] device
         tensor. Caller is responsible for upload/download.
 
-        start_pos_tt: [1, 1] uint32 device tensor holding start_pos. Threaded
-        through from Transformer.forward and used by _rotary_tables to pick
-        cos/sin rows via ttnn.embedding so the rotary slice index lives on
-        device. The legacy Python-int start_pos is still required for the
-        compressor emit branch (`(start_pos+1) % ratio != 0`), kv_cache slot
-        args, and the indexer T_active stage; those will be hoisted next.
-
-        When called via the standalone `_decode` host-test wrapper (no chained
-        Transformer.forward), start_pos_tt is None and we synthesize it here.
+        start_pos_tt: [1, 1] uint32 device tensor holding start_pos. Used by
+        _rotary_tables to pick cos/sin rows via ttnn.embedding so the rotary
+        slice index lives on device. The legacy Python-int start_pos is still
+        required for the host-side bucket / T_active selection that runs
+        before this call, but the body itself only reads device tensors.
 
         Requires offload_compressor_indexer: attn._device_compressor and
         (when compress_ratio is set) attn._device_indexer must be bound.
@@ -5060,13 +5032,9 @@ class DeviceAttention(nn.Module):
         B = int(x_tt.shape[0])
         S = 1
         if start_pos_tt is None:
-            start_pos_tt = ttnn.from_torch(
-                torch.tensor([[start_pos]], dtype=torch.int32),
-                device=self.mesh, dtype=ttnn.uint32,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
-            )
+            raise ValueError(
+                "DeviceAttention.forward_device requires start_pos_tt "
+                "(no host->device upload inside the trace body).")
         H, D = self.n_heads, self.head_dim
         rd = self.rope_head_dim
         win = self.window_size
@@ -5184,18 +5152,10 @@ class DeviceAttention(nn.Module):
                                 self._alloc_indexer_score_scratch(score_tt)
                             ttnn.copy(score_tt, self._indexer_score_in_tt)
                             # T_active was staged at the top of forward_device.
-                            # Capture the bucketed pad+mask + topk + sentinel
-                            # body as a trace on first encounter; subsequent
-                            # steps that hit the same bucket just replay.
-                            if bucket not in self._indexer_topk_trace_id_per_bucket:
-                                self._capture_indexer_topk_trace(
-                                    bucket, k_fixed, win, B, S)
-                            ttnn.execute_trace(
-                                self.mesh,
-                                self._indexer_topk_trace_id_per_bucket[bucket],
-                                cq_id=0, blocking=True,
-                            )
-                            cmp_idxs_int = self._indexer_topk_out_per_bucket[bucket]
+                            # Body runs inline so it can be embedded inside an
+                            # outer whole-decode-step trace.
+                            cmp_idxs_int = self._indexer_topk_body(
+                                bucket, k_fixed, win, B, S)
                             k = k_fixed
                     else:
                         cmp_idxs_int = ttnn.slice(
@@ -5689,8 +5649,15 @@ class Model:
         def _device_head_forward_argmax(self_head, a_tt, num_tokens):
             with _phase("head.norm_and_argmax"):
                 return dlh.forward_a_tt_argmax(a_tt, num_tokens)
+        def _device_head_forward_argmax_device(self_head, a_tt, num_tokens):
+            with _phase("head.norm_and_argmax_device"):
+                return dlh.forward_argmax_device(a_tt, num_tokens)
+        def _device_head_argmax_pull(self_head, local_argmax_tt, local_max_tt):
+            return dlh.argmax_pull(local_argmax_tt, local_max_tt)
         head.forward = _device_head_forward.__get__(head, type(head))
         head.forward_argmax = _device_head_forward_argmax.__get__(head, type(head))
+        head.forward_argmax_device = _device_head_forward_argmax_device.__get__(head, type(head))
+        head.argmax_pull = _device_head_argmax_pull.__get__(head, type(head))
         final_norm.weight.data = torch.empty(0)  # device owns it
         head.weight.data = torch.empty(0)
         transformer.hc_head_fn.data = torch.empty(0)
