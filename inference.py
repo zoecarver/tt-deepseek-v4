@@ -4353,7 +4353,8 @@ class DeviceIndexer(nn.Module):
         `indexer_score_reduce` fused kernel."""
         return
 
-    def forward_device_score(self, x_tt, qr_tt, B: int, start_pos: int):
+    def forward_device_score(self, x_tt, qr_tt, B: int, start_pos: int,
+                              start_pos_tt=None):
         ttnn = self._ttnn
         H = self.n_heads
         D = self.head_dim
@@ -4363,8 +4364,18 @@ class DeviceIndexer(nn.Module):
         q_tt = ttnn.reshape(q_tt, [B, 1, H, D])
 
         rd_half = rd // 2
-        cos = ttnn.slice(self.cos_full_tt, [start_pos, 0], [start_pos + 1, rd_half])
-        sin = ttnn.slice(self.sin_full_tt, [start_pos, 0], [start_pos + 1, rd_half])
+        if start_pos_tt is None:
+            start_pos_tt = ttnn.from_torch(
+                torch.tensor([[start_pos]], dtype=torch.int32),
+                device=self.mesh, dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+            )
+        cos = ttnn.embedding(
+            start_pos_tt, self.cos_full_tt, layout=ttnn.TILE_LAYOUT)
+        sin = ttnn.embedding(
+            start_pos_tt, self.sin_full_tt, layout=ttnn.TILE_LAYOUT)
         cos = ttnn.reshape(cos, [1, 1, 1, rd_half])
         sin = ttnn.reshape(sin, [1, 1, 1, rd_half])
         q_nope = ttnn.slice(q_tt, [0, 0, 0, 0],     [B, 1, H, D - rd])
@@ -4908,7 +4919,8 @@ class DeviceAttention(nn.Module):
                     if device_indexer is not None:
                         with _phase("attn.topk.indexer"):
                             score_tt = device_indexer.forward_device_score(
-                                x_tt, qr_tt, B, start_pos
+                                x_tt, qr_tt, B, start_pos,
+                                start_pos_tt=start_pos_tt,
                             )
                             bucket = _pick_indexer_topk_bucket(T_active)
                             k_fixed = min(device_indexer.index_topk, bucket)
