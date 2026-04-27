@@ -629,10 +629,8 @@ class MoE(nn.Module):
         indices_4d = ttnn.reshape(indices_int32, [1, 1, 1, topk])
         match = ttnn.eq(indices_4d, self._chip_ids_4d_tt)
         match_bf16 = ttnn.typecast(match, ttnn.bfloat16)
-        ttnn.deallocate(match)
         ttnn.multiply(weights_4d, match_bf16, output_tensor=match_bf16)
         mask = ttnn.sum(match_bf16, dim=-1, keepdim=True)
-        ttnn.deallocate(match_bf16)
 
         # Grouped MLP. Weights are [1, per_chip, K, N] sharded; ttnn.matmul
         # won't broadcast batch dims when one operand is all-1 and the
@@ -640,34 +638,34 @@ class MoE(nn.Module):
         x_4d = ttnn.reshape(x_tt, [1, 1, 1, dim])
         x_grouped = ttnn.repeat(x_4d, [1, per_chip, 1, 1])  # [1, per_chip, 1, dim]
         y1 = _fp4_gemm_via_bfp4(
-            ttnn, x_grouped, self._w1_tt, self._w1_scale_tt)
+            ttnn, x_grouped, self._w1_tt, self._w1_scale_tt,
+            bf16_scratch=self._w13_bf16_scratch_tt,
+            out_y=self._fp4_y1_scratch_tt)
         y3 = _fp4_gemm_via_bfp4(
-            ttnn, x_grouped, self._w3_tt, self._w3_scale_tt)
-        ttnn.deallocate(x_grouped)
+            ttnn, x_grouped, self._w3_tt, self._w3_scale_tt,
+            bf16_scratch=self._w13_bf16_scratch_tt,
+            out_y=self._fp4_y3_scratch_tt)
         if self.experts[0].swiglu_limit > 0:
             limit = float(self.experts[0].swiglu_limit)
             ttnn.clamp(y1, max=limit, output_tensor=y1)
             ttnn.clamp(y3, min=-limit, max=limit, output_tensor=y3)
         ttnn.silu(y1, output_tensor=y1)
         ttnn.multiply(y1, y3, output_tensor=y1)  # glu = silu(y1) * y3 (in-place)
-        ttnn.deallocate(y3)
 
-        y = _fp4_gemm_via_bfp4(ttnn, y1, self._w2_tt, self._w2_scale_tt)
-        ttnn.deallocate(y1)
+        y = _fp4_gemm_via_bfp4(
+            ttnn, y1, self._w2_tt, self._w2_scale_tt,
+            bf16_scratch=self._w2_bf16_scratch_tt,
+            out_y=self._fp4_y2_scratch_tt)
 
         ttnn.multiply(y, mask, output_tensor=y)  # y_masked (in-place)
-        ttnn.deallocate(mask)
 
         # Sum across local experts: keepdim=True so result stays rank 4.
         y_local = ttnn.sum(y, dim=1, keepdim=True)  # [1, 1, 1, dim]
-        ttnn.deallocate(y)
 
         # All-reduce across the (rows*cols) mesh: full 256-expert sum.
         y_full = ttnn.all_reduce(y_local)
-        ttnn.deallocate(y_local)
 
         y_2d = ttnn.reshape(y_full, [1, dim])
-        ttnn.deallocate(y_full)
         return ttnn.add(y_2d, shared_out_tt)
 
 
@@ -3846,7 +3844,8 @@ def _remap_bfp4_lattice_to_fp4_mags(ttnn, b_tt):
     return ttnn.add(ttnn.add(two_b, step1), step15)
 
 
-def _fp4_gemm_via_bfp4(ttnn, x_tt, w_bfp4_tt, scale_compact_tt):
+def _fp4_gemm_via_bfp4(ttnn, x_tt, w_bfp4_tt, scale_compact_tt,
+                       *, bf16_scratch, out_y):
     """y = x @ dequant(w_fp4, scale).
 
     Shape-agnostic in the leading dims: works for both 2D (single-expert
@@ -3864,20 +3863,19 @@ def _fp4_gemm_via_bfp4(ttnn, x_tt, w_bfp4_tt, scale_compact_tt):
       4) bf16 @ bf16 matmul
 
     Per-step / per-layer / per-weight; called 240x per decode step (40 MoE
-    layers x 6 = w1/w1s + w3/w3s + w2/w2s). Explicit deallocates on every
-    intermediate so DRAM doesn't drift across the step.
+    layers x 6 = w1/w1s + w3/w3s + w2/w2s).
+
+    bf16_scratch: pre-allocated bf16 tensor matching w_bfp4_tt shape, used
+        as typecast destination. Caller owns it; not deallocated.
+    out_y: pre-allocated bf16 matmul output. Caller owns it.
     """
-    w_bf16 = ttnn.typecast(w_bfp4_tt, ttnn.bfloat16)
-    w_remap = _remap_bfp4_lattice_to_fp4_mags(ttnn, w_bf16)
-    ttnn.deallocate(w_bf16)
+    ttnn.typecast(w_bfp4_tt, ttnn.bfloat16, output_tensor=bf16_scratch)
+    w_remap = _remap_bfp4_lattice_to_fp4_mags(ttnn, bf16_scratch)
     scale_expanded = ttnn.repeat_interleave(
         scale_compact_tt, repeats=FP4_BLOCK_K, dim=-2)
     w_scaled = ttnn.multiply(w_remap, scale_expanded)
-    ttnn.deallocate(w_remap)
-    ttnn.deallocate(scale_expanded)
-    y_tt = ttnn.matmul(x_tt, w_scaled)
-    ttnn.deallocate(w_scaled)
-    return y_tt
+    ttnn.matmul(x_tt, w_scaled, optional_output_tensor=out_y)
+    return out_y
 
 
 def _make_chip_local_ids_tt(ttnn, mesh, mesh_shape, n_experts: int):
@@ -4457,6 +4455,8 @@ class Model:
         rows, cols = mesh_shape
         n_chips = rows * cols
         self._device_routed_experts = []
+        self._routed_w13_bf16_scratch_tt = None
+        self._routed_w2_bf16_scratch_tt = None
         for layer in self.transformer.layers:
             ffn = layer.ffn
             if not isinstance(ffn, MoE):
@@ -4511,6 +4511,38 @@ class Model:
             ffn._chip_ids_4d_tt = ttnn.reshape(
                 ffn._chip_local_ids_tt, [1, n_per_chip, 1, 1])
             ffn._n_per_chip = n_per_chip
+
+            # Per-MoE pre-allocated matmul output scratches for _fp4_gemm_via_bfp4.
+            # Tiny (~32-64KB per chip per scratch); replicated, written each call.
+            def _alloc_y_scratch(N):
+                return ttnn.from_torch(
+                    torch.zeros([1, n_per_chip, 1, N], dtype=torch.bfloat16),
+                    device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+                )
+            ffn._fp4_y1_scratch_tt = _alloc_y_scratch(inter)
+            ffn._fp4_y3_scratch_tt = _alloc_y_scratch(inter)
+            ffn._fp4_y2_scratch_tt = _alloc_y_scratch(dim)
+
+            # Shared bf16 typecast destinations for fp4_gemm. Two shapes
+            # (w1/w3 use [K=dim, N=inter]; w2 uses [K=inter, N=dim]).
+            # Allocated once on the model and reused across every layer.
+            if self._routed_w13_bf16_scratch_tt is None:
+                self._routed_w13_bf16_scratch_tt = ttnn.from_torch(
+                    torch.zeros([1, n_per_chip, dim, inter], dtype=torch.bfloat16),
+                    device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+                )
+                self._routed_w2_bf16_scratch_tt = ttnn.from_torch(
+                    torch.zeros([1, n_per_chip, inter, dim], dtype=torch.bfloat16),
+                    device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+                )
+            ffn._w13_bf16_scratch_tt = self._routed_w13_bf16_scratch_tt
+            ffn._w2_bf16_scratch_tt = self._routed_w2_bf16_scratch_tt
             for expert in ffn.experts:
                 expert.w1.weight.data = torch.empty(0)
                 expert.w2.weight.data = torch.empty(0)
