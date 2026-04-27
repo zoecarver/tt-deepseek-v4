@@ -3622,15 +3622,22 @@ class DeviceSharedExpert(nn.Module):
             torch.zeros(1, self.dim, dtype=torch.bfloat16),
             mesh_mapper=replicate, **common)
         self._upload_mapper = replicate
+        # Trace state: captured on first forward_device call. ttnn.all_reduce
+        # allocates its own output buffer (no output_tensor= support); the
+        # captured handle is stored in _ar_out_tt and reused via execute_trace.
+        self._trace_id = None
+        self._ar_out_tt = None
 
-    def forward_device(self, x_tt):
-        """Pure-device shared-expert SwiGLU. x_tt: [M=1, dim] bf16 device
-        tensor (replicated). Returns out_tt [1, dim] replicated (post
-        all_reduce). No host transfers."""
+    def _compute_body(self):
+        """Pure-device SwiGLU body that reads from the stable _x_upload_tt
+        buffer. Caller (forward_device) is responsible for staging the input
+        via ttnn.copy before the trace replays this body."""
         ttnn = self._ttnn
-        ttnn.matmul(x_tt, self.w1_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        ttnn.matmul(self._x_upload_tt, self.w1_tt,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._y1_tt)
-        ttnn.matmul(x_tt, self.w3_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        ttnn.matmul(self._x_upload_tt, self.w3_tt,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._y3_tt)
         if self.swiglu_limit > 0:
             ttnn.clamp(self._y1_tt, max=self.swiglu_limit, output_tensor=self._y1_tt)
@@ -3642,6 +3649,30 @@ class DeviceSharedExpert(nn.Module):
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._partial_tt)
         return ttnn.all_reduce(self._partial_tt)
+
+    def forward_device(self, x_tt):
+        """Pure-device shared-expert SwiGLU. x_tt: [M=1, dim] bf16 device
+        tensor (replicated). Returns out_tt [1, dim] replicated (post
+        all_reduce). No host transfers.
+
+        First call captures a trace; subsequent calls stage x_tt into the
+        stable _x_upload_tt buffer via device-to-device copy and execute the
+        trace with blocking=True. Per-layer instances each capture their
+        own trace.
+        """
+        ttnn = self._ttnn
+        ttnn.copy(x_tt, self._x_upload_tt)
+        if self._trace_id is None:
+            # Warmup outside trace so any lazy device allocations settle.
+            self._compute_body()
+            ttnn.synchronize_device(self.mesh)
+            self._trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
+            self._ar_out_tt = self._compute_body()
+            ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
+            ttnn.synchronize_device(self.mesh)
+        else:
+            ttnn.execute_trace(self.mesh, self._trace_id, cq_id=0, blocking=True)
+        return self._ar_out_tt
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """x: [M=1, dim] -> [M=1, dim]. weights matches Expert.forward
