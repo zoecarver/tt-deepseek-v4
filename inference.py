@@ -510,25 +510,26 @@ class MoE(nn.Module):
         assert args.n_shared_experts == 1
         self.shared_experts = Expert(args.dim, args.moe_inter_dim)
 
-    def forward_device(self, x_tt, input_ids: torch.Tensor):
+    def forward_device(self, x_tt, input_ids_tt):
         """Device-in / device-out MoE for the chained block path.
 
         x_tt: [M, dim] bf16 device tensor (replicated). Must be M=1 (decode).
+        input_ids_tt: [1, 1] uint32 device tensor (pre-uploaded once per step).
         Returns y_tt: [M, dim] bf16 device tensor.
 
-        Two routed-expert paths:
-          - Path D (cached, on-device): when offload_moe_routed_experts has
-            attached _w1_tt/_w1_scale_tt/... to this MoE and the gate is
-            non-hash. Per-chip 8-expert grouped MLP + selection-mask sum +
-            ttnn.all_reduce. No host transfers.
-          - Host fallback: readback x + (weights, indices), run torch
-            scatter loop, upload result. Used for hash-gate layers (vocab
-            lookup) and when no cache is attached.
+        Routed experts go through Path D (cached, on-device): per-chip 8-expert
+        grouped MLP + selection-mask sum + ttnn.all_reduce. The host fallback
+        was removed once Hash-MoE landed on-device (commit 7492c50); every
+        layer must have offload_moe_routed_experts attached.
         """
+        if getattr(self, "_w1_tt", None) is None:
+            raise RuntimeError(
+                "MoE.forward_device requires routed-expert cache; "
+                "offload_moe_routed_experts must run before forward_device."
+            )
+
         shared_dev = self.shared_experts
         ttnn = shared_dev._ttnn
-        mesh = shared_dev.mesh
-        upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
 
         M = int(x_tt.shape[0])
         if M != 1:
@@ -540,52 +541,15 @@ class MoE(nn.Module):
                 f"x_tt last dim {int(x_tt.shape[-1])} != self.dim {self.dim}"
             )
 
-        ttnn.copy(x_tt, shared_dev._x_upload_tt)
-        shared_out_tt = shared_dev.forward_device()
+        shared_out_tt = shared_dev.forward_device(x_tt)
 
-        use_cached = getattr(self, "_w1_tt", None) is not None
-        if use_cached:
-            gate_dev = self.gate._device_gate
-            ttnn.copy(x_tt, gate_dev._x_upload_tt)
-            if self.gate.hash:
-                weights_tt, indices_tt = gate_dev.forward_device(input_ids)
-            else:
-                weights_tt, indices_tt = gate_dev.forward_device()
-            return self._forward_device_routed_cached(
-                x_tt, weights_tt, indices_tt, shared_out_tt)
-
-        x = _readback_replicated_2d(
-            ttnn, x_tt, mesh, shared_dev.mesh_shape).to(torch.bfloat16)
-
+        gate_dev = self.gate._device_gate
         if self.gate.hash:
-            weights, indices = self.gate.forward(x.float(), input_ids.flatten())
+            weights_tt, indices_tt = gate_dev.forward_device(x_tt, input_ids_tt)
         else:
-            gate_dev = self.gate._device_gate
-            ttnn.copy(x_tt, gate_dev._x_upload_tt)
-            weights_tt, indices_tt = gate_dev.forward_device()
-            weights = _readback_replicated_2d(
-                ttnn, weights_tt, mesh, shared_dev.mesh_shape)[:M].float()
-            indices = _readback_replicated_2d(
-                ttnn, indices_tt, mesh, shared_dev.mesh_shape)[:M].long()
-
-        y_routed = torch.zeros(M, self.dim, dtype=torch.float32)
-        counts = torch.bincount(
-            indices.flatten(), minlength=self.n_routed_experts
-        ).tolist()
-        for i in range(self.n_routed_experts):
-            if counts[i] == 0:
-                continue
-            expert = self.experts[i]
-            idx, top = torch.where(indices == i)
-            y_routed[idx] += expert(x[idx], weights[idx, top, None])
-
-        y_routed_tt = ttnn.from_torch(
-            y_routed.to(torch.bfloat16).contiguous(),
-            device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=upload_mapper,
-        )
-        return ttnn.add(y_routed_tt, shared_out_tt)
+            weights_tt, indices_tt = gate_dev.forward_device(x_tt)
+        return self._forward_device_routed_cached(
+            x_tt, weights_tt, indices_tt, shared_out_tt)
 
     def _forward_device_routed_cached(
         self, x_tt, weights_tt, indices_tt, shared_out_tt
@@ -693,7 +657,7 @@ class Block(nn.Module):
 
 
 def _block_forward(layer, x, start_pos: int,
-                   input_ids: Optional[torch.Tensor],
+                   input_ids_tt,
                    B: int, S: int, mhc: int, hidden: int,
                    orig_dtype):
     """Vanilla block forward. Calls the bound (device or CPU) sub-modules
@@ -704,12 +668,14 @@ def _block_forward(layer, x, start_pos: int,
     format: [num_tokens_pad, mhc*hidden] fp32. Returns the same format
     (output of hc_post → packed for the next layer's hc_pre).
 
+    input_ids_tt is the [1, 1] uint32 device tensor uploaded once per step
+    by the caller; consumed by hash-gate MoE layers.
+
     Method dispatch follows the offload-time bindings:
       - layer._device_mhc_attn / layer._device_mhc_ffn: DeviceMHC instances
       - layer.attn_norm.forward / layer.ffn_norm.forward: DeviceRMSNorm
       - layer.attn.forward: DeviceAttention.forward (decode-only)
-      - layer.ffn.forward_device: cached Path D for non-hash layers, host
-        fallback only for hash-gate layers (layer_id < n_hash_layers).
+      - layer.ffn.forward_device: cached Path D for all 43 layers (hash + non-hash).
     """
     mhc_attn = layer._device_mhc_attn
     mhc_ffn = layer._device_mhc_ffn
@@ -765,7 +731,7 @@ def _block_forward(layer, x, start_pos: int,
         ttnn.slice(ffn_norm_out_tt, [0, 0], [num_tokens, hidden],
                    output_tensor=mhc_ffn._norm_slice_tt)
         moe_out_tt = layer.ffn.forward_device(
-            mhc_ffn._norm_slice_tt, input_ids)
+            mhc_ffn._norm_slice_tt, input_ids_tt)
     with _phase("block.hc_post"):
         x_2d = ttnn.reshape(moe_out_tt, [num_tokens, 1, hidden])
         x_repeated = ttnn.repeat(x_2d, ttnn.Shape([1, mhc, 1]))
@@ -832,17 +798,29 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
-        with _phase("embed"):
-            mhc_attn = self.layers[0]._device_mhc_attn
-            ttnn = mhc_attn._ttnn
-            mhc = self.hc_mult
-            hidden = mhc_attn.hidden
-            B, S = input_ids.shape
-            num_tokens = B * S
-            num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
-            orig_dtype = torch.bfloat16
+        mhc_attn = self.layers[0]._device_mhc_attn
+        ttnn = mhc_attn._ttnn
+        mhc = self.hc_mult
+        hidden = mhc_attn.hidden
+        B, S = input_ids.shape
+        num_tokens = B * S
+        num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
+        orig_dtype = torch.bfloat16
 
-            embed_tt = self.embed(input_ids)
+        # Upload token ids ONCE per step into the pre-allocated [B, S] uint32
+        # device tensor. _device_embed and any hash-gate MoE layer consumes
+        # this same tensor; no other host->device transfers exist in the
+        # decode hot path.
+        ids_host = ttnn.from_torch(
+            input_ids.to(torch.int32).contiguous(),
+            dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=self._input_ids_upload_mapper,
+        )
+        ttnn.copy_host_to_device_tensor(ids_host, self._input_ids_tt)
+        input_ids_tt = self._input_ids_tt
+
+        with _phase("embed"):
+            embed_tt = self.embed(input_ids_tt)
             e_2d = ttnn.reshape(embed_tt, [num_tokens, hidden])
             e_fp32 = ttnn.typecast(e_2d, dtype=ttnn.float32)
             e_repeated = ttnn.repeat(e_fp32, ttnn.Shape([1, mhc]))
@@ -853,7 +831,7 @@ class Transformer(nn.Module):
             )
         with _phase("blocks"):
             for layer in self.layers:
-                a_tt = _block_forward(layer, a_tt, start_pos, input_ids,
+                a_tt = _block_forward(layer, a_tt, start_pos, input_ids_tt,
                                       B, S, mhc, hidden, orig_dtype)
         with _phase("head"):
             logits = self.head(a_tt, num_tokens)
@@ -1238,16 +1216,11 @@ class DeviceMoEGate(nn.Module):
         self._raw_tt = ttnn.from_torch(
             torch.zeros(1, self.n_experts, dtype=torch.bfloat16), **common_rep)
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
-        self._trace_id = None
-        self._weights_tt = None
-        self._indices_tt = None
 
-    def _compute_body(self):
-        """Returns (weights_tt, indices_tt). Called outside trace as warmup
-        and again during begin_trace_capture; on replay the captured
-        op sequence reproduces the same output addresses."""
+    def forward_device(self, x_tt):
+        """Pure-device gate body: x_tt [M=1, dim] bf16 device tensor in.
+        Returns (weights_tt, indices_tt) device tensors. No host transfers."""
         ttnn = self._ttnn
-        x_tt = self._x_upload_tt
         ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._raw_tt)
         scores_tt = ttnn.sqrt(ttnn.softplus(self._raw_tt))
@@ -1258,19 +1231,6 @@ class DeviceMoEGate(nn.Module):
         normed_tt = ttnn.div(gathered_tt, wsum_tt)
         weights_tt = ttnn.multiply(normed_tt, self.route_scale)
         return weights_tt, indices_tt
-
-    def _capture_trace(self):
-        ttnn = self._ttnn
-        self._weights_tt, self._indices_tt = self._compute_body()  # warmup
-        ttnn.synchronize_device(self.mesh)
-        self._trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
-        self._weights_tt, self._indices_tt = self._compute_body()
-        ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
-
-    def forward_device(self):
-        """Pure-device gate body: assumes self._x_upload_tt is already filled.
-        Returns (weights_tt, indices_tt) device tensors. No host transfers."""
-        return self._compute_body()
 
     def forward(self, x: torch.Tensor):
         """x: [M=1, dim] -> (weights [1, topk] float32, indices [1, topk] int64).
@@ -1290,7 +1250,7 @@ class DeviceMoEGate(nn.Module):
             mesh_mapper=self._upload_mapper,
         )
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
-        weights_tt, indices_tt = self.forward_device()
+        weights_tt, indices_tt = self.forward_device(self._x_upload_tt)
 
         weights = _readback_replicated_2d(
             ttnn, weights_tt, self.mesh, self.mesh_shape)[:M].float()
@@ -1374,27 +1334,20 @@ class HashDeviceMoEGate(nn.Module):
         self._raw_tt = ttnn.from_torch(
             torch.zeros(1, self.n_experts, dtype=torch.bfloat16),
             **common_rep)
-        self._input_ids_tt = ttnn.from_torch(
-            torch.zeros(1, 1, dtype=torch.int32),
-            device=self.mesh,
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
-        )
-        self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
 
-    def _compute_body(self):
-        """Run the full pipeline assuming _x_upload_tt and _input_ids_tt are
-        already filled. Returns (weights_tt [1, topk] bf16,
-        indices_tt [1, topk] uint32) replicated."""
+    def forward_device(self, x_tt, input_ids_tt):
+        """Pure-device hash-gate body.
+
+        x_tt: [1, dim] bf16 device tensor.
+        input_ids_tt: [1, 1] uint32 device tensor (pre-uploaded once per step).
+        Returns (weights_tt [1, topk] bf16, indices_tt [1, topk] uint32)
+        replicated. No host transfers."""
         ttnn = self._ttnn
-        x_tt = self._x_upload_tt
         ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._raw_tt)
         scores_tt = ttnn.sqrt(ttnn.softplus(self._raw_tt))
         idx_lookup = ttnn.embedding(
-            self._input_ids_tt, self.tid2eid_tt, layout=ttnn.TILE_LAYOUT)
+            input_ids_tt, self.tid2eid_tt, layout=ttnn.TILE_LAYOUT)
         # ttnn.gather requires uint32/uint16 index. Path D's selection mask
         # typecasts to int32 anyway, so returning uint32 is fine downstream.
         idx_u32 = ttnn.typecast(idx_lookup, ttnn.uint32)
@@ -1404,20 +1357,6 @@ class HashDeviceMoEGate(nn.Module):
         normed_tt = ttnn.div(gathered_tt, wsum_tt)
         weights_tt = ttnn.multiply(normed_tt, self.route_scale)
         return weights_tt, idx_2d
-
-    def forward_device(self, input_ids: torch.Tensor):
-        """Upload input_ids and run the gate body. Caller must have already
-        copied x into self._x_upload_tt. Returns (weights_tt, indices_tt)."""
-        ttnn = self._ttnn
-        ids = input_ids.reshape(1, 1).to(torch.int32).contiguous()
-        host_mesh = ttnn.from_torch(
-            ids,
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            mesh_mapper=self._upload_mapper,
-        )
-        ttnn.copy_host_to_device_tensor(host_mesh, self._input_ids_tt)
-        return self._compute_body()
 
 
 _RMS_TILE = 32
@@ -3147,13 +3086,11 @@ class DeviceSharedExpert(nn.Module):
         self._out_tt = ttnn.from_torch(
             torch.zeros(1, self.dim, dtype=torch.bfloat16), **common_rep)
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
-        self._trace_id = None
 
-    def _compute_body(self):
-        """Pure-device SwiGLU pipeline. All ops write into pre-allocated
-        buffers so trace replay reuses the same addresses."""
+    def forward_device(self, x_tt):
+        """Pure-device shared-expert SwiGLU. x_tt: [M=1, dim] bf16 device
+        tensor. Returns self._out_tt (filled in place). No host transfers."""
         ttnn = self._ttnn
-        x_tt = self._x_upload_tt
         ttnn.matmul(x_tt, self.w1_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._y1_tt)
         ttnn.matmul(x_tt, self.w3_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -3167,20 +3104,6 @@ class DeviceSharedExpert(nn.Module):
         ttnn.matmul(self._mid_tt, self.w2_tt,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._out_tt)
-
-    def _capture_trace(self):
-        ttnn = self._ttnn
-        self._compute_body()  # warmup
-        ttnn.synchronize_device(self.mesh)
-        self._trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
-        self._compute_body()
-        ttnn.end_trace_capture(self.mesh, self._trace_id, cq_id=0)
-
-    def forward_device(self):
-        """Pure-device shared-expert body: assumes self._x_upload_tt is
-        already filled. Returns the output device tensor self._out_tt.
-        No host transfers."""
-        self._compute_body()
         return self._out_tt
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -3204,7 +3127,7 @@ class DeviceSharedExpert(nn.Module):
             mesh_mapper=self._upload_mapper,
         )
         ttnn.copy_host_to_device_tensor(host_mesh, self._x_upload_tt)
-        out_tt = self.forward_device()
+        out_tt = self.forward_device(self._x_upload_tt)
 
         y = _readback_replicated_2d(
             ttnn, out_tt, self.mesh, self.mesh_shape)[:M]
@@ -4698,19 +4621,22 @@ class Model:
                 mesh, mesh_shape=mesh_shape, dims=(None, -1)),
         )
 
-        def _device_embed(self_embed, x: torch.Tensor):
+        # Single shared per-step input_ids upload buffer. Lives on the
+        # transformer so Transformer.forward and any hash-gate MoE layer
+        # read from the same tensor (one host->device transfer per step).
+        self.transformer._input_ids_tt = ttnn.from_torch(
+            torch.zeros(1, 1, dtype=torch.int32),
+            device=mesh, dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        self.transformer._input_ids_upload_mapper = ttnn.ReplicateTensorToMesh(mesh)
+
+        def _device_embed(self_embed, ids_tt):
             """Return a ttnn device tensor [B, S, hidden] bf16 TILE_LAYOUT,
-            replicated across the mesh. Caller is responsible for unpacking
-            shape and downstream on-device repeat/pad."""
-            ids = x.to(torch.int32).contiguous()
-            ids_tt = ttnn.as_tensor(
-                ids,
-                device=mesh,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-                dtype=ttnn.uint32,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
-            )
+            replicated across the mesh. ids_tt: [B, S] uint32 device tensor
+            (pre-uploaded by the caller). No host transfers."""
             embed_local = ttnn.embedding(ids_tt, w_tt, layout=ttnn.TILE_LAYOUT)
             return ttnn.all_gather(embed_local, dim=-1, cluster_axis=1,
                                    num_links=1)
