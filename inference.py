@@ -4020,6 +4020,30 @@ class DeviceCompressor(nn.Module):
         self.cos_full_tt = ttnn.as_tensor(fc.real.to(torch.bfloat16).contiguous(), **rep)
         self.sin_full_tt = ttnn.as_tensor(fc.imag.to(torch.bfloat16).contiguous(), **rep)
 
+        # Pre-shifted lookup tables so the per-step row pickers can use
+        # `ttnn.embedding(start_pos_tt, table)` instead of slice-by-Python-int.
+        # The slice index is then a device tensor and the surrounding op
+        # sequence is trace-stable across decode positions.
+        max_seq_len = fc.real.shape[0]
+        ape_cpu = comp.ape.to(torch.bfloat16)
+        ratio_int = int(self.compress_ratio)
+        ape_padded_cpu = ape_cpu[
+            torch.arange(max_seq_len) % ratio_int
+        ].contiguous()
+        self.ape_padded_tt = ttnn.as_tensor(ape_padded_cpu, **rep)
+
+        # cos_compressor_tt[i] = cos_full[max(0, i + 1 - ratio)]; only the
+        # rows hit by the emit branch (start_pos = ratio-1, 2*ratio-1, …)
+        # are read, so the leading `ratio - 1` rows are unused. We still
+        # populate them with cos_full[0] to keep the table well-defined.
+        shifted = torch.clamp(
+            torch.arange(max_seq_len) + 1 - ratio_int, min=0
+        )
+        cos_shifted_cpu = fc.real[shifted].to(torch.bfloat16).contiguous()
+        sin_shifted_cpu = fc.imag[shifted].to(torch.bfloat16).contiguous()
+        self.cos_compressor_tt = ttnn.as_tensor(cos_shifted_cpu, **rep)
+        self.sin_compressor_tt = ttnn.as_tensor(sin_shifted_cpu, **rep)
+
         if self.rotate:
             h_mat = (_sylvester_hadamard(self.head_dim) *
                      (self.head_dim ** -0.5)).to(torch.bfloat16)
@@ -4157,7 +4181,7 @@ class DeviceCompressor(nn.Module):
             self.kv_cache_tt = ttnn.as_tensor(
                 kv_cache_init.view(B, 1, T_pad, d).contiguous(), **rep)
 
-    def forward_device(self, x_tt, B: int, start_pos: int):
+    def forward_device(self, x_tt, B: int, start_pos: int, start_pos_tt=None):
         ttnn = self._ttnn
         ratio = self.compress_ratio
         d = self.head_dim
@@ -4166,12 +4190,27 @@ class DeviceCompressor(nn.Module):
 
         if self.kv_state_front_tt is None:
             self._alloc_decode_tensors(B)
+        if start_pos_tt is None:
+            start_pos_tt = ttnn.from_torch(
+                torch.tensor([[start_pos]], dtype=torch.int32),
+                device=self.mesh, dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+            )
 
         kv_tt = self.wkv.forward_device(x_tt)
         score_tt = self.wgate.forward_device(x_tt)
 
+        # slot_in_ape (still a host int) parameterizes the kv_cache update
+        # slot below; the ape row pick has been moved to ttnn.embedding so
+        # the slice index is on device. Removing the kv_cache.slot host-int
+        # leak is task #160 (paged_update_cache).
         slot_in_ape = start_pos % ratio
-        ape_slot = ttnn.slice(self.ape_tt, [slot_in_ape, 0], [slot_in_ape + 1, c])
+        # ape_padded_tt[start_pos] == ape_tt[start_pos % ratio]; lets the
+        # row pick stay on device.
+        ape_slot = ttnn.embedding(
+            start_pos_tt, self.ape_padded_tt, layout=ttnn.TILE_LAYOUT)
         score_tt = ttnn.add(score_tt, ttnn.reshape(ape_slot, [1, 1, c]))
 
         if self.overlap:
@@ -4244,9 +4283,13 @@ class DeviceCompressor(nn.Module):
             kv_normed = ttnn.reshape(kv_2d, [B, 1, d])
 
         rd_half = rd // 2
-        freq_idx = start_pos + 1 - ratio
-        cos = ttnn.slice(self.cos_full_tt, [freq_idx, 0], [freq_idx + 1, rd_half])
-        sin = ttnn.slice(self.sin_full_tt, [freq_idx, 0], [freq_idx + 1, rd_half])
+        # cos_compressor_tt[start_pos] == cos_full[start_pos + 1 - ratio] for
+        # the emit positions (start_pos = k*ratio - 1, k>=1) that reach this
+        # branch; the per-step row pick stays on device via ttnn.embedding.
+        cos = ttnn.embedding(
+            start_pos_tt, self.cos_compressor_tt, layout=ttnn.TILE_LAYOUT)
+        sin = ttnn.embedding(
+            start_pos_tt, self.sin_compressor_tt, layout=ttnn.TILE_LAYOUT)
         cos = ttnn.reshape(cos, [1, 1, rd_half])
         sin = ttnn.reshape(sin, [1, 1, rd_half])
         kv_nope = ttnn.slice(kv_normed, [0, 0, 0],     [B, 1, d - rd])
@@ -4385,7 +4428,7 @@ class DeviceIndexer(nn.Module):
         q_tt = _device_rotate_activation(ttnn, q_tt, self.h_tt)
 
         # fp4_act_quant SKIPPED (bf16 policy).
-        self.dc.forward_device(x_tt, B, start_pos)
+        self.dc.forward_device(x_tt, B, start_pos, start_pos_tt=start_pos_tt)
 
         scale = self.softmax_scale * (H ** -0.5)
         w_tt = self.weights_proj.forward_device(x_tt)
@@ -4965,7 +5008,8 @@ class DeviceAttention(nn.Module):
             )
         if self.compress_ratio:
             with _phase("attn.compress"):
-                device_comp.forward_device(x_tt, B, start_pos)
+                device_comp.forward_device(
+                    x_tt, B, start_pos, start_pos_tt=start_pos_tt)
 
         with _phase("attn.sparse"):
             kv_full_tt = ttnn.reshape(self.kv_cache_tt, [self.kv_cache_size_pad, D])
