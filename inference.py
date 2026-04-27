@@ -805,8 +805,10 @@ class Transformer(nn.Module):
             self.hc_head_base = nn.Parameter(torch.empty(args.hc_mult))
             self.hc_head_scale = nn.Parameter(torch.empty(1))
 
-    @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
+    def _run_blocks(self, input_ids: torch.Tensor, start_pos: int):
+        """Shared decode/prefill body: upload ids+start_pos, embed, run all
+        blocks. Returns (a_tt, num_tokens) so the caller can dispatch either
+        the full-logits head or the on-device argmax head."""
         mhc_attn = self.layers[0]._device_mhc_attn
         ttnn = mhc_attn._ttnn
         mhc = self.hc_mult
@@ -855,9 +857,25 @@ class Transformer(nn.Module):
                 a_tt = _block_forward(layer, a_tt, start_pos, start_pos_tt,
                                       input_ids_tt,
                                       B, S, mhc, hidden, orig_dtype)
+        return a_tt, num_tokens
+
+    @torch.inference_mode()
+    def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
+        a_tt, num_tokens = self._run_blocks(input_ids, start_pos)
         with _phase("head"):
             logits = self.head(a_tt, num_tokens)
         return logits
+
+    @torch.inference_mode()
+    def forward_argmax(self, input_ids: torch.Tensor, start_pos: int = 0) -> int:
+        """Decode end-to-end and return the next greedy token id directly.
+
+        Same body as `forward` but uses the on-device argmax head, so the
+        only host download per step is a 4-byte token id. Requires
+        offload_lm_head to have run (which binds head.forward_argmax)."""
+        a_tt, num_tokens = self._run_blocks(input_ids, start_pos)
+        with _phase("head"):
+            return self.head.forward_argmax(a_tt, num_tokens)
 
 
 # ==============================================================================
@@ -1042,9 +1060,9 @@ class DeviceLMHead:
         )
         return y[:1, 0, :self.vocab].float()  # [B, vocab]
 
-    def forward_a_tt(self, a_tt, num_tokens: int) -> torch.Tensor:
-        """Pure-device head: a_tt [num_tokens_pad, mhc*hidden] fp32 -> logits torch [B=1, vocab].
-        Runs hc_combiner + final RMSNorm + lm_head matmul on device."""
+    def _logits_body(self, a_tt, num_tokens: int):
+        """Pure-device hc_combiner + final RMSNorm + lm_head matmul. Writes
+        sharded logits into `_matmul_out_tt` and returns it (no host pull)."""
         ttnn = self._ttnn
         if self.hc_fn_t_tt is None:
             raise ValueError("forward_a_tt requires hc_fn/scale/base; pass them to DeviceLMHead.")
@@ -1081,11 +1099,59 @@ class DeviceLMHead:
             y_normed = y_bf16
         ttnn.matmul(y_normed, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._matmul_out_tt)
+        return self._matmul_out_tt
+
+    def forward_a_tt(self, a_tt, num_tokens: int) -> torch.Tensor:
+        """Pure-device head: a_tt [num_tokens_pad, mhc*hidden] fp32 -> logits torch [B=1, vocab].
+        Runs hc_combiner + final RMSNorm + lm_head matmul on device."""
+        ttnn = self._ttnn
+        self._logits_body(a_tt, num_tokens)
         out = ttnn.to_torch(
             self._matmul_out_tt,
             mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=-1),
         )
         return out[:1, 0, :self.vocab].float()  # [1, vocab]
+
+    def forward_a_tt_argmax(self, a_tt, num_tokens: int) -> int:
+        """On-device greedy sampling: hc_combiner + lm_head + per-chip argmax.
+
+        Runs the same logits body as forward_a_tt, but reduces the sharded
+        vocab logits per-chip (argmax over the local 4K-element chunk + max
+        value) and only downloads two 32-element tensors (~128 bytes total).
+        Host computes the global argmax by picking the chip with the highest
+        max value and offsetting by chip_index * vocab_per_chip.
+
+        We tried gathering full logits and running ttnn.argmax over 130K
+        elements: cost was ~640ms per step. Per-chip reduction is ~3ms.
+
+        Returns the next greedy token id as a Python int.
+        """
+        ttnn = self._ttnn
+        logits_tt = self._logits_body(a_tt, num_tokens)
+        # Per-chip local argmax (uint32 [1, 1]) and max value (bf16 [1, 1]).
+        # Each chip operates on its [1, 1, vocab_per_chip] shard.
+        local_argmax_tt = ttnn.argmax(logits_tt, dim=-1)
+        local_max_tt = ttnn.max(logits_tt, dim=-1)
+        # Pull both to host as [1, num_chips] tensors. mesh-iteration order
+        # along dim=-1 matches the ShardTensorToMesh(dim=-1) order used for
+        # the lm_head weight, so chip i holds vocab range
+        # [i * vocab_per_chip, (i+1) * vocab_per_chip).
+        composer = ttnn.ConcatMeshToTensor(self.mesh, dim=-1)
+        local_argmax = ttnn.to_torch(local_argmax_tt, mesh_composer=composer)
+        local_max = ttnn.to_torch(local_max_tt, mesh_composer=composer)
+        local_argmax = local_argmax.flatten()
+        local_max = local_max.flatten()
+        winner_chip = int(local_max.argmax().item())
+        local_idx = int(local_argmax[winner_chip].item())
+        vocab_per_chip = self.vocab_padded // local_argmax.numel()
+        token_id = winner_chip * vocab_per_chip + local_idx
+        if token_id >= self.vocab:
+            raise RuntimeError(
+                f"on-device argmax produced index {token_id} in vocab_padded "
+                f"region (>= real vocab {self.vocab}); a real logit must be "
+                "less than every padding entry"
+            )
+        return token_id
 
 
 class DeviceColLinear(nn.Module):
@@ -5621,7 +5687,11 @@ class Model:
         def _device_head_forward(self_head, a_tt, num_tokens):
             with _phase("head.norm_and_logits"):
                 return dlh.forward_a_tt(a_tt, num_tokens)
+        def _device_head_forward_argmax(self_head, a_tt, num_tokens):
+            with _phase("head.norm_and_argmax"):
+                return dlh.forward_a_tt_argmax(a_tt, num_tokens)
         head.forward = _device_head_forward.__get__(head, type(head))
+        head.forward_argmax = _device_head_forward_argmax.__get__(head, type(head))
         final_norm.weight.data = torch.empty(0)  # device owns it
         head.weight.data = torch.empty(0)
         transformer.hc_head_fn.data = torch.empty(0)
@@ -6245,41 +6315,45 @@ class Model:
         return n
 
     @torch.inference_mode()
-    def step_decode(self, token_id: int, pos: int) -> torch.Tensor:
-        """Single decode step. Returns logits [vocab_size]."""
+    def step_decode(self, token_id: int, pos: int) -> int:
+        """Single greedy decode step. Returns next token id (on-device argmax)."""
         ids = torch.tensor([[token_id]], dtype=torch.long)
-        logits = self.transformer.forward(ids, start_pos=pos)
-        return logits[0]
+        return self.transformer.forward_argmax(ids, start_pos=pos)
 
     @torch.inference_mode()
-    def prefill(self, tokens: list[int]) -> torch.Tensor:
-        """Loop the device decode path over every prompt token. Slow per
-        token, but reuses the decode kernels and keeps prefill on device."""
-        logits = None
+    def prefill(self, tokens: list[int]) -> int:
+        """Greedy prefill: loop decode path over prompt tokens, return next
+        greedy token id directly (no per-step logits download)."""
+        last = len(tokens) - 1
+        nxt = -1
         for i, tok in enumerate(tokens):
             ids = torch.tensor([[tok]], dtype=torch.long)
-            logits = self.transformer.forward(ids, start_pos=i)
-        return logits[0]
+            if i < last:
+                # Discard logits at intermediate positions; we only need the
+                # last one. Use forward_argmax everywhere so the trace path
+                # is the same shape every call.
+                self.transformer.forward_argmax(ids, start_pos=i)
+            else:
+                nxt = self.transformer.forward_argmax(ids, start_pos=i)
+        return nxt
 
     @torch.inference_mode()
     def generate(self, tokens: list[int], max_tokens: int = 32,
-                 temperature: float = 1.0, warmup_tokens: int = 0):
-        """Generate up to max_tokens. Phase counters are reset after the
-        first `warmup_tokens` decode steps so steady-state timings don't
-        include first-call JIT compilation / trace capture."""
+                 warmup_tokens: int = 0):
+        """Greedy generate up to max_tokens. Hardcoded temperature=0 (only
+        greedy validates the bit-exact coherence gate). The on-device argmax
+        path means the only host download per step is a 4-byte token id.
+
+        Phase counters are reset after the first `warmup_tokens` decode steps
+        so steady-state timings don't include first-call JIT compilation /
+        trace capture overhead."""
         with _phase("prefill"):
-            logits = self.prefill(tokens)
+            nxt = self.prefill(tokens)
         pos = len(tokens)
         for i in range(max_tokens):
-            with _phase("sample"):
-                if temperature == 0:
-                    nxt = int(logits.argmax().item())
-                else:
-                    probs = F.softmax(logits.float() / temperature, dim=-1)
-                    nxt = int(torch.multinomial(probs, num_samples=1).item())
             yield nxt
             with _phase("decode_step"):
-                logits = self.step_decode(nxt, pos)
+                nxt = self.step_decode(nxt, pos)
             pos += 1
             if warmup_tokens > 0 and i + 1 == warmup_tokens:
                 _PHASE_ACCUM.clear()
@@ -6305,7 +6379,6 @@ def main():
                         help="Reset phase counters after this many decode steps "
                              "so steady-state timings exclude first-call JIT / "
                              "trace capture overhead.")
-    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--weights-only", action="store_true",
                         help="Stop after loading weights (Phase 1 gate)")
     parser.add_argument("--verbose-load", action="store_true")
@@ -6390,7 +6463,6 @@ def main():
     t0 = time.time()
     out_tokens = []
     for tok in model.generate(tokens, max_tokens=args.max_tokens,
-                              temperature=args.temperature,
                               warmup_tokens=args.warmup_tokens):
         out_tokens.append(tok)
         piece = model.tokenizer.decode([tok])
