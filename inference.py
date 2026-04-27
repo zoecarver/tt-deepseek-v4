@@ -726,8 +726,14 @@ def _block_forward(layer, x, start_pos: int,
         hc_out_fp32 = mhc_attn.hc_pre_device(
             num_tokens, num_tokens_pad, a_tt=x)
     with _phase("block.norm"):
-        norm_in = ttnn.typecast(hc_out_fp32, dtype=ttnn.bfloat16)
-        norm_out_tt = attn_norm_dn.forward_device(norm_in, num_tokens)
+        # DeviceRMSNorm.forward_device reads its x_tt arg directly and writes
+        # _out_tt; _x_upload_tt is only used by the host-upload wrapper. Reuse
+        # it here as the typecast destination so we don't alloc a fresh
+        # [Mpad, hidden] bf16 buffer per call.
+        ttnn.typecast(hc_out_fp32, dtype=ttnn.bfloat16,
+                      output_tensor=attn_norm_dn._x_upload_tt)
+        norm_out_tt = attn_norm_dn.forward_device(
+            attn_norm_dn._x_upload_tt, num_tokens)
     with _phase("block.attn"):
         sliced = ttnn.slice(norm_out_tt, [0, 0], [num_tokens, hidden])
         bridge_tt = ttnn.reshape(sliced, [B, S, hidden])
@@ -752,8 +758,10 @@ def _block_forward(layer, x, start_pos: int,
         ffn_hc_out_fp32 = mhc_ffn.hc_pre_device(
             num_tokens, num_tokens_pad, a_tt=a_input_tt)
     with _phase("block.norm"):
-        ffn_norm_in = ttnn.typecast(ffn_hc_out_fp32, dtype=ttnn.bfloat16)
-        ffn_norm_out_tt = ffn_norm_dn.forward_device(ffn_norm_in, num_tokens)
+        ttnn.typecast(ffn_hc_out_fp32, dtype=ttnn.bfloat16,
+                      output_tensor=ffn_norm_dn._x_upload_tt)
+        ffn_norm_out_tt = ffn_norm_dn.forward_device(
+            ffn_norm_dn._x_upload_tt, num_tokens)
     with _phase("block.ffn"):
         ffn_norm_sliced = ttnn.slice(
             ffn_norm_out_tt, [0, 0], [num_tokens, hidden])
