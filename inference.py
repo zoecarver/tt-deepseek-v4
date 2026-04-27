@@ -2488,6 +2488,112 @@ def _compile_mhc_post_kernel(num_tokens: int, h_tiles: int):
     return post_kernel
 
 
+def _compile_compressor_slot_shift_kernel(num_buffers: int, ratio_pad: int, d: int):
+    """Inlined from tt-lang-kernels/compressor_slot_shift.py.
+
+    Replaces the per-buffer ratio-many `ttnn.kv_cache.update_cache_for_token_`
+    calls in DeviceCompressor.forward_device (overlap=True, ratio=4):
+
+        for buf in (kv_state_front, kv_state_back, score_state_front, score_state_back):
+            for i in range(ratio):
+                slot_src = ttnn.slice(buf, [0,0,ratio+i,0], [B,1,ratio+i+1,d])
+                ttnn.kv_cache.update_cache_for_token_(buf, slot_src, i, 0)
+
+    16 ttnn dispatches per emit step (4 buffers x 4 slot writes), each
+    serialized on host. We collapse to one tt-lang kernel per buffer (4
+    dispatches total).
+
+    Math: out[i, :] = buf[i + ratio, :] for i < ratio
+          out[i, :] = buf[i, :]         for i >= ratio
+    Expressed as a tile matmul: out = P @ buf where P is the [ratio_pad,
+    ratio_pad] shift matrix (P[i, i+ratio]=1 for i<ratio, P[i,i]=1 else).
+
+    V4-Flash decode: ratio=4, ratio_pad=32, num_buffers=1 (per-call), d=512
+    for the attention compressor and d=128 for the indexer's compressor.
+    Constraint: ratio_pad == TILE == 32 (within-tile shift via matmul; multi-
+    tile P would need different math).
+    """
+    if ratio_pad % _RMS_TILE != 0:
+        raise ValueError(f"ratio_pad={ratio_pad} not multiple of TILE={_RMS_TILE}")
+    if d % _RMS_TILE != 0:
+        raise ValueError(f"d={d} not multiple of TILE={_RMS_TILE}")
+    if ratio_pad != _RMS_TILE:
+        raise ValueError(
+            f"ratio_pad={ratio_pad} > TILE={_RMS_TILE} unsupported "
+            f"(V4-Flash uses ratio_pad=32; multi-tile P needs different math)"
+        )
+
+    M_tiles = num_buffers
+    N_tiles = d // _RMS_TILE
+    total_work = M_tiles * N_tiles
+
+    @ttl.operation(grid="auto")
+    def slot_shift_kernel(buf, P, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        work_per_core = -(-total_work // total_cores)
+
+        buf_dfb = ttl.make_dataflow_buffer_like(buf, shape=(1, 1), block_count=2)
+        P_dfb = ttl.make_dataflow_buffer_like(P, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            P_tile = P_dfb.wait()
+
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    buf_tile = buf_dfb.wait()
+                    out_dfb.reserve().store(P_tile @ buf_tile)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            ttl.copy(P[0, 0], P_dfb.reserve()).wait()
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    m = global_w // N_tiles
+                    n = global_w % N_tiles
+                    ttl.copy(buf[m, n], buf_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    m = global_w // N_tiles
+                    n = global_w % N_tiles
+                    ttl.copy(out_dfb.wait(), out[m, n]).wait()
+
+    return slot_shift_kernel
+
+
+def _compressor_shift_matrix(ratio: int, ratio_pad: int) -> torch.Tensor:
+    """Build the [ratio_pad, ratio_pad] shift matrix P for slot-shift kernel.
+    P @ buf produces:
+        out[i] = buf[i + ratio] for i < ratio
+        out[i] = buf[i]         for i >= ratio   (incl. padding rows)
+    """
+    if ratio_pad < 2 * ratio:
+        raise ValueError(f"ratio_pad={ratio_pad} must be >= 2*ratio={2 * ratio}")
+    P = torch.zeros(ratio_pad, ratio_pad, dtype=torch.bfloat16)
+    for i in range(ratio):
+        P[i, i + ratio] = 1.0
+    for i in range(ratio, ratio_pad):
+        P[i, i] = 1.0
+    return P
+
+
 # ============================================================================
 # tt-lang kernel cache + named decode-path globals
 # ============================================================================
@@ -2585,6 +2691,13 @@ def _get_ttl_mhc_post_kernel(num_tokens: int, h_tiles: int):
     )
 
 
+def _get_ttl_compressor_slot_shift_kernel(num_buffers: int, ratio_pad: int, d: int):
+    return _cached_kernel(
+        ("compressor_slot_shift", num_buffers, ratio_pad, d),
+        lambda: _compile_compressor_slot_shift_kernel(num_buffers, ratio_pad, d),
+    )
+
+
 # Named decode-path kernels. Set by `prebuild_ttl_decode_kernels(args)`.
 # Each name encodes the shape it serves so call sites read like
 # `ttl_rmsnorm_M32_h4096(x, gamma, sc, out)`.
@@ -2600,6 +2713,12 @@ ttl_mhc_sinkhorn_N1_R20 = None            # decode (num_tokens=1, sinkhorn=20)
 ttl_mhc_apply_mix_h_N1_h128 = None        # decode (num_tokens=1, h_tiles=128)
 ttl_mhc_post_N1_h128 = None               # decode (num_tokens=1, h_tiles=128)
 
+# DeviceCompressor slot-shift (overlap=True, ratio=4, ratio_pad=32). One
+# kernel call per state buffer collapses 4 ttnn dispatches into 1; with 4
+# buffers per emit step that's 4 dispatches vs the old 16-dispatch loop.
+ttl_compressor_slot_shift_B1_pad32_d512 = None  # attention compressor (head_dim=512)
+ttl_compressor_slot_shift_B1_pad32_d128 = None  # indexer compressor (index_head_dim=128)
+
 
 def prebuild_ttl_decode_kernels(args: "ModelArgs"):
     """Eagerly build every tt-lang kernel the decode path uses and bind them
@@ -2614,6 +2733,8 @@ def prebuild_ttl_decode_kernels(args: "ModelArgs"):
     global ttl_mhc_norm_fn_ksplit_K512_Kp8, ttl_mhc_split_mixes_M1
     global ttl_mhc_sinkhorn_N1_R20
     global ttl_mhc_apply_mix_h_N1_h128, ttl_mhc_post_N1_h128
+    global ttl_compressor_slot_shift_B1_pad32_d512
+    global ttl_compressor_slot_shift_B1_pad32_d128
 
     eps = args.norm_eps
     ttl_rmsnorm_M32_h4096 = _get_ttl_rmsnorm_kernel(
@@ -2635,6 +2756,11 @@ def prebuild_ttl_decode_kernels(args: "ModelArgs"):
         1, args.hc_sinkhorn_iters, args.hc_eps)
     ttl_mhc_apply_mix_h_N1_h128 = _get_ttl_mhc_apply_mix_h_kernel(1, h_tiles)
     ttl_mhc_post_N1_h128 = _get_ttl_mhc_post_kernel(1, h_tiles)
+
+    ttl_compressor_slot_shift_B1_pad32_d512 = _get_ttl_compressor_slot_shift_kernel(
+        1, _RMS_TILE, args.head_dim)
+    ttl_compressor_slot_shift_B1_pad32_d128 = _get_ttl_compressor_slot_shift_kernel(
+        1, _RMS_TILE, args.index_head_dim)
 
 
 class DeviceMHC(nn.Module):
@@ -3508,6 +3634,14 @@ class DeviceCompressor(nn.Module):
         self.kv_state_back_tt = None
         self.score_state_front_tt = None
         self.score_state_back_tt = None
+        # Double-buffer scratch for the slot-shift kernel (overlap=True only).
+        # Each step writes `out = P @ in`, then we swap in/out so the rotated
+        # state becomes the active buffer. Allocated alongside the state.
+        self.kv_state_front_out_tt = None
+        self.kv_state_back_out_tt = None
+        self.score_state_front_out_tt = None
+        self.score_state_back_out_tt = None
+        self.shift_P_tt = None
         self.kv_cache_tt = kv_cache_tt
         self._owns_kv_cache = kv_cache_tt is None
 
@@ -3566,6 +3700,23 @@ class DeviceCompressor(nn.Module):
                 kv_init_back.view(B, 1, ratio_pad, d).contiguous(), **rep)
             self.score_state_back_tt = ttnn.as_tensor(
                 score_init_back.view(B, 1, ratio_pad, d).contiguous(), **rep)
+
+            # Slot-shift double buffers: zeros for kv (data-side), -inf for
+            # score (matches the score-state padding semantic). Pads beyond
+            # the valid 2*ratio rows are treated as identity by the shift
+            # matrix, so init values for those rows are irrelevant.
+            zero_pad = torch.zeros(B, ratio_pad, d, dtype=torch.bfloat16)
+            ninf_pad = torch.full_like(zero_pad, float("-inf"))
+            self.kv_state_front_out_tt = ttnn.as_tensor(
+                zero_pad.view(B, 1, ratio_pad, d).contiguous(), **rep)
+            self.kv_state_back_out_tt = ttnn.as_tensor(
+                zero_pad.view(B, 1, ratio_pad, d).contiguous(), **rep)
+            self.score_state_front_out_tt = ttnn.as_tensor(
+                ninf_pad.view(B, 1, ratio_pad, d).contiguous(), **rep)
+            self.score_state_back_out_tt = ttnn.as_tensor(
+                ninf_pad.view(B, 1, ratio_pad, d).contiguous(), **rep)
+            P_cpu = _compressor_shift_matrix(self.compress_ratio, ratio_pad)
+            self.shift_P_tt = ttnn.as_tensor(P_cpu.contiguous(), **rep)
 
         if self._owns_kv_cache:
             T = comp.kv_cache.shape[1]
@@ -3663,17 +3814,38 @@ class DeviceCompressor(nn.Module):
         ttnn.kv_cache.update_cache_for_token_(self.kv_cache_tt, kv_4d_out,
                                               self.slot_offset + comp_idx, 0)
 
-        # TODO(tt-lang): the per-buffer ratio-many slot-shift writes below are
-        # the second tt-lang candidate (compressor_state_shift). One kernel
-        # that copies [B, ratio, d] from slots ratio..2*ratio-1 to 0..ratio-1
-        # in a single dispatch is much cleaner than the loop below.
+        # Slot-shift via tt-lang kernel (compressor_slot_shift). One kernel
+        # call per buffer (4 dispatches) replaces the old 16-dispatch loop
+        # of slice + update_cache_for_token_. Compute is `out = P @ in`, then
+        # swap in/out so the rotated state is the next step's input.
         if self.overlap:
-            for buf in (self.kv_state_front_tt, self.kv_state_back_tt,
-                        self.score_state_front_tt, self.score_state_back_tt):
-                for i in range(ratio):
-                    slot_src = ttnn.slice(buf, [0, 0, ratio + i, 0],
-                                               [B, 1, ratio + i + 1, d])
-                    ttnn.kv_cache.update_cache_for_token_(buf, slot_src, i, 0)
+            if d == 512:
+                slot_shift = ttl_compressor_slot_shift_B1_pad32_d512
+            elif d == 128:
+                slot_shift = ttl_compressor_slot_shift_B1_pad32_d128
+            else:
+                raise ValueError(f"no compressor_slot_shift kernel built for d={d}")
+            if slot_shift is None:
+                raise RuntimeError(
+                    "compressor_slot_shift kernel not pre-built; "
+                    "call prebuild_ttl_decode_kernels(args) first")
+            ratio_pad = self.ratio_pad
+            P_2d = ttnn.reshape(self.shift_P_tt, [ratio_pad, ratio_pad])
+            for in_attr, out_attr in (
+                ("kv_state_front_tt", "kv_state_front_out_tt"),
+                ("kv_state_back_tt", "kv_state_back_out_tt"),
+                ("score_state_front_tt", "score_state_front_out_tt"),
+                ("score_state_back_tt", "score_state_back_out_tt"),
+            ):
+                buf_in = getattr(self, in_attr)
+                buf_out = getattr(self, out_attr)
+                slot_shift(
+                    ttnn.reshape(buf_in, [ratio_pad, d]),
+                    P_2d,
+                    ttnn.reshape(buf_out, [ratio_pad, d]),
+                )
+                setattr(self, in_attr, buf_out)
+                setattr(self, out_attr, buf_in)
 
         return kv_normed
 
