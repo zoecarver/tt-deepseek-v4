@@ -4452,8 +4452,10 @@ class DeviceCompressor(nn.Module):
 
         # Slot-shift via tt-lang kernel (compressor_slot_shift). One kernel
         # call per buffer (4 dispatches) replaces the old 16-dispatch loop
-        # of slice + update_cache_for_token_. Compute is `out = P @ in`, then
-        # swap in/out so the rotated state is the next step's input.
+        # of slice + update_cache_for_token_. Compute is `out = P @ in`;
+        # the result is copied back into the input buffer (single-tensor
+        # state with no Python attribute swap, so trace capture sees fixed
+        # tensor identities). The `_out_2d_tt` buffers act as scratch.
         if self.overlap:
             if d == 512:
                 slot_shift = ttl_compressor_slot_shift_B1_pad32_d512
@@ -4467,26 +4469,10 @@ class DeviceCompressor(nn.Module):
                     "call prebuild_ttl_decode_kernels(args) first")
             for base in ("kv_state_front", "kv_state_back",
                          "score_state_front", "score_state_back"):
-                in_4d = f"{base}_tt"
-                out_4d = f"{base}_out_tt"
-                in_2d = f"{base}_2d_tt"
-                out_2d = f"{base}_out_2d_tt"
-                slot_shift(
-                    getattr(self, in_2d),
-                    self.shift_P_tt,
-                    getattr(self, out_2d),
-                )
-                # Swap both 4D (used by kv_cache.update_cache_) and 2D
-                # (used by slot_shift / cssn) attrs together so they stay
-                # aliased to the same underlying buffers.
-                buf_in_4d = getattr(self, in_4d)
-                buf_out_4d = getattr(self, out_4d)
-                buf_in_2d = getattr(self, in_2d)
-                buf_out_2d = getattr(self, out_2d)
-                setattr(self, in_4d, buf_out_4d)
-                setattr(self, out_4d, buf_in_4d)
-                setattr(self, in_2d, buf_out_2d)
-                setattr(self, out_2d, buf_in_2d)
+                in_2d = getattr(self, f"{base}_2d_tt")
+                out_2d = getattr(self, f"{base}_out_2d_tt")
+                slot_shift(in_2d, self.shift_P_tt, out_2d)
+                ttnn.copy(out_2d, in_2d)
 
         return kv_normed
 
