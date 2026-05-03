@@ -24,7 +24,7 @@ from _refs import open_mesh, close_mesh, report_pcc, download_chip0
 
 from inference import (
     DeviceRMSNorm, _device_apply_rotary_interleaved,
-    _get_ttl_act_quant_block_kernel, _RMS_TILE,
+    _get_ttl_act_quant_block_kernel, _get_ttl_rmsnorm_kernel, _RMS_TILE,
 )
 
 
@@ -35,25 +35,76 @@ ACT_QUANT_BLOCK = 64
 MAX_SEQ_LEN = 512
 NORM_EPS = 1e-6
 B, S = 1, 1
+TILE = 32
 
 
 def make_lk_d1_kernel():
-    """Placeholder mega kernel for Lk-D1.
+    """Mega kernel for Lk-D1 = kv_norm → rotary(rope) → act_quant_block(nope).
 
-    Inputs:
-      kv:           [1, 1, head_dim] bf16  — post-wkv-all_gather
-      kv_norm_gamma:[head_dim] bf16
-      cos_full:     [max_seq_len, rope_head_dim/2] bf16
-      sin_full:     [max_seq_len, rope_head_dim/2] bf16
-      start_pos:    [1, 1] uint32
-    Output:
-      kv_out:       [1, 1, head_dim] bf16  — normed + rotated + nope-quantized
+    Composes two tt-lang dispatches (rmsnorm + act_quant_block) plus a
+    ttnn-based rotary helper, mirroring DeviceAttention.forward_device's
+    attn.kv stage exactly. Wrapper handles all the [1,1,D] ↔ [TILE,D]
+    pad/slice glue around the kernels.
     """
-    @ttl.operation(grid="auto")
+    rms_kernel = _get_ttl_rmsnorm_kernel(
+        num_row_tiles=1, h_tiles=HEAD_DIM // TILE,
+        rms_eps=NORM_EPS, inv_D=1.0 / HEAD_DIM)
+    act_kernel = _get_ttl_act_quant_block_kernel(
+        M_pad=TILE, N=NOPE_DIM, BLOCK=ACT_QUANT_BLOCK)
+
+    state: dict = {}
+
+    def _alloc_replicated_zeros(mesh, shape):
+        return ttnn.from_torch(
+            torch.zeros(*shape, dtype=torch.bfloat16),
+            device=mesh, dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+
     def lk_d1_kernel(kv, kv_norm_gamma, cos_full, sin_full, start_pos, kv_out):
-        @ttl.compute()
-        def compute():
-            pass
+        if "scratch" not in state:
+            mesh = kv.device()
+            state["scaler_tt"] = ttnn.from_torch(
+                torch.ones((TILE, TILE), dtype=torch.bfloat16),
+                device=mesh, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+            state["normed_tt"] = _alloc_replicated_zeros(mesh, (TILE, HEAD_DIM))
+            state["nope_quant_tt"] = _alloc_replicated_zeros(mesh, (TILE, NOPE_DIM))
+            state["scratch"] = True
+
+        rd_half = ROPE_HEAD_DIM // 2
+
+        # kv_norm: pad → rmsnorm → slice/reshape.
+        kv_2d = ttnn.reshape(kv, [B * S, HEAD_DIM])
+        kv_padded = ttnn.pad(
+            kv_2d, padding=[(0, TILE - B * S), (0, 0)], value=0.0)
+        rms_kernel(kv_padded, kv_norm_gamma, state["scaler_tt"], state["normed_tt"])
+        kv_normed_2d = ttnn.slice(state["normed_tt"], [0, 0], [B * S, HEAD_DIM])
+        kv_normed = ttnn.reshape(kv_normed_2d, [B, S, HEAD_DIM])
+
+        # Rotary on rope-half via the existing ttnn-based helper.
+        cos = ttnn.embedding(start_pos, cos_full, layout=ttnn.TILE_LAYOUT)
+        sin = ttnn.embedding(start_pos, sin_full, layout=ttnn.TILE_LAYOUT)
+        cos = ttnn.reshape(cos, [1, S, rd_half])
+        sin = ttnn.reshape(sin, [1, S, rd_half])
+        kv_nope = ttnn.slice(kv_normed, [0, 0, 0], [B, S, NOPE_DIM])
+        kv_rope = ttnn.slice(kv_normed, [0, 0, NOPE_DIM], [B, S, HEAD_DIM])
+        kv_rope = _device_apply_rotary_interleaved(ttnn, kv_rope, cos, sin, inverse=False)
+
+        # act_quant_block on nope-half via the existing TTL kernel.
+        nope_2d = ttnn.reshape(kv_nope, [B * S, NOPE_DIM])
+        nope_padded = ttnn.pad(
+            nope_2d, padding=[(0, TILE - B * S), (0, 0)], value=0.0)
+        act_kernel(nope_padded, state["scaler_tt"], state["nope_quant_tt"])
+        kv_nope_q_2d = ttnn.slice(state["nope_quant_tt"], [0, 0], [B * S, NOPE_DIM])
+        kv_nope_q = ttnn.reshape(kv_nope_q_2d, [B, S, NOPE_DIM])
+
+        # Concat nope_q + rope and copy into the test-provided out.
+        merged = ttnn.concat([kv_nope_q, kv_rope], dim=-1)
+        ttnn.copy(merged, kv_out)
 
     return lk_d1_kernel
 
