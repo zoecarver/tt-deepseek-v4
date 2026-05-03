@@ -478,12 +478,14 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
                     wo_a_w_tt, [g, 0, 0], [g + 1, PER_GROUP, O_LORA_RANK])
                 state["wo_a_g_2d_list"].append(
                     ttnn.reshape(wo_a_g_4d, [PER_GROUP, O_LORA_RANK]))
+        # One pad on the batch dim instead of 8.
+        o_g_padded_3d = ttnn.pad(
+            o_g, padding=[(0, 0), (0, TILE - B * S), (0, 0)], value=0.0)
         for g in range(N_GROUPS):
-            o_g_slice = ttnn.slice(o_g, [g, 0, 0], [g + 1, B * S, PER_GROUP])
-            o_g_2d = ttnn.reshape(o_g_slice, [B * S, PER_GROUP])
-            o_g_padded = ttnn.pad(
-                o_g_2d, padding=[(0, TILE - B * S), (0, 0)], value=0.0)
-            matmul_wo_a(o_g_padded, state["wo_a_g_2d_list"][g],
+            o_g_slice = ttnn.slice(
+                o_g_padded_3d, [g, 0, 0], [g + 1, TILE, PER_GROUP])
+            o_g_2d = ttnn.reshape(o_g_slice, [TILE, PER_GROUP])
+            matmul_wo_a(o_g_2d, state["wo_a_g_2d_list"][g],
                         state["o_a_padded_list"][g])
 
         # 12. Concat all 8 [TILE, O_LORA_RANK] -> [TILE, N_GROUPS*O_LORA_RANK].
