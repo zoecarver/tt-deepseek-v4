@@ -17,9 +17,11 @@ This file inlines:
   - cssn kernel factory (_make_cssn_kernel)
   - slot-shift kernel factory (_make_slot_shift_kernel)
   - SUMMA matmul factory used for Walsh-Hadamard rotation
+  - rotary swap-SUMMA + rotary-combine (same lowering as Lk-C/Lk-D1)
 
-ttnn glue (with TODO markers) covers embedding, slice/concat, rotary,
-paged_update_cache.
+ttnn glue (with TODO markers) covers embedding(start_pos, ...) for the
+cos/sin lookup, slice/reshape/concat around the rotary, and
+paged_update_cache to indexer kv_cache.
 """
 from __future__ import annotations
 
@@ -54,13 +56,11 @@ B = 1
 TILE = _RMS_TILE
 
 
-# TODO: mega fusion blocked: ttnn used for embedding(start_pos, cos/sin),
-# rotary on the rope half, and paged_update_cache(kv_cache, emit_slot).
-# Lowering them needs:
-#   - ttl.copy_indexed (runtime-indexed read of cos/sin tables and runtime
-#     write to kv_cache[emit_slot])
-#   - tt-lang rotary primitive that reads interleaved (real, imag) pairs
-#     at sub-tile granularity (same blocker tracked in Lk-C and Lk-D1).
+# TODO: mega fusion blocked: ttnn used for embedding(start_pos, cos/sin)
+# (depends on a device uint32 index, no tt-lang gather primitive) and for
+# paged_update_cache(kv_cache, emit_slot) (runtime-indexed write). The
+# rotary math itself is now in tt-lang (see _make_rotary_combine_kernel +
+# swap-SUMMA below).
 
 
 def _make_cssn_kernel(ratio: int, ratio_pad: int, d: int, rms_eps: float):
@@ -383,13 +383,84 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
     return summa_matmul
 
 
-def make_lk_d_idx_emit_kernel(mesh, sharded_input_memcfg):
+def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
+    """out = x * cos + x_swap * sin (elementwise). cos/sin tile-replicated."""
+
+    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
+    def rotary_combine(x, x_swap, cos, sin, out):
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        xs_dfb = ttl.make_dataflow_buffer_like(x_swap, shape=(1, 1), block_count=2)
+        c_dfb = ttl.make_dataflow_buffer_like(cos, shape=(1, 1), block_count=2)
+        s_dfb = ttl.make_dataflow_buffer_like(sin, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for _ in range(num_row_tiles):
+                for _ in range(num_h_tiles):
+                    xt = x_dfb.wait()
+                    xst = xs_dfb.wait()
+                    ct = c_dfb.wait()
+                    st = s_dfb.wait()
+                    out_dfb.reserve().store(xt * ct + xst * st)
+
+        @ttl.datamovement()
+        def dm_read():
+            for t in range(num_row_tiles):
+                for h in range(num_h_tiles):
+                    ttl.copy(x[t, h], x_dfb.reserve()).wait()
+                    ttl.copy(x_swap[t, h], xs_dfb.reserve()).wait()
+                    ttl.copy(cos[0, h], c_dfb.reserve()).wait()
+                    ttl.copy(sin[0, h], s_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            for t in range(num_row_tiles):
+                for h in range(num_h_tiles):
+                    ttl.copy(out_dfb.wait(), out[t, h]).wait()
+
+    return rotary_combine
+
+
+def _build_rotary_tables(cos_full_cpu: torch.Tensor, sin_full_cpu: torch.Tensor,
+                         inverse: bool):
+    """Pre-replicated cos/sin tables; see Lk-C for the shape rationale."""
+    max_seq_len, rd_half = cos_full_cpu.shape
+    rd = 2 * rd_half
+    if rd % TILE != 0:
+        raise ValueError(f"rd={rd} not multiple of TILE={TILE}")
+    cos_extended = cos_full_cpu.repeat_interleave(2, dim=-1)
+    sign = torch.ones(rd, dtype=cos_full_cpu.dtype)
+    if inverse:
+        sign[1::2] = -1
+    else:
+        sign[0::2] = -1
+    sin_signed = sin_full_cpu.repeat_interleave(2, dim=-1) * sign
+    cos_extended_packed = cos_extended.unsqueeze(1).expand(
+        max_seq_len, TILE, rd).reshape(max_seq_len, TILE * rd).contiguous()
+    sin_signed_packed = sin_signed.unsqueeze(1).expand(
+        max_seq_len, TILE, rd).reshape(max_seq_len, TILE * rd).contiguous()
+    return cos_extended_packed, sin_signed_packed
+
+
+def _build_swap_matrix(rd: int) -> torch.Tensor:
+    if rd % 2:
+        raise ValueError(f"rd={rd} must be even")
+    P = torch.zeros(rd, rd, dtype=torch.bfloat16)
+    for k in range(rd // 2):
+        P[2 * k, 2 * k + 1] = 1.0
+        P[2 * k + 1, 2 * k] = 1.0
+    return P
+
+
+def make_lk_d_idx_emit_kernel(mesh, cos_compressor_cpu, sin_compressor_cpu,
+                              sharded_input_memcfg):
     """Mega kernel for Lk-D-idx-emit.
 
     Pipeline:
       cssn -> [TILE, d] (row 0 valid)
       reshape -> [1, TILE, d]
-      slice nope/rope, rotary on rope, concat (TODO: mega - ttnn glue)
+      slice nope/rope, swap-SUMMA + rotary-combine on rope, concat
       reshape -> [TILE, d]
       SUMMA Walsh-Hadamard matmul -> [TILE, d]
       slice/reshape -> kv_normed [1, 1, d]
@@ -398,7 +469,6 @@ def make_lk_d_idx_emit_kernel(mesh, sharded_input_memcfg):
     """
     d = INDEX_HEAD_DIM
     rd = ROPE_HEAD_DIM
-    rd_half = rd // 2
 
     cssn_kernel = _make_cssn_kernel(RATIO, RATIO_PAD, d, NORM_EPS)
     slot_shift_kernel = _make_slot_shift_kernel(1, RATIO_PAD, d)
@@ -409,9 +479,26 @@ def make_lk_d_idx_emit_kernel(mesh, sharded_input_memcfg):
         M=TILE, K=d, N=d,
         block_cfg=(1, 2, 4), part_cfg=(1, 2, 1))
 
+    # Rotary swap SUMMA: M=TILE=32, K=N=rd=64. Mt=1, Kt=Nt=2.
+    # block=(1,1,2), part=(1,2,1) -> 2 cores.
+    swap_kernel = _make_summa_matmul_kernel(
+        M=TILE, K=rd, N=rd,
+        block_cfg=(1, 1, 2), part_cfg=(1, 2, 1))
+    rotary_combine_kernel = _make_rotary_combine_kernel(
+        num_row_tiles=TILE // TILE,             # 1
+        num_h_tiles=rd // TILE)                 # 2
+
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+
+    cos_ext_packed, sin_signed_packed = _build_rotary_tables(
+        cos_compressor_cpu, sin_compressor_cpu, inverse=False)
+    cos_ext_tt = ttnn.as_tensor(cos_ext_packed, dtype=ttnn.bfloat16, **rep)
+    sin_signed_tt = ttnn.as_tensor(sin_signed_packed, dtype=ttnn.bfloat16, **rep)
+    P_cpu = _build_swap_matrix(rd)
+    P_tt = ttnn.as_tensor(P_cpu.contiguous(), dtype=ttnn.bfloat16, **rep)
+
     state: dict = {}
 
     def lk_d_idx_emit_kernel(
@@ -432,6 +519,12 @@ def make_lk_d_idx_emit_kernel(mesh, sharded_input_memcfg):
             state["hada_out"] = ttnn.from_torch(
                 torch.zeros(TILE, d, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
+            state["rope_swap"] = ttnn.from_torch(
+                torch.zeros(TILE, rd, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
+            state["rope_rot"] = ttnn.from_torch(
+                torch.zeros(TILE, rd, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
             state["scratch"] = True
 
         # cssn fused softmax+sum+norm.
@@ -446,15 +539,20 @@ def make_lk_d_idx_emit_kernel(mesh, sharded_input_memcfg):
         # layout; only row 0 is valid, others are zero from cssn (gamma * 0).
         kv_3d = ttnn.reshape(state["cssn_out"], [1, TILE, d])
 
-        # Rotary on the rope half (TODO: mega).
-        cos = ttnn.embedding(start_pos, cos_compressor, layout=ttnn.TILE_LAYOUT)
-        sin = ttnn.embedding(start_pos, sin_compressor, layout=ttnn.TILE_LAYOUT)
-        cos = ttnn.reshape(cos, [1, 1, rd_half])
-        sin = ttnn.reshape(sin, [1, 1, rd_half])
+        # Rotary on the rope half via swap-SUMMA + rotary-combine.
+        # TODO: mega fusion blocked: ttnn used for embedding(start_pos, ...).
+        cos_b_2d = ttnn.embedding(start_pos, cos_ext_tt, layout=ttnn.TILE_LAYOUT)
+        sin_b_2d = ttnn.embedding(start_pos, sin_signed_tt, layout=ttnn.TILE_LAYOUT)
+        cos_b = ttnn.reshape(cos_b_2d, [TILE, rd])
+        sin_b = ttnn.reshape(sin_b_2d, [TILE, rd])
         kv_nope = ttnn.slice(kv_3d, [0, 0, 0], [1, TILE, d - rd])
         kv_rope = ttnn.slice(kv_3d, [0, 0, d - rd], [1, TILE, d])
-        kv_rope = _device_apply_rotary_interleaved(ttnn, kv_rope, cos, sin, inverse=False)
-        kv_3d = ttnn.concat([kv_nope, kv_rope], dim=-1)
+        kv_rope_2d = ttnn.reshape(kv_rope, [TILE, rd])
+        swap_kernel(kv_rope_2d, P_tt, state["rope_swap"])
+        rotary_combine_kernel(
+            kv_rope_2d, state["rope_swap"], cos_b, sin_b, state["rope_rot"])
+        kv_rope_rot_3d = ttnn.reshape(state["rope_rot"], [1, TILE, rd])
+        kv_3d = ttnn.concat([kv_nope, kv_rope_rot_3d], dim=-1)
 
         # Walsh-Hadamard rotation via inline SUMMA matmul.
         kv_2d = ttnn.reshape(kv_3d, [TILE, d])
@@ -650,7 +748,8 @@ def main():
         sc_sb_scratch2 = upload_2d(ninf_pad)
         kv_cache_tt2 = upload_2d(kv_cache_init)
 
-        kernel = make_lk_d_idx_emit_kernel(mesh, sharded_memcfg)
+        kernel = make_lk_d_idx_emit_kernel(
+            mesh, cos_compressor, sin_compressor, sharded_memcfg)
         kv_normed_out_tt = ttnn.from_torch(
             torch.zeros(1, 1, INDEX_HEAD_DIM, dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, **rep)
