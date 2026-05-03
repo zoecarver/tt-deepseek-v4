@@ -302,10 +302,10 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
     rd = ROPE_HEAD_DIM
 
     # SUMMA score: M=H=64, K=D=512, N=K=128. Mt=2, Kt=16, Nt=4.
-    # block (1, 2, 4) part (2, 2, 1): Mb=2, Nb=2, Kb=4 -> 4 cores.
+    # block (1, 1, 4) part (2, 4, 1): Mb=2, Nb=4, Kb=4 -> 8 cores.
     matmul_score = _make_summa_matmul_kernel(
         M=H, K_dim=D, N=K,
-        block_cfg=(1, 2, 4), part_cfg=(2, 2, 1))
+        block_cfg=(1, 1, 4), part_cfg=(2, 4, 1))
 
     # SUMMA output: M=H=64, K=K=128, N=D=512. Mt=2, Kt=4, Nt=16.
     # block (1, 4, 4) part (2, 4, 1): Mb=2, Nb=4, Kb=1 -> 8 cores.
@@ -361,15 +361,6 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
             state["o_padded"] = ttnn.from_torch(
                 torch.zeros(H, D, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
-            # One [TILE, O_LORA_RANK] scratch per group; concat'd at the end
-            # to assemble o_flat. (ttnn.slice returns a new tensor, so we
-            # cannot dispatch SUMMA into a sub-view of a single o_flat buffer.)
-            state["o_a_padded_list"] = [
-                ttnn.from_torch(
-                    torch.zeros(TILE, O_LORA_RANK, dtype=torch.bfloat16),
-                    dtype=ttnn.bfloat16, **rep)
-                for _ in range(N_GROUPS)
-            ]
             state["wo_b_out_padded"] = ttnn.from_torch(
                 torch.zeros(TILE, DIM, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
@@ -381,9 +372,6 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
                 dtype=ttnn.bfloat16, **rep)
             state["scores_masked_padded"] = ttnn.from_torch(
                 torch.zeros(H, K, dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
-            state["topk_idxs_bf16_padded"] = ttnn.from_torch(
-                torch.zeros(TILE, K, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
             state["init"] = True
 
@@ -404,7 +392,6 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         topk_2d = ttnn.reshape(topk_idxs_bf16, [B, K])
         topk_padded_in = ttnn.pad(
             topk_2d, padding=[(0, TILE - B), (0, 0)], value=0.0)
-        ttnn.copy(topk_padded_in, state["topk_idxs_bf16_padded"])
         safe = ttnn.clamp(topk_idxs_tt, min=0)
         safe = ttnn.reshape(safe, [B, S * K])
         safe = ttnn.typecast(safe, dtype=ttnn.uint32)
@@ -430,7 +417,7 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
 
         # 6. Multiply by softmax_scale + add bf16 sign-trick mask (fused).
         scale_mask_kernel(state["scores_padded"],
-                          state["topk_idxs_bf16_padded"],
+                          topk_padded_in,
                           state["scores_masked_padded"])
         scores_masked = ttnn.reshape(state["scores_masked_padded"], [B, S, H, K])
 
@@ -469,30 +456,17 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         o_perm = ttnn.permute(o_perm, [2, 0, 1, 3])  # [G, B, S, per_group]
         o_g = ttnn.reshape(o_perm, [N_GROUPS, B * S, PER_GROUP])
 
-        # 11. SUMMA wo_a per-group; one [TILE, O_LORA_RANK] output per group.
-        # wo_a per-group slices are constants — cache after first call.
-        if "wo_a_g_2d_list" not in state:
-            state["wo_a_g_2d_list"] = []
-            for g in range(N_GROUPS):
-                wo_a_g_4d = ttnn.slice(
-                    wo_a_w_tt, [g, 0, 0], [g + 1, PER_GROUP, O_LORA_RANK])
-                state["wo_a_g_2d_list"].append(
-                    ttnn.reshape(wo_a_g_4d, [PER_GROUP, O_LORA_RANK]))
-        # One pad on the batch dim instead of 8.
+        # 11. wo_a as a single batched matmul [G, M, K] @ [G, K, N] -> [G, M, N].
+        # TODO: mega: replace with batched-SUMMA tt-lang kernel.
         o_g_padded_3d = ttnn.pad(
             o_g, padding=[(0, 0), (0, TILE - B * S), (0, 0)], value=0.0)
-        for g in range(N_GROUPS):
-            o_g_slice = ttnn.slice(
-                o_g_padded_3d, [g, 0, 0], [g + 1, TILE, PER_GROUP])
-            o_g_2d = ttnn.reshape(o_g_slice, [TILE, PER_GROUP])
-            matmul_wo_a(o_g_2d, state["wo_a_g_2d_list"][g],
-                        state["o_a_padded_list"][g])
+        o_wo_a_g = ttnn.matmul(o_g_padded_3d, wo_a_w_tt,
+                               memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
-        # 12. Concat all 8 [TILE, O_LORA_RANK] -> [TILE, N_GROUPS*O_LORA_RANK].
-        # TODO: mega fusion blocked: ttnn used for the cross-group concat.
-        # Lowering needs a tt-lang batched-A SUMMA that writes directly into
-        # the [TILE, 8192] o_flat scratch.
-        o_flat_padded = ttnn.concat(state["o_a_padded_list"], dim=1)
+        # 12. Permute [G, TILE, O_LORA_RANK] -> [TILE, G*O_LORA_RANK].
+        o_wo_a_perm = ttnn.permute(o_wo_a_g, [1, 0, 2])
+        o_flat_padded = ttnn.reshape(
+            o_wo_a_perm, [TILE, N_GROUPS * O_LORA_RANK])
 
         # 13. SUMMA wo_b: o_flat [TILE, 8192] @ wo_b_w [8192, DIM] -> [TILE, DIM].
         matmul_wo_b(o_flat_padded, wo_b_w_tt, state["wo_b_out_padded"])
