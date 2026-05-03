@@ -16,10 +16,14 @@ import math
 import pathlib
 import sys
 
-# Make `inference` importable from the repo root.
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+# Make `inference` importable. In-repo it lives two dirs up; on the
+# remote sandbox the file is colocated with this module under /tmp.
+_HERE = pathlib.Path(__file__).resolve().parent
+for _candidate in (_HERE, *_HERE.parents):
+    if (_candidate / "inference.py").exists():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
 
 import torch  # noqa: E402
 

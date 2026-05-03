@@ -14,7 +14,7 @@ import ttl
 import _refs  # noqa: F401
 from _refs import open_mesh, close_mesh, report_pcc, download_chip0
 
-from inference import DeviceRMSNorm, _RMS_TILE
+from inference import DeviceRMSNorm, _RMS_TILE, _get_ttl_rmsnorm_kernel
 
 
 Q_LORA_RANK = 1024
@@ -23,23 +23,155 @@ HEAD_DIM = 512
 N = N_HEADS * HEAD_DIM    # 32768
 NORM_EPS = 1e-6
 B, S = 1, 1
+TILE = 32
+
+
+def _make_summa_matmul_kernel(M: int, K: int, N: int,
+                              block_cfg, part_cfg,
+                              fp32_dest_acc_en: bool = True):
+    """Pure-SUMMA matmul kernel modelled on tt-lang-kernels/attention_matmul.py.
+
+    Output = a @ w. A is row-mcast across Np cores, B is column-mcast across
+    Mp cores. Each core owns an M_BPN x N_BPN output sub-grid.
+    """
+    bm, bn, bk = block_cfg
+    Mp, Np, Kp = part_cfg
+    if Kp != 1:
+        raise ValueError(f"K_parts must be 1, got {Kp}")
+    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
+    if Mt % bm or Nt % bn or Kt % bk:
+        raise ValueError(
+            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
+            f"block=(bm={bm}, bn={bn}, bk={bk})")
+    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
+    if Mb % Mp or Nb % Np:
+        raise ValueError(
+            f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
+    M_BPN = Mb // Mp
+    N_BPN = Nb // Np
+
+    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
+    def summa_matmul(a, w, out):
+        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
+                   for m_p in range(Mp)]
+        mcast_a_net = ttl.PipeNet(a_pipes)
+        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
+                   for n_p in range(Np)]
+        mcast_b_net = ttl.PipeNet(b_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+        out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for _ in range(M_BPN):
+                for _ in range(N_BPN):
+                    p = out_cb.reserve()
+                    for _ in range(Kb):
+                        a_blk = a_cb.wait()
+                        b_blk = b_cb.wait()
+                        p += a_blk @ b_blk
+
+        @ttl.datamovement()
+        def dm_read():
+            _, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for _ in range(N_BPN):
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        a_blk = a_cb.reserve()
+
+                        def read_a(pipe):
+                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
+                            ttl.copy(a_blk, pipe).wait()
+
+                        mcast_a_net.if_src(read_a)
+                        mcast_a_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for local_nb in range(N_BPN):
+                    nb = col_c * N_BPN + local_nb
+                    nc = nb * bn
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        b_blk = b_cb.reserve()
+
+                        def read_b(pipe):
+                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                            ttl.copy(b_blk, pipe).wait()
+
+                        mcast_b_net.if_src(read_b)
+                        mcast_b_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
+                    o = out_cb.wait()
+                    ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
+
+    return summa_matmul
 
 
 def make_lk_b_kernel():
-    """Placeholder mega kernel for Lk-B.
+    """Mega kernel for Lk-B = rmsnorm(q_lora, gamma) @ wq_b.
 
-    Inputs:
-      q_lora:        [1, 1, q_lora_rank] bf16  — post-wq_a-all_gather
-      q_norm_gamma:  [q_lora_rank] bf16
-      wq_b_w:        [q_lora_rank, n_heads*head_dim] bf16
-    Output:
-      out:           [1, 1, n_heads*head_dim] bf16  — pre-wq_b-all_gather
+    Composes two tt-lang dispatches (rmsnorm + SUMMA matmul). Wrapper is
+    responsible for the [1,1,K] -> [TILE,K] padding and [TILE,N] -> [1,1,N]
+    slice/reshape glue around the kernels.
     """
-    @ttl.operation(grid="auto")
+    state: dict = {}
+    M_PAD = TILE
+    rms_kernel = _get_ttl_rmsnorm_kernel(
+        num_row_tiles=1, h_tiles=Q_LORA_RANK // TILE,
+        rms_eps=NORM_EPS, inv_D=1.0 / Q_LORA_RANK)
+    matmul_kernel = _make_summa_matmul_kernel(
+        M=M_PAD, K=Q_LORA_RANK, N=N,
+        block_cfg=(1, 8, 8), part_cfg=(1, 8, 1))
+
     def lk_b_kernel(q_lora, q_norm_gamma, wq_b_w, out):
-        @ttl.compute()
-        def compute():
-            pass
+        if "scratch" not in state:
+            mesh = q_lora.device()
+            sc_host = torch.ones((TILE, TILE), dtype=torch.bfloat16)
+            state["scaler_tt"] = ttnn.from_torch(
+                sc_host, device=mesh, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+            state["normed_tt"] = ttnn.from_torch(
+                torch.zeros((M_PAD, Q_LORA_RANK), dtype=torch.bfloat16),
+                device=mesh, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+            state["y_padded_tt"] = ttnn.from_torch(
+                torch.zeros((M_PAD, N), dtype=torch.bfloat16),
+                device=mesh, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+            state["scratch"] = True
+
+        # 1. Pad input [1, 1, K] -> [TILE, K].
+        q_2d = ttnn.reshape(q_lora, [B * S, Q_LORA_RANK])
+        x_padded = ttnn.pad(
+            q_2d, padding=[(0, M_PAD - B * S), (0, 0)], value=0.0)
+
+        # 2. RMSNorm -> normed_tt [TILE, K].
+        rms_kernel(x_padded, q_norm_gamma, state["scaler_tt"], state["normed_tt"])
+
+        # 3. Matmul -> y_padded_tt [TILE, N].
+        matmul_kernel(state["normed_tt"], wq_b_w, state["y_padded_tt"])
+
+        # 4. Slice + reshape + copy into the test-provided [1, 1, N] out.
+        y_row = ttnn.slice(state["y_padded_tt"], [0, 0], [B * S, N])
+        y_3d = ttnn.reshape(y_row, [B, S, N])
+        ttnn.copy(y_3d, out)
 
     return lk_b_kernel
 
