@@ -33,28 +33,149 @@ ROPE_HEAD_DIM = 64
 MAX_SEQ_LEN = 512
 NORM_EPS = 1e-6
 B, S = 1, 1
+TILE = 32
+
+
+def _make_summa_matmul_kernel(M: int, K: int, N: int,
+                              block_cfg, part_cfg,
+                              fp32_dest_acc_en: bool = True):
+    """Pure-SUMMA matmul kernel modelled on tt-lang-kernels/attention_matmul.py."""
+    bm, bn, bk = block_cfg
+    Mp, Np, Kp = part_cfg
+    if Kp != 1:
+        raise ValueError(f"K_parts must be 1, got {Kp}")
+    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
+    if Mt % bm or Nt % bn or Kt % bk:
+        raise ValueError(
+            f"block must divide shape: Mt={Mt} Nt={Nt} Kt={Kt} "
+            f"block=(bm={bm}, bn={bn}, bk={bk})")
+    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
+    if Mb % Mp or Nb % Np:
+        raise ValueError(f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
+    M_BPN = Mb // Mp
+    N_BPN = Nb // Np
+
+    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
+    def summa_matmul(a, w, out):
+        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
+                   for m_p in range(Mp)]
+        mcast_a_net = ttl.PipeNet(a_pipes)
+        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
+                   for n_p in range(Np)]
+        mcast_b_net = ttl.PipeNet(b_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+        out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for _ in range(M_BPN):
+                for _ in range(N_BPN):
+                    p = out_cb.reserve()
+                    for _ in range(Kb):
+                        a_blk = a_cb.wait()
+                        b_blk = b_cb.wait()
+                        p += a_blk @ b_blk
+
+        @ttl.datamovement()
+        def dm_read():
+            _, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for _ in range(N_BPN):
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        a_blk = a_cb.reserve()
+
+                        def read_a(pipe):
+                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
+                            ttl.copy(a_blk, pipe).wait()
+
+                        mcast_a_net.if_src(read_a)
+                        mcast_a_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for local_nb in range(N_BPN):
+                    nb = col_c * N_BPN + local_nb
+                    nc = nb * bn
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        b_blk = b_cb.reserve()
+
+                        def read_b(pipe):
+                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                            ttl.copy(b_blk, pipe).wait()
+
+                        mcast_b_net.if_src(read_b)
+                        mcast_b_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
+                    o = out_cb.wait()
+                    ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
+
+    return summa_matmul
 
 
 def make_lk_c_kernel():
-    """Placeholder mega kernel for Lk-C.
+    """Mega kernel for Lk-C = q_rsqrt_norm + q rotary + wkv matmul.
 
-    Inputs:
-      q_full:       [1, 1, n_heads*head_dim] bf16  — post-wq_b-all_gather
-      x:            [1, 1, dim] bf16               — residual (replicated)
-      cos_full:     [max_seq_len, rope_head_dim/2] bf16
-      sin_full:     [max_seq_len, rope_head_dim/2] bf16
-      start_pos:    [1, 1] uint32
-      wkv_w:        [dim, head_dim] bf16
-    Outputs:
-      q_out:        [1, 1, n_heads, head_dim] bf16  — rotated/normed q
-      wkv_out:      [1, 1, head_dim] bf16            — pre-wkv-all_gather
+    The q-stack tail uses ttnn helpers (q_rsqrt_norm + rotary); the wkv
+    matmul is a tt-lang SUMMA dispatch. Mirrors the wq_b → wkv slice of
+    DeviceAttention.forward_device exactly.
     """
-    @ttl.operation(grid="auto")
+    matmul_kernel = _make_summa_matmul_kernel(
+        M=TILE, K=DIM, N=HEAD_DIM,
+        block_cfg=(1, 4, 8), part_cfg=(1, 4, 1))
+    state: dict = {}
+
+    def _alloc_replicated_zeros(mesh, shape):
+        return ttnn.from_torch(
+            torch.zeros(*shape, dtype=torch.bfloat16),
+            device=mesh, dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+
     def lk_c_kernel(q_full, x, cos_full, sin_full, start_pos, wkv_w,
                     q_out, wkv_out):
-        @ttl.compute()
-        def compute():
-            pass
+        if "scratch" not in state:
+            mesh = q_full.device()
+            state["wkv_padded_tt"] = _alloc_replicated_zeros(mesh, (TILE, HEAD_DIM))
+            state["scratch"] = True
+
+        rd_half = ROPE_HEAD_DIM // 2
+
+        # q-stack tail (ttnn helpers).
+        q_tt = ttnn.reshape(q_full, [B, S, N_HEADS, HEAD_DIM])
+        q_tt = _device_q_rsqrt_norm(ttnn, q_tt, NORM_EPS)
+        cos = ttnn.embedding(start_pos, cos_full, layout=ttnn.TILE_LAYOUT)
+        sin = ttnn.embedding(start_pos, sin_full, layout=ttnn.TILE_LAYOUT)
+        cos = ttnn.reshape(cos, [1, S, 1, rd_half])
+        sin = ttnn.reshape(sin, [1, S, 1, rd_half])
+        q_nope = ttnn.slice(
+            q_tt, [0, 0, 0, 0], [B, S, N_HEADS, HEAD_DIM - ROPE_HEAD_DIM])
+        q_rope = ttnn.slice(
+            q_tt, [0, 0, 0, HEAD_DIM - ROPE_HEAD_DIM], [B, S, N_HEADS, HEAD_DIM])
+        q_rope = _device_apply_rotary_interleaved(
+            ttnn, q_rope, cos, sin, inverse=False)
+        q_full_out = ttnn.concat([q_nope, q_rope], dim=-1)
+        ttnn.copy(q_full_out, q_out)
+
+        # wkv matmul (tt-lang SUMMA).
+        x_2d = ttnn.reshape(x, [B * S, DIM])
+        x_padded = ttnn.pad(
+            x_2d, padding=[(0, TILE - B * S), (0, 0)], value=0.0)
+        matmul_kernel(x_padded, wkv_w, state["wkv_padded_tt"])
+        wkv_row = ttnn.slice(state["wkv_padded_tt"], [0, 0], [B * S, HEAD_DIM])
+        wkv_3d = ttnn.reshape(wkv_row, [B, S, HEAD_DIM])
+        ttnn.copy(wkv_3d, wkv_out)
 
     return lk_c_kernel
 
