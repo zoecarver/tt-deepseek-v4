@@ -191,15 +191,30 @@ def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
     return rotary_combine
 
 
-def _make_scale_mask_kernel(num_row_tiles: int, num_k_tiles: int, scale: float):
-    """scores * softmax_scale + valid (valid broadcast across H rows)."""
+def _make_scale_sign_mask_kernel(num_row_tiles: int, num_k_tiles: int,
+                                  scale: float, mask_amp: float):
+    """Fused scale + sign-trick mask:
+
+        masked[mt, kt] = scores[mt, kt] * softmax_scale +
+                         (sign(idx[0, kt] + 0.5) - 1) * (mask_amp / 2)
+
+    Replaces (ttnn.lt int<0 + where(-inf, 0)) + multiply(scale) + add(mask):
+      idx >= 0 -> mask = 0
+      idx < 0  -> mask = -mask_amp  (functionally -inf for softmax)
+    idx is broadcast across the H (row) tiles.
+    """
+    half_amp = mask_amp / 2.0
 
     @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
-    def scale_mask(scores, valid, masked_out):
+    def scale_sign_mask(scores, idxs_bf16, masked_out):
         scores_dfb = ttl.make_dataflow_buffer_like(
             scores, shape=(1, 1), block_count=2)
-        valid_dfb = ttl.make_dataflow_buffer_like(
-            valid, shape=(1, 1), block_count=2)
+        idxs_dfb = ttl.make_dataflow_buffer_like(
+            idxs_bf16, shape=(1, 1), block_count=2)
+        # Scratch CB for the mask term; mixing it with scores in one store
+        # mis-compiles (collapses the scaled term to 0). Stage separately.
+        mask_dfb = ttl.make_dataflow_buffer_like(
+            masked_out, shape=(1, 1), block_count=2)
         out_dfb = ttl.make_dataflow_buffer_like(
             masked_out, shape=(1, 1), block_count=2)
 
@@ -208,16 +223,20 @@ def _make_scale_mask_kernel(num_row_tiles: int, num_k_tiles: int, scale: float):
             for kt in range(num_k_tiles):
                 for _ in range(num_row_tiles):
                     s = scores_dfb.wait()
-                    v = valid_dfb.wait()
-                    out_dfb.reserve().store(
-                        s * ttl.math.fill(s, scale) + v)
+                    i = idxs_dfb.wait()
+                    mask_dfb.reserve().store(
+                        (ttl.math.sign(i + ttl.math.fill(i, 0.5))
+                         - ttl.math.fill(i, 1.0))
+                        * ttl.math.fill(i, half_amp))
+                    m = mask_dfb.wait()
+                    out_dfb.reserve().store(s * ttl.math.fill(s, scale) + m)
 
         @ttl.datamovement()
         def dm_read():
             for kt in range(num_k_tiles):
                 for mt in range(num_row_tiles):
                     ttl.copy(scores[mt, kt], scores_dfb.reserve()).wait()
-                    ttl.copy(valid[0, kt], valid_dfb.reserve()).wait()
+                    ttl.copy(idxs_bf16[0, kt], idxs_dfb.reserve()).wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -225,7 +244,7 @@ def _make_scale_mask_kernel(num_row_tiles: int, num_k_tiles: int, scale: float):
                 for mt in range(num_row_tiles):
                     ttl.copy(out_dfb.wait(), masked_out[mt, kt]).wait()
 
-    return scale_mask
+    return scale_sign_mask
 
 
 def _build_rotary_tables(cos_full_cpu: torch.Tensor, sin_full_cpu: torch.Tensor,
@@ -314,9 +333,10 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
     rotary_combine_kernel = _make_rotary_combine_kernel(
         num_row_tiles=H // TILE, num_h_tiles=rd // TILE)
 
-    # Score scale + masked add: scores [H, K] * scale + valid [TILE, K] (bcast).
-    scale_mask_kernel = _make_scale_mask_kernel(
-        num_row_tiles=H // TILE, num_k_tiles=K // TILE, scale=softmax_scale)
+    # Score scale + sign-trick mask: scores [H, K] * scale + sign_mask(idx_bf16).
+    scale_mask_kernel = _make_scale_sign_mask_kernel(
+        num_row_tiles=H // TILE, num_k_tiles=K // TILE,
+        scale=softmax_scale, mask_amp=1.0e4)
 
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -362,7 +382,7 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
             state["scores_masked_padded"] = ttnn.from_torch(
                 torch.zeros(H, K, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
-            state["valid_padded"] = ttnn.from_torch(
+            state["topk_idxs_bf16_padded"] = ttnn.from_torch(
                 torch.zeros(TILE, K, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
             state["init"] = True
@@ -375,18 +395,16 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         ttnn.experimental.paged_update_cache(
             kv_cache_tt, kv_4d_sharded, update_idxs_tensor=kv_slot_tt)
 
-        # 2. Build idxs_uint32_rm + valid mask from topk_idxs_int.
-        # TODO: mega fusion blocked: ttnn used for lt/where/clamp/typecast/
-        # to_layout. Lowering needs tt-lang int compare + bool->bf16 cast +
-        # tile<->row-major converter.
-        cond = ttnn.lt(topk_idxs_tt, 0)
-        cond_4d = ttnn.reshape(cond, [B, S, 1, K])
-        valid_4d = ttnn.where(cond_4d, float("-inf"), 0.0)
-        # 2D-pad valid for the tt-lang scale_mask kernel input (broadcast across H).
-        valid_2d = ttnn.reshape(valid_4d, [B, K])
-        valid_padded_in = ttnn.pad(
-            valid_2d, padding=[(0, TILE - B), (0, 0)], value=0.0)
-        ttnn.copy(valid_padded_in, state["valid_padded"])
+        # 2. Build idxs_uint32_rm + bf16 topk idxs for the fused mask kernel.
+        # Mask construction (lt + where(-inf, 0)) is folded into the tt-lang
+        # scale_sign_mask kernel below via the bf16 sign trick.
+        # TODO: mega fusion blocked: ttnn used for clamp/typecast/to_layout.
+        # Lowering needs tt-lang int->uint32 cast + tile<->row-major converter.
+        topk_idxs_bf16 = ttnn.typecast(topk_idxs_tt, dtype=ttnn.bfloat16)
+        topk_2d = ttnn.reshape(topk_idxs_bf16, [B, K])
+        topk_padded_in = ttnn.pad(
+            topk_2d, padding=[(0, TILE - B), (0, 0)], value=0.0)
+        ttnn.copy(topk_padded_in, state["topk_idxs_bf16_padded"])
         safe = ttnn.clamp(topk_idxs_tt, min=0)
         safe = ttnn.reshape(safe, [B, S * K])
         safe = ttnn.typecast(safe, dtype=ttnn.uint32)
@@ -410,8 +428,9 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         q_2d = ttnn.reshape(q_tt, [H, D])
         matmul_score(q_2d, kv_gather_t_2d, state["scores_padded"])
 
-        # 6. Multiply by softmax_scale + add mask (fused tt-lang kernel).
-        scale_mask_kernel(state["scores_padded"], state["valid_padded"],
+        # 6. Multiply by softmax_scale + add bf16 sign-trick mask (fused).
+        scale_mask_kernel(state["scores_padded"],
+                          state["topk_idxs_bf16_padded"],
                           state["scores_masked_padded"])
         scores_masked = ttnn.reshape(state["scores_masked_padded"], [B, S, H, K])
 
