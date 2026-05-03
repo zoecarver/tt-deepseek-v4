@@ -34,7 +34,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 from inference import (
     _device_apply_rotary_interleaved, _device_q_rsqrt_norm,
@@ -510,6 +510,16 @@ def main():
 
         ok_q = report_pcc("Lk-C/q", ref_q_host, kernel_q_host)
         ok_kv = report_pcc("Lk-C/wkv", ref_wkv_host, kernel_wkv_host)
+
+        benchmark("Lk-C ref",
+                  lambda: reference(mesh, q_full_tt, x_tt, cos_full_tt,
+                                    sin_full_tt, start_pos_tt, wkv_w_tt),
+                  mesh)
+        benchmark("Lk-C ttl",
+                  lambda: kernel(q_full_tt, x_tt, cos_full_tt, sin_full_tt,
+                                 start_pos_tt, wkv_w_tt, q_out_tt, wkv_out_tt),
+                  mesh)
+
         sys.exit(0 if (ok_q and ok_kv) else 1)
     finally:
         close_mesh(mesh)

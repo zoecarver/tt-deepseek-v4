@@ -31,7 +31,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 
 DIM = 4096
@@ -428,6 +428,16 @@ def main():
         kernel_host = download_chip0(mesh, mesh_shape, kernel_out_tt)
 
         ok = report_pcc("Lk-F", ref_host, kernel_host)
+
+        benchmark("Lk-F ref",
+                  lambda: reference(mesh, x_tt, gate_w_tt, gate_bias_tt,
+                                    w1_tt, w2_tt, w3_tt, chip_ids_tt, per_chip),
+                  mesh)
+        benchmark("Lk-F ttl",
+                  lambda: kernel(x_tt, gate_w_tt, gate_bias_tt,
+                                 w1_tt, w2_tt, w3_tt, chip_ids_tt),
+                  mesh)
+
         sys.exit(0 if ok else 1)
     finally:
         close_mesh(mesh)

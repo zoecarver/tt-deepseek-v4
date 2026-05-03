@@ -19,7 +19,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 from inference import (
     DeviceMHC, DeviceRMSNorm, _MHC_TILE, _MHC_PAD_SENTINEL,
@@ -1036,6 +1036,20 @@ def main():
 
         ok_p = report_pcc("Lk-E/shared", ref_partial_host, kernel_partial_host)
         ok_a = report_pcc("Lk-E/next_a", ref_next_a_host, kernel_next_a_host)
+
+        benchmark("Lk-E ref",
+                  lambda: reference(
+                      mesh, attn_out_tt, prev_a_tt,
+                      hc_attn_fn, hc_attn_scale, hc_attn_base,
+                      hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+                      attn_norm_gamma, ffn_norm_gamma,
+                      w1_tt, w2_tt, w3_tt),
+                  mesh)
+        benchmark("Lk-E ttl",
+                  lambda: kernel(attn_out_tt, prev_a_tt, w1_tt, w2_tt, w3_tt,
+                                 partial_out_tt, next_a_tt),
+                  mesh)
+
         sys.exit(0 if (ok_p and ok_a) else 1)
     finally:
         close_mesh(mesh)
