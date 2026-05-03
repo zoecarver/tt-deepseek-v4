@@ -93,6 +93,34 @@ def alloc_replicated(mesh, shape, dtype, layout=None,
     )
 
 
+def benchmark(label: str, thunk, mesh,
+              warmup: int = 2, runs: int = 5,
+              sleep_ms: int = 5) -> float:
+    """Warmup + timed runs. Returns min wall-time in seconds.
+
+    `thunk()` should run the full kernel chain end-to-end. The kernel is
+    expected to write into pre-allocated outputs (no per-call allocs).
+    """
+    import time
+    import ttnn
+    for _ in range(warmup):
+        thunk()
+    ttnn.synchronize_device(mesh)
+    times = []
+    for _ in range(runs):
+        if sleep_ms:
+            time.sleep(sleep_ms / 1000)
+        t0 = time.perf_counter()
+        thunk()
+        ttnn.synchronize_device(mesh)
+        times.append(time.perf_counter() - t0)
+    best = min(times)
+    median = sorted(times)[len(times) // 2]
+    print(f"[bench {label}] best={best * 1e3:.3f}ms "
+          f"median={median * 1e3:.3f}ms over {runs} runs")
+    return best
+
+
 def download_chip0(mesh, mesh_shape, t_tt) -> torch.Tensor:
     """Download a replicated tensor and return chip (0,0)'s view, sliced
     back to the logical shape (mirrors `_readback_replicated_2d` in

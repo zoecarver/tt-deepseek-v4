@@ -18,7 +18,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 from inference import DeviceRMSNorm, _RMS_TILE
 
@@ -327,6 +327,22 @@ def main():
         kernel_host = download_chip0(mesh, mesh_shape, out_tt)
 
         ok = report_pcc("Lk-B", ref_host, kernel_host)
+
+        # Benchmarks: ref vs tt-lang kernel. The kernel's scratch state is
+        # already warm from the PCC run above; benchmark() does its own
+        # warmup runs too.
+        ref_thunks_out = []
+
+        def ref_thunk():
+            r = reference(mesh, q_lora_tt, gamma, wq_b_w_tt)
+            ref_thunks_out.append(r)
+
+        def kernel_thunk():
+            kernel(q_lora_tt, wq_b_w_tt, out_tt)
+
+        benchmark("Lk-B ref", ref_thunk, mesh)
+        benchmark("Lk-B ttl", kernel_thunk, mesh)
+
         sys.exit(0 if ok else 1)
     finally:
         close_mesh(mesh)
