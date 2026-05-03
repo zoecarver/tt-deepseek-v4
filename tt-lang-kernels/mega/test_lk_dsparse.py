@@ -470,17 +470,21 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         o_g = ttnn.reshape(o_perm, [N_GROUPS, B * S, PER_GROUP])
 
         # 11. SUMMA wo_a per-group; one [TILE, O_LORA_RANK] output per group.
+        # wo_a per-group slices are constants — cache after first call.
+        if "wo_a_g_2d_list" not in state:
+            state["wo_a_g_2d_list"] = []
+            for g in range(N_GROUPS):
+                wo_a_g_4d = ttnn.slice(
+                    wo_a_w_tt, [g, 0, 0], [g + 1, PER_GROUP, O_LORA_RANK])
+                state["wo_a_g_2d_list"].append(
+                    ttnn.reshape(wo_a_g_4d, [PER_GROUP, O_LORA_RANK]))
         for g in range(N_GROUPS):
             o_g_slice = ttnn.slice(o_g, [g, 0, 0], [g + 1, B * S, PER_GROUP])
             o_g_2d = ttnn.reshape(o_g_slice, [B * S, PER_GROUP])
             o_g_padded = ttnn.pad(
                 o_g_2d, padding=[(0, TILE - B * S), (0, 0)], value=0.0)
-
-            wo_a_g_4d = ttnn.slice(
-                wo_a_w_tt, [g, 0, 0], [g + 1, PER_GROUP, O_LORA_RANK])
-            wo_a_g_2d = ttnn.reshape(wo_a_g_4d, [PER_GROUP, O_LORA_RANK])
-
-            matmul_wo_a(o_g_padded, wo_a_g_2d, state["o_a_padded_list"][g])
+            matmul_wo_a(o_g_padded, state["wo_a_g_2d_list"][g],
+                        state["o_a_padded_list"][g])
 
         # 12. Concat all 8 [TILE, O_LORA_RANK] -> [TILE, N_GROUPS*O_LORA_RANK].
         # TODO: mega fusion blocked: ttnn used for the cross-group concat.
