@@ -6,8 +6,10 @@ layer 0) and the wq_a all_gather. Specifically: `DeviceMHC.hc_pre_device`
 + ttnn.typecast + `DeviceRMSNorm.forward_device` + ttnn.slice + reshape +
 `ttnn.matmul(wq_a)`. The all_gather after the matmul is excluded.
 
-Placeholder mega kernel has empty compute; PCC is expected to fail
-today and pass once the real kernel is implemented.
+All tt-lang kernel definitions are inlined in this file (mhc_norm_fn_ksplit
++ mhc_split_mixes + mhc_sinkhorn + mhc_apply_mix_h + rmsnorm + SUMMA matmul).
+The reference path still calls into inference.py's wrappers so the
+comparison is apples-to-apples.
 """
 from __future__ import annotations
 
@@ -17,10 +19,13 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401  (sets up sys.path for `inference` import)
-from _refs import (open_mesh, close_mesh, report_pcc, download_chip0,
-                   DEFAULT_MESH_SHAPE)
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0
 
-from inference import DeviceMHC, DeviceRMSNorm, _MHC_TILE
+from inference import (
+    DeviceMHC, DeviceRMSNorm, _MHC_TILE, _MHC_PAD_SENTINEL,
+    _MHC_POST_MULT, _mhc_pack_fn, _mhc_build_split_constant_tiles,
+    _mhc_sinkhorn_mask_tile, _mhc_sinkhorn_eps_mask_tile,
+)
 
 
 # V4-Flash decode shape.
@@ -34,28 +39,781 @@ HC_EPS = 1e-6
 HC_SINKHORN_ITERS = 20
 NUM_TOKENS = 1
 NUM_TOKENS_PAD = _MHC_TILE                      # 32
+TILE = 32
+NORM_FN_KP = 8
 
 
-def make_lk_a_kernel():
-    """Placeholder mega kernel for Lk-A.
-
-    Inputs (logical shapes; format is whatever the eventual kernel needs):
-      a:                [num_tokens_pad, D] fp32    — residual stream
-      hc_fn_packed:     [D, _MHC_TILE]    fp32      — _mhc_pack_fn output
-      hc_scale:         [3]               fp32
-      hc_base:          [mhc_mult3]       fp32
-      attn_norm_gamma:  [hidden]          bf16
-      wq_a_w:           [hidden, q_lora_rank] bf16
-    Output:
-      out:              [1, 1, q_lora_rank] bf16    — pre-all_gather wq_a partial
-    Empty compute → PCC fails today.
+def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
+                                    rms_eps: float, inv_D: float,
+                                    *, grid_cols: int = 8):
+    """K-axis-parallel mhc norm_fn for num_out_tiles=1 (decode).
+    Inlined from inference.py / tt-lang-kernels/pre_norm_fn_ksplit.py.
     """
-    @ttl.operation(grid="auto")
-    def lk_a_kernel(a, hc_fn_packed, hc_scale, hc_base,
-                    attn_norm_gamma, wq_a_w, out):
+    if Kp < 2:
+        raise ValueError(f"ksplit kernel requires Kp >= 2, got {Kp}")
+    if K_tiles % Kp:
+        raise ValueError(f"K_tiles={K_tiles} not divisible by Kp={Kp}")
+    if Kp < grid_cols:
+        grid_cols = Kp
+    if Kp % grid_cols:
+        raise ValueError(f"Kp={Kp} not divisible by grid_cols={grid_cols}")
+    if Kp - 1 > 32:
+        raise ValueError(f"Kp={Kp} requires block_count={Kp-1} > 32")
+
+    K_BPN = K_tiles // Kp
+    COL = grid_cols
+    ROW = Kp // grid_cols
+
+    @ttl.operation(
+        grid=(COL, ROW),
+        options="--no-ttl-reduce-full-fp32",
+        fp32_dest_acc_en=True,
+    )
+    def norm_fn_ksplit_kernel(a, b, scaler, out):
+        c_reduce_pipes = [
+            ttl.Pipe(src=(col, row), dst=(0, 0))
+            for row in range(ROW)
+            for col in range(COL)
+            if not (col == 0 and row == 0)
+        ]
+        c_reduce_net = ttl.PipeNet(c_reduce_pipes)
+
+        sq_reduce_pipes = [
+            ttl.Pipe(src=(col, row), dst=(0, 0))
+            for row in range(ROW)
+            for col in range(COL)
+            if not (col == 0 and row == 0)
+        ]
+        sq_reduce_net = ttl.PipeNet(sq_reduce_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(b, shape=(1, 1), block_count=2)
+        sc_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        c_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        sq_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        inv_bc_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        asq_cb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
+        red_step_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+
+        recv_c_cb = ttl.make_dataflow_buffer_like(
+            out, shape=(1, 1), block_count=max(2, Kp - 1))
+        recv_sq_cb = ttl.make_dataflow_buffer_like(
+            scaler, shape=(1, 1), block_count=max(2, Kp - 1))
+
         @ttl.compute()
         def compute():
-            pass
+            col_c, row_c = ttl.node(dims=2)
+            sc = sc_cb.wait()
+
+            a0 = a_cb.wait()
+            b0 = b_cb.wait()
+            c_cb.reserve().store(a0 @ b0)
+            asq_cb.reserve().store(a0 * a0)
+            sq_cb.reserve().store(
+                ttl.math.reduce_sum(asq_cb.wait(), sc, dims=[1])
+            )
+
+            for _ in range(K_BPN - 1):
+                ak = a_cb.wait()
+                bk = b_cb.wait()
+                prev_c = c_cb.wait()
+                c_cb.reserve().store(prev_c + ak @ bk)
+
+                asq_cb.reserve().store(ak * ak)
+                red_step_cb.reserve().store(
+                    ttl.math.reduce_sum(asq_cb.wait(), sc, dims=[1])
+                )
+                prev_sq = sq_cb.wait()
+                sq_cb.reserve().store(prev_sq + red_step_cb.wait())
+
+            if col_c == 0 and row_c == 0:
+                for _ in range(Kp - 1):
+                    prev_c = c_cb.wait()
+                    r = recv_c_cb.wait()
+                    new_c = c_cb.reserve()
+                    new_c.store(prev_c + r)
+                for _ in range(Kp - 1):
+                    prev_sq = sq_cb.wait()
+                    r = recv_sq_cb.wait()
+                    new_sq = sq_cb.reserve()
+                    new_sq.store(prev_sq + r)
+
+                sq_total = sq_cb.wait()
+                inv_bc = inv_bc_cb.reserve()
+                inv_bc.store(ttl.math.broadcast(
+                    ttl.math.rsqrt(
+                        sq_total * ttl.math.fill(sq_total, inv_D)
+                        + ttl.math.fill(sq_total, rms_eps)
+                    ),
+                    inv_bc, dims=[1],
+                ))
+                c_total = c_cb.wait()
+                out_cb.reserve().store(c_total * inv_bc_cb.wait())
+
+        @ttl.datamovement()
+        def dm_read():
+            col_c, row_c = ttl.node(dims=2)
+            k_p = row_c * COL + col_c
+
+            ttl.copy(scaler[0, 0], sc_cb.reserve()).wait()
+
+            for kb_local in range(K_BPN):
+                kc = k_p * K_BPN + kb_local
+                ttl.copy(a[0, kc], a_cb.reserve()).wait()
+                ttl.copy(b[kc, 0], b_cb.reserve()).wait()
+
+            is_root = (col_c == 0 and row_c == 0)
+            if is_root:
+                def recv_c(pipe):
+                    blk = recv_c_cb.reserve()
+                    ttl.copy(pipe, blk).wait()
+                c_reduce_net.if_dst(recv_c)
+
+                def recv_sq(pipe):
+                    blk = recv_sq_cb.reserve()
+                    ttl.copy(pipe, blk).wait()
+                sq_reduce_net.if_dst(recv_sq)
+            else:
+                p_c = c_cb.wait()
+
+                def send_c(pipe):
+                    ttl.copy(p_c, pipe).wait()
+                c_reduce_net.if_src(send_c)
+
+                p_sq = sq_cb.wait()
+
+                def send_sq(pipe):
+                    ttl.copy(p_sq, pipe).wait()
+                sq_reduce_net.if_src(send_sq)
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, row_c = ttl.node(dims=2)
+            if col_c == 0 and row_c == 0:
+                ttl.copy(out_cb.wait(), out[0, 0]).wait()
+
+    return norm_fn_ksplit_kernel
+
+
+def _make_mhc_split_mixes_kernel(num_tiles: int):
+    """Per-token elementwise split of mixes into pre/post/comb sections.
+    Inlined from inference.py / tt-lang-kernels/pre_split_mixes.py.
+    """
+
+    @ttl.operation(grid="auto")
+    def split_mixes_kernel(
+        input_mixes, scale_tile, base_tile,
+        pre_mask, pre_eps_tile, post_mult_mask, comb_mask,
+        pre_out, post_out, comb_out,
+    ):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        tiles_per_core = -(-num_tiles // total_cores)
+
+        in_dfb = ttl.make_dataflow_buffer_like(input_mixes, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scale_tile, shape=(1, 1), block_count=1)
+        base_dfb = ttl.make_dataflow_buffer_like(base_tile, shape=(1, 1), block_count=1)
+        prem_dfb = ttl.make_dataflow_buffer_like(pre_mask, shape=(1, 1), block_count=1)
+        preeps_dfb = ttl.make_dataflow_buffer_like(pre_eps_tile, shape=(1, 1), block_count=1)
+        postmm_dfb = ttl.make_dataflow_buffer_like(post_mult_mask, shape=(1, 1), block_count=1)
+        combm_dfb = ttl.make_dataflow_buffer_like(comb_mask, shape=(1, 1), block_count=1)
+
+        sig_dfb = ttl.make_dataflow_buffer_like(input_mixes, shape=(1, 1), block_count=2)
+
+        pre_out_dfb = ttl.make_dataflow_buffer_like(pre_out, shape=(1, 1), block_count=2)
+        post_out_dfb = ttl.make_dataflow_buffer_like(post_out, shape=(1, 1), block_count=2)
+        comb_out_dfb = ttl.make_dataflow_buffer_like(comb_out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            sc = sc_dfb.wait()
+            base = base_dfb.wait()
+            prem = prem_dfb.wait()
+            preeps = preeps_dfb.wait()
+            postmm = postmm_dfb.wait()
+            combm = combm_dfb.wait()
+
+            for local_i in range(tiles_per_core):
+                global_i = core_idx * tiles_per_core + local_i
+                if global_i < num_tiles:
+                    inp = in_dfb.wait()
+                    sig_dfb.reserve().store(ttl.math.sigmoid(inp * sc + base))
+                    comb_out_dfb.reserve().store((inp * sc + base) * combm)
+
+                    sig = sig_dfb.wait()
+                    pre_out_dfb.reserve().store(sig * prem + preeps)
+                    post_out_dfb.reserve().store(sig * postmm)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            ttl.copy(scale_tile[0, 0], sc_dfb.reserve()).wait()
+            ttl.copy(base_tile[0, 0], base_dfb.reserve()).wait()
+            ttl.copy(pre_mask[0, 0], prem_dfb.reserve()).wait()
+            ttl.copy(pre_eps_tile[0, 0], preeps_dfb.reserve()).wait()
+            ttl.copy(post_mult_mask[0, 0], postmm_dfb.reserve()).wait()
+            ttl.copy(comb_mask[0, 0], combm_dfb.reserve()).wait()
+            for local_i in range(tiles_per_core):
+                global_i = core_idx * tiles_per_core + local_i
+                if global_i < num_tiles:
+                    ttl.copy(input_mixes[global_i, 0], in_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_i in range(tiles_per_core):
+                global_i = core_idx * tiles_per_core + local_i
+                if global_i < num_tiles:
+                    ttl.copy(pre_out_dfb.wait(), pre_out[global_i, 0]).wait()
+                    ttl.copy(post_out_dfb.wait(), post_out[global_i, 0]).wait()
+                    ttl.copy(comb_out_dfb.wait(), comb_out[global_i, 0]).wait()
+
+    return split_mixes_kernel
+
+
+def _make_mhc_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
+    """Per-slice iterative softmax + alternating row/col normalize.
+    Inlined from inference.py / tt-lang-kernels/sinkhorn.py.
+    """
+
+    @ttl.operation(grid="auto", options="--no-ttl-reduce-full-fp32")
+    def sinkhorn_kernel(x, mask, eps_mask, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        slices_per_core = -(-num_slices // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        m_dfb = ttl.make_dataflow_buffer_like(mask, shape=(1, 1), block_count=1)
+        em_dfb = ttl.make_dataflow_buffer_like(eps_mask, shape=(1, 1), block_count=1)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        state_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        state_copy_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        exp_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            sc = sc_dfb.wait()
+            m = m_dfb.wait()
+            em = em_dfb.wait()
+
+            for local_i in range(slices_per_core):
+                global_i = core_idx * slices_per_core + local_i
+                if global_i < num_slices:
+                    # Row softmax: state := softmax(x, dim=-1)
+                    x_in = x_dfb.wait()
+                    red_dfb.reserve().store(ttl.math.reduce_max(x_in, sc, dims=[1]))
+                    rmx = bc_dfb.reserve()
+                    rmx.store(ttl.math.broadcast(red_dfb.wait(), rmx, dims=[1]))
+                    exp_dfb.reserve().store(ttl.math.exp(x_in - bc_dfb.wait()))
+
+                    ex = exp_dfb.wait()
+                    red_dfb.reserve().store(ttl.math.reduce_sum(ex, sc, dims=[1]))
+                    state_copy_dfb.reserve().store(ex)
+                    rinv = bc_dfb.reserve()
+                    rinv.store(ttl.math.broadcast(ttl.math.recip(red_dfb.wait()), rinv, dims=[1]))
+                    state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                    # Mask + eps: state := state * mask + eps_mask
+                    state_copy_dfb.reserve().store(state_dfb.wait() * m + em)
+                    state_dfb.reserve().store(state_copy_dfb.wait())
+
+                    # First col-normalize: state := state / (col_sum + eps)
+                    s = state_dfb.wait()
+                    red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[0]))
+                    state_copy_dfb.reserve().store(s)
+                    cinv = bc_dfb.reserve()
+                    csum = red_dfb.wait()
+                    cinv.store(ttl.math.broadcast(
+                        ttl.math.recip(csum + ttl.math.fill(csum, eps)),
+                        cinv, dims=[0]))
+                    state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                    for _ in range(repeat - 1):
+                        s = state_dfb.wait()
+                        red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[1]))
+                        state_copy_dfb.reserve().store(s)
+                        rinv = bc_dfb.reserve()
+                        rsum = red_dfb.wait()
+                        rinv.store(ttl.math.broadcast(
+                            ttl.math.recip(rsum + ttl.math.fill(rsum, eps)),
+                            rinv, dims=[1]))
+                        state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                        s = state_dfb.wait()
+                        red_dfb.reserve().store(ttl.math.reduce_sum(s, sc, dims=[0]))
+                        state_copy_dfb.reserve().store(s)
+                        cinv = bc_dfb.reserve()
+                        csum = red_dfb.wait()
+                        cinv.store(ttl.math.broadcast(
+                            ttl.math.recip(csum + ttl.math.fill(csum, eps)),
+                            cinv, dims=[0]))
+                        state_dfb.reserve().store(state_copy_dfb.wait() * bc_dfb.wait())
+
+                    out_dfb.reserve().store(state_dfb.wait())
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            ttl.copy(mask[0, 0], m_dfb.reserve()).wait()
+            ttl.copy(eps_mask[0, 0], em_dfb.reserve()).wait()
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for local_i in range(slices_per_core):
+                global_i = core_idx * slices_per_core + local_i
+                if global_i < num_slices:
+                    ttl.copy(x[global_i, 0], x_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_i in range(slices_per_core):
+                global_i = core_idx * slices_per_core + local_i
+                if global_i < num_slices:
+                    ttl.copy(out_dfb.wait(), out[global_i, 0]).wait()
+
+    return sinkhorn_kernel
+
+
+def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
+    """h-axis-sharded apply_mix. Per-(token, h-tile): out[t, h] = sum_m x[t,m,h] * mix[t,m].
+    Inlined from inference.py / tt-lang-kernels/pre_apply_mix_h.py.
+    """
+    total_work = num_tokens * h_tiles
+
+    @ttl.operation(grid="auto")
+    def apply_mix_h_kernel(x, mix, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        work_per_core = -(-total_work // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        mix_dfb = ttl.make_dataflow_buffer_like(mix, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        mix_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        prod_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            sc = sc_dfb.wait()
+
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    mix_raw = mix_dfb.wait()
+                    mx = mix_bc_dfb.reserve()
+                    mx.store(ttl.math.broadcast(mix_raw, mx, dims=[1]))
+                    mix_bc = mix_bc_dfb.wait()
+
+                    x_tile = x_dfb.wait()
+                    prod_dfb.reserve().store(x_tile * mix_bc)
+                    red_dfb.reserve().store(
+                        ttl.math.reduce_sum(prod_dfb.wait(), sc, dims=[0])
+                    )
+                    out_dfb.reserve().store(red_dfb.wait())
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    global_t = global_w // h_tiles
+                    global_h = global_w % h_tiles
+                    ttl.copy(mix[global_t, 0], mix_dfb.reserve()).wait()
+                    ttl.copy(x[global_t, global_h], x_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    global_t = global_w // h_tiles
+                    global_h = global_w % h_tiles
+                    ttl.copy(out_dfb.wait(), out[global_t, global_h]).wait()
+
+    return apply_mix_h_kernel
+
+
+def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
+                         rms_eps: float, inv_D: float):
+    """RMSNorm kernel inlined from inference.py / tt-lang-kernels/rmsnorm.py."""
+
+    @ttl.operation(
+        grid="auto",
+        options="--no-ttl-reduce-full-fp32",
+        fp32_dest_acc_en=True,
+    )
+    def rmsnorm_kernel(x, gamma, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        tiles_per_core = -(-num_row_tiles // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        g_dfb = ttl.make_dataflow_buffer_like(gamma, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        xsq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        red_step_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        inv_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            sc = sc_dfb.wait()
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    x0 = x_dfb.wait()
+                    xsq_dfb.reserve().store(x0 * x0)
+                    sq_dfb.reserve().store(
+                        ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
+                    )
+                    for _ in range(h_tiles - 1):
+                        xk = x_dfb.wait()
+                        xsq_dfb.reserve().store(xk * xk)
+                        red_step_dfb.reserve().store(
+                            ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
+                        )
+                        prev = sq_dfb.wait()
+                        sq_dfb.reserve().store(prev + red_step_dfb.wait())
+
+                    sq = sq_dfb.wait()
+                    inv_bc = inv_bc_dfb.reserve()
+                    inv_bc.store(ttl.math.broadcast(
+                        ttl.math.rsqrt(
+                            sq * ttl.math.fill(sq, inv_D)
+                            + ttl.math.fill(sq, rms_eps)
+                        ),
+                        inv_bc, dims=[1],
+                    ))
+                    inv = inv_bc_dfb.wait()
+
+                    for _ in range(h_tiles):
+                        xk = x_dfb.wait()
+                        gk = g_dfb.wait()
+                        out_dfb.reserve().store(xk * gk * inv)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    for h in range(h_tiles):
+                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
+                    for h in range(h_tiles):
+                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
+                        ttl.copy(gamma[0, h], g_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    for h in range(h_tiles):
+                        ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
+
+    return rmsnorm_kernel
+
+
+def _make_summa_matmul_kernel(M: int, K: int, N: int,
+                              block_cfg, part_cfg,
+                              fp32_dest_acc_en: bool = True):
+    """Pure-SUMMA matmul kernel modelled on tt-lang-kernels/attention_matmul.py."""
+    bm, bn, bk = block_cfg
+    Mp, Np, Kp = part_cfg
+    if Kp != 1:
+        raise ValueError(f"K_parts must be 1, got {Kp}")
+    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
+    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
+    M_BPN = Mb // Mp
+    N_BPN = Nb // Np
+
+    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
+    def summa_matmul(a, w, out):
+        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
+                   for m_p in range(Mp)]
+        mcast_a_net = ttl.PipeNet(a_pipes)
+        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
+                   for n_p in range(Np)]
+        mcast_b_net = ttl.PipeNet(b_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+        out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for _ in range(M_BPN):
+                for _ in range(N_BPN):
+                    p = out_cb.reserve()
+                    for _ in range(Kb):
+                        a_blk = a_cb.wait()
+                        b_blk = b_cb.wait()
+                        p += a_blk @ b_blk
+
+        @ttl.datamovement()
+        def dm_read():
+            _, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for _ in range(N_BPN):
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        a_blk = a_cb.reserve()
+
+                        def read_a(pipe):
+                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
+                            ttl.copy(a_blk, pipe).wait()
+
+                        mcast_a_net.if_src(read_a)
+                        mcast_a_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for local_nb in range(N_BPN):
+                    nb = col_c * N_BPN + local_nb
+                    nc = nb * bn
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        b_blk = b_cb.reserve()
+
+                        def read_b(pipe):
+                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                            ttl.copy(b_blk, pipe).wait()
+
+                        mcast_b_net.if_src(read_b)
+                        mcast_b_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
+                    o = out_cb.wait()
+                    ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
+
+    return summa_matmul
+
+
+def make_lk_a_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
+    """Mega kernel for Lk-A = hc_pre + typecast + attn_norm + wq_a matmul.
+
+    Composes 6 tt-lang dispatches all defined locally in this file:
+    norm_fn_ksplit + split_mixes + sinkhorn + apply_mix_h + rmsnorm + SUMMA
+    matmul. Constants/scratch tensors are allocated up front from
+    cpu-side weights.
+    """
+    K_tiles = D // TILE                                # 512
+    h_tiles = DIM // TILE                              # 128
+    norm_fn_kernel = _make_mhc_norm_fn_ksplit_kernel(
+        K_tiles=K_tiles, Kp=NORM_FN_KP,
+        rms_eps=NORM_EPS, inv_D=1.0 / D)
+    split_mixes_kernel = _make_mhc_split_mixes_kernel(
+        num_tiles=NUM_TOKENS_PAD // _MHC_TILE)         # 1
+    sinkhorn_kernel = _make_mhc_sinkhorn_kernel(
+        num_slices=NUM_TOKENS, repeat=HC_SINKHORN_ITERS, eps=HC_EPS)
+    apply_mix_kernel = _make_mhc_apply_mix_h_kernel(
+        num_tokens=NUM_TOKENS, h_tiles=h_tiles)
+    rms_kernel = _make_rmsnorm_kernel(
+        num_row_tiles=1, h_tiles=DIM // TILE,
+        rms_eps=NORM_EPS, inv_D=1.0 / DIM)
+    matmul_kernel = _make_summa_matmul_kernel(
+        M=TILE, K=DIM, N=Q_LORA_RANK,
+        block_cfg=(1, 4, 8), part_cfg=(1, 8, 1))
+
+    rep_fp32 = dict(device=mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    rep_bf16 = dict(device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+
+    # Constant tensors (uploaded once at kernel construction).
+    fn_packed = _mhc_pack_fn(
+        hc_fn_cpu.detach().to(torch.float32).cpu(), MHC_MULT3)
+    fn_tt = ttnn.as_tensor(fn_packed, **rep_fp32)
+    sc_fp32_tt = ttnn.as_tensor(
+        torch.ones((_MHC_TILE, _MHC_TILE), dtype=torch.float32), **rep_fp32)
+    sc_bf16_tt = ttnn.as_tensor(
+        torch.ones((TILE, TILE), dtype=torch.bfloat16), **rep_bf16)
+
+    (scale_tile, base_tile, pre_mask_tile, pre_eps_tile,
+     post_mult_mask_tile, comb_mask_tile) = _mhc_build_split_constant_tiles(
+        hc_scale_cpu.detach().to(torch.float32).cpu(),
+        hc_base_cpu.detach().to(torch.float32).cpu(),
+        MHC, _MHC_POST_MULT, HC_EPS,
+    )
+    split_scale_tt = ttnn.as_tensor(scale_tile, **rep_fp32)
+    split_base_tt = ttnn.as_tensor(base_tile, **rep_fp32)
+    split_pre_mask_tt = ttnn.as_tensor(pre_mask_tile, **rep_fp32)
+    split_pre_eps_tt = ttnn.as_tensor(pre_eps_tile, **rep_fp32)
+    split_post_mult_mask_tt = ttnn.as_tensor(post_mult_mask_tile, **rep_fp32)
+    split_comb_mask_tt = ttnn.as_tensor(comb_mask_tile, **rep_fp32)
+
+    sk_mask_tt = ttnn.as_tensor(_mhc_sinkhorn_mask_tile(MHC), **rep_fp32)
+    sk_eps_mask_tt = ttnn.as_tensor(
+        _mhc_sinkhorn_eps_mask_tile(MHC, HC_EPS), **rep_fp32)
+
+    # rmsnorm gamma packed to [TILE, hidden].
+    gamma_packed = gamma_cpu.flatten().to(torch.bfloat16) \
+        .unsqueeze(0).expand(TILE, -1).contiguous()
+    gamma_tt = ttnn.as_tensor(gamma_packed, **rep_bf16)
+
+    state: dict = {}
+
+    def _zeros_fp32(shape):
+        return ttnn.zeros(
+            shape=tuple(shape), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+            device=mesh, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+    def _zeros_bf16(shape):
+        return ttnn.from_torch(
+            torch.zeros(*shape, dtype=torch.bfloat16),
+            device=mesh, dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+
+    def lk_a_kernel(a_tt, wq_a_w_tt, out_tt):
+        if "scratch" not in state:
+            # mhc scratch
+            state["mixes_tt"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
+            state["pre_tt"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
+            state["post_tt"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
+            state["comb_tt"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
+            state["comb_sk_out_tt"] = _zeros_fp32((NUM_TOKENS * _MHC_TILE, _MHC_TILE))
+            state["apply_mix_out_tt"] = _zeros_fp32((NUM_TOKENS * _MHC_TILE, DIM))
+            state["a_sliced_scratch_tt"] = _zeros_fp32((NUM_TOKENS, MHC * DIM))
+            # rmsnorm scratch
+            state["rms_in_tt"] = _zeros_bf16((TILE, DIM))   # bf16 input post-typecast
+            state["rms_out_tt"] = _zeros_bf16((TILE, DIM))
+            state["norm_slice_tt"] = _zeros_bf16((NUM_TOKENS, DIM))
+            # matmul scratch
+            state["y_padded_tt"] = _zeros_bf16((TILE, Q_LORA_RANK))
+            state["scratch"] = True
+
+        mixes_tt = state["mixes_tt"]
+        pre_tt = state["pre_tt"]
+        post_tt = state["post_tt"]
+        comb_tt = state["comb_tt"]
+        comb_sk_out_tt = state["comb_sk_out_tt"]
+        apply_mix_out_tt = state["apply_mix_out_tt"]
+        a_sliced_scratch_tt = state["a_sliced_scratch_tt"]
+
+        # 1. mhc.norm_fn (ksplit) on residual a_tt -> mixes_tt
+        norm_fn_kernel(a_tt, fn_tt, sc_fp32_tt, mixes_tt)
+
+        # 2. split_mixes -> pre/post/comb
+        split_mixes_kernel(
+            mixes_tt, split_scale_tt, split_base_tt,
+            split_pre_mask_tt, split_pre_eps_tt,
+            split_post_mult_mask_tt, split_comb_mask_tt,
+            pre_tt, post_tt, comb_tt,
+        )
+
+        # 3. ttnn glue: pull comb's mhc*mhc tail, pad to [num_tokens, TILE, TILE].
+        comb_sliced = ttnn.slice(
+            comb_tt, [0, 2 * MHC], [NUM_TOKENS, 2 * MHC + MHC * MHC])
+        comb_3d = ttnn.reshape(comb_sliced, [NUM_TOKENS, MHC, MHC])
+        comb_padded = ttnn.pad(
+            comb_3d,
+            padding=[(0, 0), (0, _MHC_TILE - MHC), (0, _MHC_TILE - MHC)],
+            value=_MHC_PAD_SENTINEL,
+        )
+        comb_sk_in_tt = ttnn.reshape(
+            comb_padded, [NUM_TOKENS * _MHC_TILE, _MHC_TILE])
+
+        # 4. sinkhorn -> comb_sk_out_tt
+        sinkhorn_kernel(
+            comb_sk_in_tt, sk_mask_tt, sk_eps_mask_tt, sc_fp32_tt,
+            comb_sk_out_tt,
+        )
+
+        # 5. ttnn glue: build mix tile from pre's first mhc cols.
+        pre_sliced = ttnn.slice(pre_tt, [0, 0], [NUM_TOKENS, MHC])
+        pre_3d = ttnn.reshape(pre_sliced, [NUM_TOKENS, MHC, 1])
+        mix_padded = ttnn.pad(
+            pre_3d,
+            padding=[(0, 0), (0, _MHC_TILE - MHC), (0, _MHC_TILE - 1)],
+            value=0.0,
+        )
+        mix_tt = ttnn.reshape(
+            mix_padded, [NUM_TOKENS * _MHC_TILE, _MHC_TILE])
+
+        # 6. ttnn glue: reshape a_tt rows -> [num_tokens*TILE, hidden].
+        ttnn.slice(a_tt, [0, 0], [NUM_TOKENS, MHC * DIM],
+                   output_tensor=a_sliced_scratch_tt)
+        a_3d = ttnn.reshape(a_sliced_scratch_tt, [NUM_TOKENS, MHC, DIM])
+        x_padded = ttnn.pad(
+            a_3d,
+            padding=[(0, 0), (0, _MHC_TILE - MHC), (0, 0)],
+            value=0.0,
+        )
+        x_tt = ttnn.reshape(x_padded, [NUM_TOKENS * _MHC_TILE, DIM])
+
+        # 7. apply_mix_h -> apply_mix_out_tt (fp32)
+        apply_mix_kernel(x_tt, mix_tt, sc_fp32_tt, apply_mix_out_tt)
+
+        # 8. typecast fp32 -> bf16 (apply_mix_out_tt is [TILE, DIM]).
+        ttnn.typecast(apply_mix_out_tt, dtype=ttnn.bfloat16,
+                      output_tensor=state["rms_in_tt"])
+
+        # 9. rmsnorm.
+        rms_kernel(state["rms_in_tt"], gamma_tt, sc_bf16_tt, state["rms_out_tt"])
+
+        # 10. slice rmsnorm output to [NUM_TOKENS, DIM].
+        ttnn.slice(state["rms_out_tt"], [0, 0], [NUM_TOKENS, DIM],
+                   output_tensor=state["norm_slice_tt"])
+
+        # 11. wq_a matmul (SUMMA). Pad to [TILE, dim] for tile-alignment.
+        x_padded_2d = ttnn.pad(
+            state["norm_slice_tt"],
+            padding=[(0, TILE - NUM_TOKENS), (0, 0)], value=0.0)
+        matmul_kernel(x_padded_2d, wq_a_w_tt, state["y_padded_tt"])
+        y_row = ttnn.slice(state["y_padded_tt"], [0, 0],
+                           [NUM_TOKENS, Q_LORA_RANK])
+        y_3d = ttnn.reshape(y_row, [1, 1, Q_LORA_RANK])
+        ttnn.copy(y_3d, out_tt)
 
     return lk_a_kernel
 
@@ -110,25 +868,11 @@ def main():
                                gamma, wq_a_w_tt)
         ref_host = download_chip0(mesh, mesh_shape, ref_out_tt)
 
-        # Placeholder kernel — set up matching input/output buffers and
-        # dispatch. Compute is empty; output stays zero.
-        kernel = make_lk_a_kernel()
-        hc_fn_packed_tt = ttnn.as_tensor(
-            torch.zeros(D, _MHC_TILE, dtype=torch.float32),
-            dtype=ttnn.float32, **rep)
-        hc_scale_tt = ttnn.as_tensor(
-            hc_scale.reshape(1, 3).contiguous(), dtype=ttnn.float32, **rep)
-        hc_base_tt = ttnn.as_tensor(
-            hc_base.reshape(1, MHC_MULT3).contiguous(),
-            dtype=ttnn.float32, **rep)
-        gamma_tt = ttnn.as_tensor(
-            gamma.unsqueeze(0).expand(_MHC_TILE, -1).contiguous(),
-            dtype=ttnn.bfloat16, **rep)
+        kernel = make_lk_a_kernel(mesh, hc_fn, hc_scale, hc_base, gamma)
         out_tt = ttnn.from_torch(
             torch.zeros(1, 1, Q_LORA_RANK, dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, **rep)
-        kernel(a_tt, hc_fn_packed_tt, hc_scale_tt, hc_base_tt,
-               gamma_tt, wq_a_w_tt, out_tt)
+        kernel(a_tt, wq_a_w_tt, out_tt)
         kernel_host = download_chip0(mesh, mesh_shape, out_tt)
 
         ok = report_pcc("Lk-A", ref_host, kernel_host)
