@@ -310,43 +310,21 @@ def make_lk_f_kernel(mesh, gate_bias_cpu):
         match_weighted = ttnn.multiply(weights_4d, match_bf16)
         mask = ttnn.sum(match_weighted, dim=-1, keepdim=True)
 
-        # 6. Per-expert path: 8 iterations × (w1 SUMMA, w3 SUMMA, ttnn SwiGLU,
-        #    w2 SUMMA, mask multiply + accumulate).
-        # TODO: mega fusion blocked: ttnn.slice for per-expert weight extraction
-        # (4D -> 2D), ttnn.clamp + silu (see Lk-E note about open tt-lang
-        # clamp compile issue), ttnn.multiply + add for mask-and-sum tail.
-        y_local_acc = ttnn.from_torch(
-            torch.zeros(1, 1, 1, DIM, dtype=torch.bfloat16),
-            dtype=ttnn.bfloat16, **rep)
-        for i in range(PER_CHIP):
-            w1_i_4d = ttnn.slice(w1_tt, [0, i, 0, 0],
-                                 [1, i + 1, DIM, INTER_DIM])
-            w1_i_2d = ttnn.reshape(w1_i_4d, [DIM, INTER_DIM])
-            matmul_w1(state["x_padded"], w1_i_2d, state["y1_padded"])
-
-            w3_i_4d = ttnn.slice(w3_tt, [0, i, 0, 0],
-                                 [1, i + 1, DIM, INTER_DIM])
-            w3_i_2d = ttnn.reshape(w3_i_4d, [DIM, INTER_DIM])
-            matmul_w3(state["x_padded"], w3_i_2d, state["y3_padded"])
-
-            y1_clamped = ttnn.clamp(state["y1_padded"], max=SWIGLU_LIMIT)
-            y3_clamped = ttnn.clamp(
-                state["y3_padded"], min=-SWIGLU_LIMIT, max=SWIGLU_LIMIT)
-            silu_y1 = ttnn.silu(y1_clamped)
-            mid_padded = ttnn.multiply(silu_y1, y3_clamped)
-
-            w2_i_4d = ttnn.slice(w2_tt, [0, i, 0, 0],
-                                 [1, i + 1, INTER_DIM, DIM])
-            w2_i_2d = ttnn.reshape(w2_i_4d, [INTER_DIM, DIM])
-            matmul_w2(mid_padded, w2_i_2d, state["y_padded"])
-
-            y_2d = ttnn.slice(state["y_padded"], [0, 0], [B, DIM])
-            y_4d = ttnn.reshape(y_2d, [1, 1, B, DIM])
-            mask_i = ttnn.slice(mask, [0, i, 0, 0], [1, i + 1, 1, 1])
-            scaled = ttnn.multiply(y_4d, mask_i)
-            y_local_acc = ttnn.add(y_local_acc, scaled)
-
-        return y_local_acc
+        # 6. Batched routed-expert path: w1, w3, swiglu, w2, mask, sum-experts.
+        # TODO: mega: replace batched ttnn.matmul x3 with batched-SUMMA tt-lang
+        # kernel; SwiGLU body (clamp + silu + multiply) also still in ttnn.
+        x_4d = ttnn.reshape(x_tt, [1, 1, 1, DIM])
+        x_grouped = ttnn.repeat(x_4d, [1, PER_CHIP, 1, 1])
+        y1 = ttnn.matmul(x_grouped, w1_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        y3 = ttnn.matmul(x_grouped, w3_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        if SWIGLU_LIMIT > 0:
+            ttnn.clamp(y1, max=SWIGLU_LIMIT, output_tensor=y1)
+            ttnn.clamp(y3, min=-SWIGLU_LIMIT, max=SWIGLU_LIMIT, output_tensor=y3)
+        ttnn.silu(y1, output_tensor=y1)
+        ttnn.multiply(y1, y3, output_tensor=y1)
+        y = ttnn.matmul(y1, w2_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.multiply(y, mask, output_tensor=y)
+        return ttnn.sum(y, dim=1, keepdim=True)
 
     return lk_f_kernel
 
