@@ -13,6 +13,10 @@ Reference covers (from `DeviceCompressor.forward_device`, sans CCLs):
 - 4× paged_update_cache to state_front/back, score_front/back
 
 The wkv and wgate all_gathers between them are excluded.
+
+Kernel inlines the SUMMA matmul and reuses it for both linears. APE
+(embedding + add) and the four `paged_update_cache` calls remain as
+ttnn glue — see TODO below.
 """
 from __future__ import annotations
 
@@ -33,33 +37,185 @@ RATIO = 4
 RATIO_PAD = 32                          # _RMS_TILE
 MAX_SEQ_LEN = 512
 B = 1
+TILE = 32
+
+# TODO: mega the embedding(start_pos, ape_padded) + reshape + add and the
+# four paged_update_cache calls remain ttnn here. Lowering them to
+# tt-lang requires:
+#   * embedding -> a runtime-indexed ttl.copy from ape_padded[start_pos]
+#     into a 1-tile buffer (start_pos is a [1] uint32 device tensor).
+#   * paged_update_cache -> a runtime-indexed ttl.copy that writes the
+#     newly produced kv/score row into cache[state_slot]. state_slot is
+#     also a device-side scalar.
+# Both need data-movement-time index reads. Punt for now; once we have a
+# `ttl.copy_indexed` (or equivalent) primitive these all collapse into
+# one mega-kernel dispatch.
 
 
-def make_lk_d_idx_cmp_kernel():
-    """Placeholder mega kernel for indexer compressor non-emit path.
+def _make_summa_matmul_kernel(M: int, K: int, N: int,
+                              block_cfg, part_cfg,
+                              fp32_dest_acc_en: bool = True):
+    """Pure-SUMMA matmul kernel (same shape as Lk-A/Lk-B/Lk-D-idx-q)."""
+    bm, bn, bk = block_cfg
+    Mp, Np, Kp = part_cfg
+    if Kp != 1:
+        raise ValueError(f"K_parts must be 1, got {Kp}")
+    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
+    if Mt % bm or Nt % bn or Kt % bk:
+        raise ValueError(
+            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
+            f"block=(bm={bm}, bn={bn}, bk={bk})")
+    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
+    if Mb % Mp or Nb % Np:
+        raise ValueError(
+            f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
+    M_BPN = Mb // Mp
+    N_BPN = Nb // Np
 
-    Inputs:
-      x:              [1, 1, dim] bf16  — replicated activation
-      wkv_w:          [dim, coff*head_dim] bf16
-      wgate_w:        [dim, coff*head_dim] bf16
-      ape_padded:     [max_seq_len, coff*head_dim] bf16
-      start_pos:      [1, 1] uint32
-      state_slot:     [1] int32
-      state buffers (in/out): kv_state_front/back, score_state_front/back
-                              each [1, 1, ratio_pad, head_dim] bf16
-    Output:
-      kv_out:         [1, 1, cdim] bf16  — pre-wkv-all_gather wkv result
-      score_out:      [1, 1, cdim] bf16  — pre-wgate-all_gather + APE result
-    """
-    @ttl.operation(grid="auto")
-    def lk_d_idx_cmp_kernel(x, wkv_w, wgate_w, ape_padded, start_pos,
-                            state_slot,
-                            kv_state_front, kv_state_back,
-                            score_state_front, score_state_back,
-                            kv_out, score_out):
+    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
+    def summa_matmul(a, w, out):
+        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
+                   for m_p in range(Mp)]
+        mcast_a_net = ttl.PipeNet(a_pipes)
+        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
+                   for n_p in range(Np)]
+        mcast_b_net = ttl.PipeNet(b_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+        out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
+
         @ttl.compute()
         def compute():
-            pass
+            for _ in range(M_BPN):
+                for _ in range(N_BPN):
+                    p = out_cb.reserve()
+                    for _ in range(Kb):
+                        a_blk = a_cb.wait()
+                        b_blk = b_cb.wait()
+                        p += a_blk @ b_blk
+
+        @ttl.datamovement()
+        def dm_read():
+            _, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for _ in range(N_BPN):
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        a_blk = a_cb.reserve()
+
+                        def read_a(pipe):
+                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
+                            ttl.copy(a_blk, pipe).wait()
+
+                        mcast_a_net.if_src(read_a)
+                        mcast_a_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for local_nb in range(N_BPN):
+                    nb = col_c * N_BPN + local_nb
+                    nc = nb * bn
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        b_blk = b_cb.reserve()
+
+                        def read_b(pipe):
+                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                            ttl.copy(b_blk, pipe).wait()
+
+                        mcast_b_net.if_src(read_b)
+                        mcast_b_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
+                    o = out_cb.wait()
+                    ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
+
+    return summa_matmul
+
+
+def make_lk_d_idx_cmp_kernel(mesh, sharded_input_memcfg):
+    """Mega kernel for Lk-D-idx-cmp.
+
+    Two SUMMA matmuls (wkv, wgate) plus ttnn glue (APE +
+    paged_update_cache; see TODO above).
+    """
+    d = INDEX_HEAD_DIM
+    c = CDIM
+    M_PAD = TILE
+    state: dict = {}
+
+    # Both matmuls have the same shape: M=TILE, K=DIM, N=CDIM.
+    # Mt=1, Kt=128, Nt=8.
+    # block=(1, 4, 4) -> Mb=1, Nb=2, Kb=32. part=(1, 2, 1) -> N_BPN=1.
+    matmul_kernel = _make_summa_matmul_kernel(
+        M=M_PAD, K=DIM, N=CDIM,
+        block_cfg=(1, 4, 4), part_cfg=(1, 2, 1))
+
+    rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
+               memory_config=ttnn.DRAM_MEMORY_CONFIG,
+               mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+
+    def lk_d_idx_cmp_kernel(x_tt, wkv_w_tt, wgate_w_tt, ape_padded_tt,
+                            start_pos_tt, state_slot_tt,
+                            kv_state_front_tt, kv_state_back_tt,
+                            score_state_front_tt, score_state_back_tt,
+                            kv_out, score_out):
+        if "scratch" not in state:
+            state["kv_padded_tt"] = ttnn.from_torch(
+                torch.zeros((M_PAD, CDIM), dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
+            state["score_padded_tt"] = ttnn.from_torch(
+                torch.zeros((M_PAD, CDIM), dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
+            state["scratch"] = True
+
+        # Pad x [1, 1, DIM] -> [TILE, DIM] for SUMMA M-axis.
+        x_2d = ttnn.reshape(x_tt, [B, DIM])
+        x_padded = ttnn.pad(x_2d, padding=[(0, M_PAD - B), (0, 0)], value=0.0)
+
+        # SUMMA #1: kv = x · wkv -> [TILE, CDIM].
+        matmul_kernel(x_padded, wkv_w_tt, state["kv_padded_tt"])
+        # SUMMA #2: score = x · wgate -> [TILE, CDIM].
+        matmul_kernel(x_padded, wgate_w_tt, state["score_padded_tt"])
+
+        # Slice + reshape to [1, 1, CDIM].
+        kv_row = ttnn.slice(state["kv_padded_tt"], [0, 0], [B, CDIM])
+        kv_3d = ttnn.reshape(kv_row, [B, 1, CDIM])
+        score_row = ttnn.slice(state["score_padded_tt"], [0, 0], [B, CDIM])
+        score_3d = ttnn.reshape(score_row, [B, 1, CDIM])
+
+        # APE add (TODO: mega).
+        ape_slot = ttnn.embedding(
+            start_pos_tt, ape_padded_tt, layout=ttnn.TILE_LAYOUT)
+        score_3d = ttnn.add(score_3d, ttnn.reshape(ape_slot, [1, 1, c]))
+
+        # paged_update_cache writes (TODO: mega).
+        kv_front = ttnn.slice(kv_3d, [0, 0, 0], [B, 1, d])
+        kv_back = ttnn.slice(kv_3d, [0, 0, d], [B, 1, c])
+        score_front = ttnn.slice(score_3d, [0, 0, 0], [B, 1, d])
+        score_back = ttnn.slice(score_3d, [0, 0, d], [B, 1, c])
+
+        def pug(cache_tt, x_3d_tt):
+            x_4d = ttnn.reshape(x_3d_tt, [1, B, 1, d])
+            x_sharded = ttnn.to_memory_config(
+                x_4d, memory_config=sharded_input_memcfg)
+            ttnn.experimental.paged_update_cache(
+                cache_tt, x_sharded, update_idxs_tensor=state_slot_tt)
+
+        pug(kv_state_front_tt, kv_front)
+        pug(kv_state_back_tt, kv_back)
+        pug(score_state_front_tt, score_front)
+        pug(score_state_back_tt, score_back)
+
+        ttnn.copy(kv_3d, kv_out)
+        ttnn.copy(score_3d, score_out)
 
     return lk_d_idx_cmp_kernel
 
@@ -165,7 +321,7 @@ def main():
         ref_kv_host = download_chip0(mesh, mesh_shape, ref_kv_tt)
         ref_score_host = download_chip0(mesh, mesh_shape, ref_score_tt)
 
-        kernel = make_lk_d_idx_cmp_kernel()
+        kernel = make_lk_d_idx_cmp_kernel(mesh, sharded_memcfg)
         kv_out_tt = ttnn.from_torch(
             torch.zeros(1, 1, CDIM, dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, **rep)
