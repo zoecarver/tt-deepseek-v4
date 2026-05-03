@@ -6,27 +6,25 @@ the wq_b all_gather and the wkv all_gather:
 - per-head rsqrt-norm
 - pick cos/sin via embedding(start_pos, table); reshape to [1,S,1,rd/2]
 - slice q nope/rope, rotary on rope half, concat
-- ttnn.matmul(x, wkv) — partial pre-all_gather
+- ttnn.matmul(x, wkv) - partial pre-all_gather
 
 The wq_a/wq_b path that produces q_full / qr is upstream (Lk-A/B).
 For this test we feed in random q_full and x directly.
 
-q_rsqrt_norm is now lowered to the inlined rmsnorm tt-lang kernel
-(per-head rsqrt-norm = rmsnorm with gamma=ones). The wkv matmul is
-the inlined SUMMA kernel.
+Three inlined tt-lang dispatches:
+  - rmsnorm (q_rsqrt_norm)
+  - SUMMA matmul x P (rotary swap_pairs)
+  - rotary combine (x * cos_extended + x_swap * sin_signed)
+  - SUMMA matmul (wkv)
 
-TODO: lower the rotary to tt-lang. `_device_apply_rotary_interleaved`
-is still pure ttnn (slice / multiply / concat). Lowering needs a real
-design pass: at decode the rope half is rd=64 wide which is 2 tiles,
-the (real, imag) pairs are interleaved along the last axis (positions
-0,2,4,... vs 1,3,5,...) so a tile-tile @ttl.operation must either
-transpose pairs to separate tiles first, or read sub-tile granularity
-which tt-lang doesn't support natively. Pick a layout for cos/sin that
-matches a chosen split layout and keep the tt-lang body to four
-elementwise multiplies + one add and one sub.
-ttnn.embedding(start_pos, cos/sin) for the table lookup is also still
-ttnn — it depends on a device int32 tensor and is not a candidate for
-fusion into the rotary kernel.
+Rotary lowering trick: bake the rotate_half permutation into a swap
+matrix P and the rotate_half sign into the sin table (sin_signed).
+Then rotary becomes x * cos_extended + (x @ P) * sin_signed, where
+cos_extended = pair-repeat(cos) and P = block_diag([[0,1],[1,0]] x rd/2).
+cos/sin tables are pre-replicated across TILE rows on the host so the
+tt-lang kernel can read tile-aligned cos/sin tiles without an extra
+broadcast op. ttnn.embedding(start_pos, ...) is still ttnn glue
+because it depends on a device uint32 index (TODO: mega).
 """
 from __future__ import annotations
 
@@ -229,14 +227,108 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
     return summa_matmul
 
 
-def make_lk_c_kernel(mesh):
+def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
+    """out = x * cos + x_swap * sin (elementwise).
+
+    cos/sin tiles already carry the same data on every TILE row (the
+    host pre-replicates the table along the row axis), so the kernel
+    just multiplies tile-by-tile - no broadcast op needed.
+    """
+
+    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
+    def rotary_combine(x, x_swap, cos, sin, out):
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        xs_dfb = ttl.make_dataflow_buffer_like(x_swap, shape=(1, 1), block_count=2)
+        c_dfb = ttl.make_dataflow_buffer_like(cos, shape=(1, 1), block_count=2)
+        s_dfb = ttl.make_dataflow_buffer_like(sin, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for _ in range(num_row_tiles):
+                for _ in range(num_h_tiles):
+                    xt = x_dfb.wait()
+                    xst = xs_dfb.wait()
+                    ct = c_dfb.wait()
+                    st = s_dfb.wait()
+                    out_dfb.reserve().store(xt * ct + xst * st)
+
+        @ttl.datamovement()
+        def dm_read():
+            for t in range(num_row_tiles):
+                for h in range(num_h_tiles):
+                    ttl.copy(x[t, h], x_dfb.reserve()).wait()
+                    ttl.copy(x_swap[t, h], xs_dfb.reserve()).wait()
+                    # cos/sin: row 0 holds the full TILE-replicated table.
+                    ttl.copy(cos[0, h], c_dfb.reserve()).wait()
+                    ttl.copy(sin[0, h], s_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            for t in range(num_row_tiles):
+                for h in range(num_h_tiles):
+                    ttl.copy(out_dfb.wait(), out[t, h]).wait()
+
+    return rotary_combine
+
+
+def _build_rotary_tables(cos_full_cpu: torch.Tensor, sin_full_cpu: torch.Tensor,
+                         inverse: bool):
+    """Build host-side pre-processed cos/sin tables for the kernel rotary.
+
+    Output:
+      cos_extended_packed: [max_seq_len, TILE * rd] bf16
+        each row holds TILE replicas of [c0, c0, c1, c1, ..., c_{rd/2-1},
+        c_{rd/2-1}] so that ttnn.embedding(start_pos, ...) followed by
+        reshape([TILE, rd]) yields a tile-aligned [TILE, rd] tensor with
+        the same cos values on every row.
+      sin_signed_packed: [max_seq_len, TILE * rd] bf16
+        same layout, but the sin values are signed so that
+        out = x * cos_extended + (x @ P) * sin_signed reproduces the
+        forward (or inverse) rotary exactly.
+
+    sin sign pattern:
+      forward: [-s, +s, -s, +s, ...]   (so that x[2k+1] picks up -sin(k))
+      inverse: [+s, -s, +s, -s, ...]
+    """
+    max_seq_len, rd_half = cos_full_cpu.shape
+    rd = 2 * rd_half
+    if rd % TILE != 0:
+        raise ValueError(f"rd={rd} not multiple of TILE={TILE}")
+
+    cos_extended = cos_full_cpu.repeat_interleave(2, dim=-1)  # (T, rd)
+    sign = torch.ones(rd, dtype=cos_full_cpu.dtype)
+    if inverse:
+        sign[1::2] = -1
+    else:
+        sign[0::2] = -1
+    sin_signed = sin_full_cpu.repeat_interleave(2, dim=-1) * sign
+    cos_extended_packed = cos_extended.unsqueeze(1).expand(
+        max_seq_len, TILE, rd).reshape(max_seq_len, TILE * rd).contiguous()
+    sin_signed_packed = sin_signed.unsqueeze(1).expand(
+        max_seq_len, TILE, rd).reshape(max_seq_len, TILE * rd).contiguous()
+    return cos_extended_packed, sin_signed_packed
+
+
+def _build_swap_matrix(rd: int) -> torch.Tensor:
+    """Block-diagonal swap matrix P [rd, rd] with 2x2 [[0,1],[1,0]] blocks."""
+    if rd % 2:
+        raise ValueError(f"rd={rd} must be even")
+    P = torch.zeros(rd, rd, dtype=torch.bfloat16)
+    for k in range(rd // 2):
+        P[2 * k, 2 * k + 1] = 1.0
+        P[2 * k + 1, 2 * k] = 1.0
+    return P
+
+
+def make_lk_c_kernel(mesh, cos_full_cpu, sin_full_cpu):
     """Mega kernel for Lk-C = q_rsqrt_norm + q rotary + wkv matmul.
 
-    q_rsqrt_norm is the inlined rmsnorm kernel with gamma=ones (per-head
-    rsqrt-norm IS rmsnorm; both compute x * rsqrt(mean(x^2) + eps) and
-    differ only by the multiplicative gamma weight). The wkv matmul is
-    the inlined SUMMA kernel. The rotary helper is still pure-ttnn —
-    see the file docstring TODO for the design notes.
+    Three inlined tt-lang kernels (rmsnorm, swap-SUMMA + rotary combine,
+    wkv-SUMMA). The rotary swap is implemented as a small 64x64 matmul
+    against a block-diagonal swap matrix; the combine is one elementwise
+    pass. Cos/sin tables are pre-processed on host (interleave-repeat
+    cos, sign-bake sin) so the kernel sees tile-aligned tables.
     """
     rms_kernel = _make_rmsnorm_kernel(
         num_row_tiles=N_HEADS // TILE,         # 64 / 32 = 2
@@ -245,6 +337,14 @@ def make_lk_c_kernel(mesh):
     matmul_kernel = _make_summa_matmul_kernel(
         M=TILE, K=DIM, N=HEAD_DIM,
         block_cfg=(1, 4, 8), part_cfg=(1, 4, 1))
+    # Swap SUMMA: M=N_HEADS=64, K=N=rd=64. Mt=Kt=Nt=2. block=(1,1,2)
+    # part=(2,2,1) -> 4 cores, M_BPN=N_BPN=1, Kb=1.
+    swap_kernel = _make_summa_matmul_kernel(
+        M=N_HEADS, K=ROPE_HEAD_DIM, N=ROPE_HEAD_DIM,
+        block_cfg=(1, 1, 2), part_cfg=(2, 2, 1))
+    rotary_combine_kernel = _make_rotary_combine_kernel(
+        num_row_tiles=N_HEADS // TILE,        # 64 / 32 = 2
+        num_h_tiles=ROPE_HEAD_DIM // TILE)    # 64 / 32 = 2
 
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -261,6 +361,15 @@ def make_lk_c_kernel(mesh):
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
 
+    # Pre-processed rotary tables. Forward rotary in Lk-C.
+    cos_ext_packed, sin_signed_packed = _build_rotary_tables(
+        cos_full_cpu, sin_full_cpu, inverse=False)
+    cos_ext_tt = ttnn.as_tensor(cos_ext_packed, dtype=ttnn.bfloat16, **rep)
+    sin_signed_tt = ttnn.as_tensor(sin_signed_packed, dtype=ttnn.bfloat16, **rep)
+
+    P_cpu = _build_swap_matrix(ROPE_HEAD_DIM)
+    P_tt = ttnn.as_tensor(P_cpu.contiguous(), dtype=ttnn.bfloat16, **rep)
+
     state: dict = {}
 
     def _alloc_replicated_zeros(shape):
@@ -276,29 +385,49 @@ def make_lk_c_kernel(mesh):
         if "scratch" not in state:
             state["q_normed_2d_tt"] = _alloc_replicated_zeros(
                 (N_HEADS, HEAD_DIM))
+            state["q_rope_swap_tt"] = _alloc_replicated_zeros(
+                (N_HEADS, ROPE_HEAD_DIM))
+            state["q_rope_rot_tt"] = _alloc_replicated_zeros(
+                (N_HEADS, ROPE_HEAD_DIM))
             state["wkv_padded_tt"] = _alloc_replicated_zeros((TILE, HEAD_DIM))
             state["scratch"] = True
-
-        rd_half = ROPE_HEAD_DIM // 2
 
         # q_rsqrt_norm via rmsnorm tt-lang kernel.
         q_2d = ttnn.reshape(q_full, [N_HEADS, HEAD_DIM])
         rms_kernel(q_2d, gamma_q_tt, sc_tt, state["q_normed_2d_tt"])
-        q_tt = ttnn.reshape(state["q_normed_2d_tt"], [B, S, N_HEADS, HEAD_DIM])
 
-        # TODO: lower this rotary block to a @ttl.operation kernel; see
-        # the file docstring for the design notes.
-        cos = ttnn.embedding(start_pos, cos_full, layout=ttnn.TILE_LAYOUT)
-        sin = ttnn.embedding(start_pos, sin_full, layout=ttnn.TILE_LAYOUT)
-        cos = ttnn.reshape(cos, [1, S, 1, rd_half])
-        sin = ttnn.reshape(sin, [1, S, 1, rd_half])
+        # Rotary on the rope half.
+        # TODO: mega fusion blocked: ttnn used for embedding(start_pos, ...)
+        # to look up cos/sin (depends on a device uint32 index, no tt-lang
+        # gather primitive). Slice/pad/reshape stay in ttnn for the same
+        # reason - they're light data movement around the lookup. The
+        # actual rotary math (swap_pairs + cos/sin combine) is in tt-lang.
+        cos_b_2d = ttnn.embedding(start_pos, cos_ext_tt, layout=ttnn.TILE_LAYOUT)
+        sin_b_2d = ttnn.embedding(start_pos, sin_signed_tt, layout=ttnn.TILE_LAYOUT)
+        cos_b = ttnn.reshape(cos_b_2d, [TILE, ROPE_HEAD_DIM])
+        sin_b = ttnn.reshape(sin_b_2d, [TILE, ROPE_HEAD_DIM])
+
+        q_normed_4d = ttnn.reshape(
+            state["q_normed_2d_tt"], [B, S, N_HEADS, HEAD_DIM])
         q_nope = ttnn.slice(
-            q_tt, [0, 0, 0, 0], [B, S, N_HEADS, HEAD_DIM - ROPE_HEAD_DIM])
+            q_normed_4d, [0, 0, 0, 0],
+            [B, S, N_HEADS, HEAD_DIM - ROPE_HEAD_DIM])
         q_rope = ttnn.slice(
-            q_tt, [0, 0, 0, HEAD_DIM - ROPE_HEAD_DIM], [B, S, N_HEADS, HEAD_DIM])
-        q_rope = _device_apply_rotary_interleaved(
-            ttnn, q_rope, cos, sin, inverse=False)
-        q_full_out = ttnn.concat([q_nope, q_rope], dim=-1)
+            q_normed_4d, [0, 0, 0, HEAD_DIM - ROPE_HEAD_DIM],
+            [B, S, N_HEADS, HEAD_DIM])
+        q_rope_2d = ttnn.reshape(q_rope, [N_HEADS, ROPE_HEAD_DIM])
+
+        # SUMMA: q_rope_swap = q_rope @ P.
+        swap_kernel(q_rope_2d, P_tt, state["q_rope_swap_tt"])
+
+        # tt-lang combine: q_rope_rot = q_rope * cos_b + q_rope_swap * sin_b.
+        rotary_combine_kernel(
+            q_rope_2d, state["q_rope_swap_tt"], cos_b, sin_b,
+            state["q_rope_rot_tt"])
+
+        q_rope_rot_4d = ttnn.reshape(
+            state["q_rope_rot_tt"], [B, S, N_HEADS, ROPE_HEAD_DIM])
+        q_full_out = ttnn.concat([q_nope, q_rope_rot_4d], dim=-1)
         ttnn.copy(q_full_out, q_out)
 
         # wkv matmul (tt-lang SUMMA).
@@ -367,7 +496,7 @@ def main():
         ref_q_host = download_chip0(mesh, mesh_shape, ref_q_tt)
         ref_wkv_host = download_chip0(mesh, mesh_shape, ref_wkv_tt)
 
-        kernel = make_lk_c_kernel(mesh)
+        kernel = make_lk_c_kernel(mesh, cos_full, sin_full)
         q_out_tt = ttnn.from_torch(
             torch.zeros(1, 1, N_HEADS, HEAD_DIM, dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, **rep)
