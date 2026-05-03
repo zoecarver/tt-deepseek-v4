@@ -33,7 +33,7 @@ from __future__ import annotations
 import sys
 import torch
 import ttnn
-import ttl  # noqa: F401  (kept so the test compiles in the same env as the others)
+import ttl
 
 import _refs  # noqa: F401
 from _refs import open_mesh, close_mesh, report_pcc, download_chip0
@@ -44,13 +44,66 @@ BUCKET = 128       # smallest bucket from _INDEXER_TOPK_BUCKETS
 K_FIXED = 64       # arbitrary k <= bucket (real model uses min(index_topk, bucket))
 WIN = 128
 MASK_AMP = 1e4
+TILE = 32
 B, S = 1, 1
 
 
-def _indexer_topk_body(score_in_tt, ramp_int_tt, t_active_tt):
-    """The shared op chain. Used by both the reference and kernel paths
-    today; once tt-lang gains topk + int compares + bool casts, the
-    kernel path will diverge into a fused dispatch."""
+def _make_mask_build_kernel(num_h_tiles: int):
+    """Fused mask build via bf16 sign trick.
+
+    Replaces the ttnn lt(int32) + typecast(bool->bf16) + sub(1) + mul(amp) + add
+    chain with one tt-lang kernel. Inputs ramp/t_active are bf16. Output:
+        masked = score + (sign(t_active - ramp - 0.5) - 1) * (MASK_AMP / 2)
+    Validates as +0 for ramp < t_active (valid lane) and -MASK_AMP for invalid.
+    """
+    half_amp = MASK_AMP / 2.0
+
+    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
+    def mask_build(score, ramp, t_active, masked_out):
+        score_dfb = ttl.make_dataflow_buffer_like(
+            score, shape=(1, 1), block_count=2)
+        ramp_dfb = ttl.make_dataflow_buffer_like(
+            ramp, shape=(1, 1), block_count=2)
+        ta_dfb = ttl.make_dataflow_buffer_like(
+            t_active, shape=(1, 1), block_count=2)
+        # Scratch holds the additive mask term; combining it with `score` in
+        # the same store mis-compiles when mixed with the multi-fill chain
+        # (collapses the scaled term to ~0). Stage via a CB instead.
+        mask_dfb = ttl.make_dataflow_buffer_like(
+            masked_out, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(
+            masked_out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for _ in range(num_h_tiles):
+                sc = score_dfb.wait()
+                rp = ramp_dfb.wait()
+                ta = ta_dfb.wait()
+                mask_dfb.reserve().store(
+                    (ttl.math.sign(ta - rp - ttl.math.fill(rp, 0.5))
+                     - ttl.math.fill(ta, 1.0))
+                    * ttl.math.fill(rp, half_amp))
+                m = mask_dfb.wait()
+                out_dfb.reserve().store(sc + m)
+
+        @ttl.datamovement()
+        def dm_read():
+            for h in range(num_h_tiles):
+                ttl.copy(score[0, h], score_dfb.reserve()).wait()
+                ttl.copy(ramp[0, h], ramp_dfb.reserve()).wait()
+                ttl.copy(t_active[0, h], ta_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            for h in range(num_h_tiles):
+                ttl.copy(out_dfb.wait(), masked_out[0, h]).wait()
+
+    return mask_build
+
+
+def _indexer_topk_body_ref(score_in_tt, ramp_int_tt, t_active_tt):
+    """Reference op chain, kept verbatim so the kernel path can diverge."""
     score_slice = ttnn.slice(score_in_tt, [0, 0, 0], [B, S, BUCKET])
     mask_bool = ttnn.lt(ramp_int_tt, t_active_tt)
     mask_bf16 = ttnn.typecast(mask_bool, dtype=ttnn.bfloat16)
@@ -71,20 +124,81 @@ def _indexer_topk_body(score_in_tt, ramp_int_tt, t_active_tt):
 def make_lk_d_topk_kernel(mesh):
     """Mega kernel for Lk-D-topk.
 
-    Today the kernel path is identical to the reference because every op
-    in the zone is blocked. Wrapped in a closure that matches the
-    `kernel(in..., out)` calling convention used by sibling tests.
+    Mask construction (lt + bool typecast + sub + mul + add) is now a single
+    tt-lang kernel using the bf16 sign trick. topk and the post-correction
+    int-math chain remain ttnn (TODO: mega bundled with B1 topk lowering).
     """
+    h_tiles = BUCKET // TILE
+    mask_build = _make_mask_build_kernel(num_h_tiles=h_tiles)
+
+    rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
+               memory_config=ttnn.DRAM_MEMORY_CONFIG,
+               mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+
+    # Pre-stage ramp as bf16 [TILE, BUCKET]; only row 0 is used downstream
+    # but the kernel processes all rows identically (rows 1+ are don't-cares).
+    ramp_bf16_cpu = torch.zeros(TILE, BUCKET, dtype=torch.bfloat16)
+    ramp_bf16_cpu[0, :] = torch.arange(BUCKET, dtype=torch.bfloat16)
+    ramp_bf16_tt = ttnn.from_torch(ramp_bf16_cpu, dtype=ttnn.bfloat16, **rep)
+
+    state: dict = {"ramp_bf16": ramp_bf16_tt}
 
     def lk_d_topk_kernel(score_in_tt, ramp_int_tt, t_active_tt, cmp_idxs_out):
-        cmp_idxs_int = _indexer_topk_body(score_in_tt, ramp_int_tt, t_active_tt)
+        if "init" not in state:
+            state["score_padded"] = ttnn.from_torch(
+                torch.zeros(TILE, BUCKET, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
+            state["t_active_padded"] = ttnn.from_torch(
+                torch.zeros(TILE, BUCKET, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
+            state["masked_padded"] = ttnn.from_torch(
+                torch.zeros(TILE, BUCKET, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
+            state["init"] = True
+
+        # Stage score [1, 1, T_PAD] -> [TILE, BUCKET].
+        # TODO: mega fusion blocked: ttnn.slice/reshape sub-tile.
+        score_slice = ttnn.slice(score_in_tt, [0, 0, 0], [B, S, BUCKET])
+        score_2d = ttnn.reshape(score_slice, [B, BUCKET])
+        score_padded_in = ttnn.pad(score_2d, padding=[(0, TILE - B), (0, 0)],
+                                   value=0.0)
+        ttnn.copy(score_padded_in, state["score_padded"])
+
+        # Convert t_active int32 -> bf16; pad to [TILE, BUCKET].
+        # TODO: mega fusion blocked: ttnn.typecast int32->bf16.
+        t_active_bf16 = ttnn.typecast(t_active_tt, dtype=ttnn.bfloat16)
+        t_active_2d = ttnn.reshape(t_active_bf16, [B, BUCKET])
+        t_active_padded_in = ttnn.pad(t_active_2d, padding=[(0, TILE - B), (0, 0)],
+                                       value=0.0)
+        ttnn.copy(t_active_padded_in, state["t_active_padded"])
+
+        # tt-lang fused mask build + score add.
+        mask_build(state["score_padded"], state["ramp_bf16"],
+                   state["t_active_padded"], state["masked_padded"])
+
+        # Slice back to [1, 1, BUCKET] for topk consumption.
+        # TODO: mega fusion blocked: ttnn.slice/reshape sub-tile.
+        masked_2d = ttnn.slice(state["masked_padded"], [0, 0], [B, BUCKET])
+        masked_tt = ttnn.reshape(masked_2d, [1, B, BUCKET])
+
+        # topk + post-correction stay in ttnn until B1 lands.
+        # TODO: mega fusion blocked: ttnn.topk + the int post-correction chain.
+        vals_tt, idxs_tt = ttnn.topk(
+            masked_tt, k=K_FIXED, dim=-1, largest=True, sorted=True)
+        invalid_bf16 = ttnn.lt(vals_tt, -1000.0)
+        invalid_int = ttnn.typecast(invalid_bf16, dtype=ttnn.int32)
+        idxs_int = ttnn.typecast(idxs_tt, dtype=ttnn.int32)
+        idxs_winned = ttnn.add(idxs_int, WIN)
+        idxs_plus_1 = ttnn.add(idxs_winned, 1)
+        correction = ttnn.multiply(idxs_plus_1, invalid_int)
+        cmp_idxs_int = ttnn.subtract(idxs_winned, correction)
         ttnn.copy(cmp_idxs_int, cmp_idxs_out)
 
     return lk_d_topk_kernel
 
 
 def reference(mesh, score_in_tt, ramp_int_tt, t_active_tt):
-    return _indexer_topk_body(score_in_tt, ramp_int_tt, t_active_tt)
+    return _indexer_topk_body_ref(score_in_tt, ramp_int_tt, t_active_tt)
 
 
 def main():
