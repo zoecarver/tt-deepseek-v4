@@ -11,14 +11,22 @@ the wq_b all_gather and the wkv all_gather:
 The wq_a/wq_b path that produces q_full / qr is upstream (Lk-A/B).
 For this test we feed in random q_full and x directly.
 
-TODO: mega two helpers in the q-stack are still pure-ttnn op chains and
-have NOT been lowered into @ttl.operation kernels in this file:
-  1. `_device_q_rsqrt_norm` (multiply + reduce_mean + add + rsqrt +
-     multiply) — needs a tt-lang kernel doing per-head rsqrt-norm.
-  2. `_device_apply_rotary_interleaved` (slice + transpose + multiply +
-     concat) — needs a tt-lang kernel doing the interleave/multiply.
-The optimization stage requires every op in this zone to live as
-tt-lang in this file; lower these before fusion work begins.
+q_rsqrt_norm is now lowered to the inlined rmsnorm tt-lang kernel
+(per-head rsqrt-norm = rmsnorm with gamma=ones). The wkv matmul is
+the inlined SUMMA kernel.
+
+TODO: lower the rotary to tt-lang. `_device_apply_rotary_interleaved`
+is still pure ttnn (slice / multiply / concat). Lowering needs a real
+design pass: at decode the rope half is rd=64 wide which is 2 tiles,
+the (real, imag) pairs are interleaved along the last axis (positions
+0,2,4,... vs 1,3,5,...) so a tile-tile @ttl.operation must either
+transpose pairs to separate tiles first, or read sub-tile granularity
+which tt-lang doesn't support natively. Pick a layout for cos/sin that
+matches a chosen split layout and keep the tt-lang body to four
+elementwise multiplies + one add and one sub.
+ttnn.embedding(start_pos, cos/sin) for the table lookup is also still
+ttnn — it depends on a device int32 tensor and is not a candidate for
+fusion into the rotary kernel.
 """
 from __future__ import annotations
 
@@ -43,6 +51,95 @@ MAX_SEQ_LEN = 512
 NORM_EPS = 1e-6
 B, S = 1, 1
 TILE = 32
+
+
+def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
+                         rms_eps: float, inv_D: float):
+    """RMSNorm kernel inlined from inference.py / tt-lang-kernels/rmsnorm.py."""
+
+    @ttl.operation(
+        grid="auto",
+        options="--no-ttl-reduce-full-fp32",
+        fp32_dest_acc_en=True,
+    )
+    def rmsnorm_kernel(x, gamma, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        tiles_per_core = -(-num_row_tiles // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        g_dfb = ttl.make_dataflow_buffer_like(gamma, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        xsq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        red_step_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        inv_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            sc = sc_dfb.wait()
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    x0 = x_dfb.wait()
+                    xsq_dfb.reserve().store(x0 * x0)
+                    sq_dfb.reserve().store(
+                        ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
+                    )
+                    for _ in range(h_tiles - 1):
+                        xk = x_dfb.wait()
+                        xsq_dfb.reserve().store(xk * xk)
+                        red_step_dfb.reserve().store(
+                            ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
+                        )
+                        prev = sq_dfb.wait()
+                        sq_dfb.reserve().store(prev + red_step_dfb.wait())
+
+                    sq = sq_dfb.wait()
+                    inv_bc = inv_bc_dfb.reserve()
+                    inv_bc.store(ttl.math.broadcast(
+                        ttl.math.rsqrt(
+                            sq * ttl.math.fill(sq, inv_D)
+                            + ttl.math.fill(sq, rms_eps)
+                        ),
+                        inv_bc, dims=[1],
+                    ))
+                    inv = inv_bc_dfb.wait()
+
+                    for _ in range(h_tiles):
+                        xk = x_dfb.wait()
+                        gk = g_dfb.wait()
+                        out_dfb.reserve().store(xk * gk * inv)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    for h in range(h_tiles):
+                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
+                    for h in range(h_tiles):
+                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
+                        ttl.copy(gamma[0, h], g_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    for h in range(h_tiles):
+                        ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
+
+    return rmsnorm_kernel
 
 
 def _make_summa_matmul_kernel(M: int, K: int, N: int,
@@ -132,19 +229,41 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
     return summa_matmul
 
 
-def make_lk_c_kernel():
+def make_lk_c_kernel(mesh):
     """Mega kernel for Lk-C = q_rsqrt_norm + q rotary + wkv matmul.
 
-    The q-stack tail uses ttnn helpers (q_rsqrt_norm + rotary); the wkv
-    matmul is a tt-lang SUMMA dispatch. Mirrors the wq_b → wkv slice of
-    DeviceAttention.forward_device exactly.
+    q_rsqrt_norm is the inlined rmsnorm kernel with gamma=ones (per-head
+    rsqrt-norm IS rmsnorm; both compute x * rsqrt(mean(x^2) + eps) and
+    differ only by the multiplicative gamma weight). The wkv matmul is
+    the inlined SUMMA kernel. The rotary helper is still pure-ttnn —
+    see the file docstring TODO for the design notes.
     """
+    rms_kernel = _make_rmsnorm_kernel(
+        num_row_tiles=N_HEADS // TILE,         # 64 / 32 = 2
+        h_tiles=HEAD_DIM // TILE,              # 512 / 32 = 16
+        rms_eps=NORM_EPS, inv_D=1.0 / HEAD_DIM)
     matmul_kernel = _make_summa_matmul_kernel(
         M=TILE, K=DIM, N=HEAD_DIM,
         block_cfg=(1, 4, 8), part_cfg=(1, 4, 1))
+
+    rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
+               memory_config=ttnn.DRAM_MEMORY_CONFIG,
+               mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    # gamma=ones for q_rsqrt_norm. Packed [TILE, HEAD_DIM] so the rmsnorm
+    # kernel's `gamma[0, h]` reads cover the full row.
+    gamma_q_packed = torch.ones(HEAD_DIM, dtype=torch.bfloat16) \
+        .unsqueeze(0).expand(TILE, -1).contiguous()
+    gamma_q_tt = ttnn.as_tensor(gamma_q_packed, dtype=ttnn.bfloat16, **rep)
+    sc_tt = ttnn.from_torch(
+        torch.ones((TILE, TILE), dtype=torch.bfloat16),
+        device=mesh, dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+
     state: dict = {}
 
-    def _alloc_replicated_zeros(mesh, shape):
+    def _alloc_replicated_zeros(shape):
         return ttnn.from_torch(
             torch.zeros(*shape, dtype=torch.bfloat16),
             device=mesh, dtype=ttnn.bfloat16,
@@ -155,15 +274,20 @@ def make_lk_c_kernel():
     def lk_c_kernel(q_full, x, cos_full, sin_full, start_pos, wkv_w,
                     q_out, wkv_out):
         if "scratch" not in state:
-            mesh = q_full.device()
-            state["wkv_padded_tt"] = _alloc_replicated_zeros(mesh, (TILE, HEAD_DIM))
+            state["q_normed_2d_tt"] = _alloc_replicated_zeros(
+                (N_HEADS, HEAD_DIM))
+            state["wkv_padded_tt"] = _alloc_replicated_zeros((TILE, HEAD_DIM))
             state["scratch"] = True
 
         rd_half = ROPE_HEAD_DIM // 2
 
-        # q-stack tail (ttnn helpers).
-        q_tt = ttnn.reshape(q_full, [B, S, N_HEADS, HEAD_DIM])
-        q_tt = _device_q_rsqrt_norm(ttnn, q_tt, NORM_EPS)
+        # q_rsqrt_norm via rmsnorm tt-lang kernel.
+        q_2d = ttnn.reshape(q_full, [N_HEADS, HEAD_DIM])
+        rms_kernel(q_2d, gamma_q_tt, sc_tt, state["q_normed_2d_tt"])
+        q_tt = ttnn.reshape(state["q_normed_2d_tt"], [B, S, N_HEADS, HEAD_DIM])
+
+        # TODO: lower this rotary block to a @ttl.operation kernel; see
+        # the file docstring for the design notes.
         cos = ttnn.embedding(start_pos, cos_full, layout=ttnn.TILE_LAYOUT)
         sin = ttnn.embedding(start_pos, sin_full, layout=ttnn.TILE_LAYOUT)
         cos = ttnn.reshape(cos, [1, S, 1, rd_half])
@@ -243,7 +367,7 @@ def main():
         ref_q_host = download_chip0(mesh, mesh_shape, ref_q_tt)
         ref_wkv_host = download_chip0(mesh, mesh_shape, ref_wkv_tt)
 
-        kernel = make_lk_c_kernel()
+        kernel = make_lk_c_kernel(mesh)
         q_out_tt = ttnn.from_torch(
             torch.zeros(1, 1, N_HEADS, HEAD_DIM, dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, **rep)
