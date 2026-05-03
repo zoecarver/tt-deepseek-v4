@@ -191,6 +191,43 @@ def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
     return rotary_combine
 
 
+def _make_scale_mask_kernel(num_row_tiles: int, num_k_tiles: int, scale: float):
+    """scores * softmax_scale + valid (valid broadcast across H rows)."""
+
+    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
+    def scale_mask(scores, valid, masked_out):
+        scores_dfb = ttl.make_dataflow_buffer_like(
+            scores, shape=(1, 1), block_count=2)
+        valid_dfb = ttl.make_dataflow_buffer_like(
+            valid, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(
+            masked_out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for kt in range(num_k_tiles):
+                for _ in range(num_row_tiles):
+                    s = scores_dfb.wait()
+                    v = valid_dfb.wait()
+                    out_dfb.reserve().store(
+                        s * ttl.math.fill(s, scale) + v)
+
+        @ttl.datamovement()
+        def dm_read():
+            for kt in range(num_k_tiles):
+                for mt in range(num_row_tiles):
+                    ttl.copy(scores[mt, kt], scores_dfb.reserve()).wait()
+                    ttl.copy(valid[0, kt], valid_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            for kt in range(num_k_tiles):
+                for mt in range(num_row_tiles):
+                    ttl.copy(out_dfb.wait(), masked_out[mt, kt]).wait()
+
+    return scale_mask
+
+
 def _build_rotary_tables(cos_full_cpu: torch.Tensor, sin_full_cpu: torch.Tensor,
                          inverse: bool):
     max_seq_len, rd_half = cos_full_cpu.shape
@@ -277,6 +314,10 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
     rotary_combine_kernel = _make_rotary_combine_kernel(
         num_row_tiles=H // TILE, num_h_tiles=rd // TILE)
 
+    # Score scale + masked add: scores [H, K] * scale + valid [TILE, K] (bcast).
+    scale_mask_kernel = _make_scale_mask_kernel(
+        num_row_tiles=H // TILE, num_k_tiles=K // TILE, scale=softmax_scale)
+
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
@@ -318,6 +359,12 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
             state["o_rope_rot"] = ttnn.from_torch(
                 torch.zeros(H, ROPE_HEAD_DIM, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
+            state["scores_masked_padded"] = ttnn.from_torch(
+                torch.zeros(H, K, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
+            state["valid_padded"] = ttnn.from_torch(
+                torch.zeros(TILE, K, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
             state["init"] = True
 
         # 1. paged_update_cache.
@@ -334,7 +381,12 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         # tile<->row-major converter.
         cond = ttnn.lt(topk_idxs_tt, 0)
         cond_4d = ttnn.reshape(cond, [B, S, 1, K])
-        valid_tt = ttnn.where(cond_4d, float("-inf"), 0.0)
+        valid_4d = ttnn.where(cond_4d, float("-inf"), 0.0)
+        # 2D-pad valid for the tt-lang scale_mask kernel input (broadcast across H).
+        valid_2d = ttnn.reshape(valid_4d, [B, K])
+        valid_padded_in = ttnn.pad(
+            valid_2d, padding=[(0, TILE - B), (0, 0)], value=0.0)
+        ttnn.copy(valid_padded_in, state["valid_padded"])
         safe = ttnn.clamp(topk_idxs_tt, min=0)
         safe = ttnn.reshape(safe, [B, S * K])
         safe = ttnn.typecast(safe, dtype=ttnn.uint32)
@@ -358,12 +410,10 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         q_2d = ttnn.reshape(q_tt, [H, D])
         matmul_score(q_2d, kv_gather_t_2d, state["scores_padded"])
 
-        # 6. Multiply by softmax_scale + add mask.
-        # TODO: mega fusion blocked: ttnn used for scalar multiply + masked
-        # add. Could fold scale into kv on host but kv changes every step.
-        scores_4d = ttnn.reshape(state["scores_padded"], [B, S, H, K])
-        scores_scaled = ttnn.multiply(scores_4d, softmax_scale)
-        scores_masked = ttnn.add(scores_scaled, valid_tt)
+        # 6. Multiply by softmax_scale + add mask (fused tt-lang kernel).
+        scale_mask_kernel(state["scores_padded"], state["valid_padded"],
+                          state["scores_masked_padded"])
+        scores_masked = ttnn.reshape(state["scores_masked_padded"], [B, S, H, K])
 
         # 7. Concat sink, softmax, drop sink.
         # TODO: mega fusion blocked: ttnn used for concat/softmax/slice. No
