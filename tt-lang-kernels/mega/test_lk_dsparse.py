@@ -28,7 +28,8 @@ ttnn glue (TODO: mega):
   - softmax_scale multiply (could fold into pre-scaled kv on host but
     kv changes per step)
   - concat sink, softmax, slice (no tt-lang softmax)
-  - inverse rotary helper (slice/reshape/multiply chain)
+  - embedding(start_pos, ...) for the inverse rotary cos/sin lookup
+    (rotary math itself is now in tt-lang via swap-SUMMA + combine)
   - group reshape + permute (no tt-lang permute)
   - per-group input/weight slicing for the wo_a dispatch loop
   - final permute + reshape to assemble o_flat
@@ -151,7 +152,77 @@ def _make_summa_matmul_kernel(M: int, K_dim: int, N: int,
     return summa_matmul
 
 
-def make_lk_dsparse_kernel(mesh, sharded_input_memcfg, softmax_scale: float):
+def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
+    """out = x * cos + x_swap * sin; cos/sin tile-replicated."""
+
+    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
+    def rotary_combine(x, x_swap, cos, sin, out):
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        xs_dfb = ttl.make_dataflow_buffer_like(x_swap, shape=(1, 1), block_count=2)
+        c_dfb = ttl.make_dataflow_buffer_like(cos, shape=(1, 1), block_count=2)
+        s_dfb = ttl.make_dataflow_buffer_like(sin, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for _ in range(num_row_tiles):
+                for _ in range(num_h_tiles):
+                    xt = x_dfb.wait()
+                    xst = xs_dfb.wait()
+                    ct = c_dfb.wait()
+                    st = s_dfb.wait()
+                    out_dfb.reserve().store(xt * ct + xst * st)
+
+        @ttl.datamovement()
+        def dm_read():
+            for t in range(num_row_tiles):
+                for h in range(num_h_tiles):
+                    ttl.copy(x[t, h], x_dfb.reserve()).wait()
+                    ttl.copy(x_swap[t, h], xs_dfb.reserve()).wait()
+                    ttl.copy(cos[0, h], c_dfb.reserve()).wait()
+                    ttl.copy(sin[0, h], s_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            for t in range(num_row_tiles):
+                for h in range(num_h_tiles):
+                    ttl.copy(out_dfb.wait(), out[t, h]).wait()
+
+    return rotary_combine
+
+
+def _build_rotary_tables(cos_full_cpu: torch.Tensor, sin_full_cpu: torch.Tensor,
+                         inverse: bool):
+    max_seq_len, rd_half = cos_full_cpu.shape
+    rd = 2 * rd_half
+    if rd % TILE != 0:
+        raise ValueError(f"rd={rd} not multiple of TILE={TILE}")
+    cos_extended = cos_full_cpu.repeat_interleave(2, dim=-1)
+    sign = torch.ones(rd, dtype=cos_full_cpu.dtype)
+    if inverse:
+        sign[1::2] = -1
+    else:
+        sign[0::2] = -1
+    sin_signed = sin_full_cpu.repeat_interleave(2, dim=-1) * sign
+    cos_extended_packed = cos_extended.unsqueeze(1).expand(
+        max_seq_len, TILE, rd).reshape(max_seq_len, TILE * rd).contiguous()
+    sin_signed_packed = sin_signed.unsqueeze(1).expand(
+        max_seq_len, TILE, rd).reshape(max_seq_len, TILE * rd).contiguous()
+    return cos_extended_packed, sin_signed_packed
+
+
+def _build_swap_matrix(rd: int) -> torch.Tensor:
+    if rd % 2:
+        raise ValueError(f"rd={rd} must be even")
+    P = torch.zeros(rd, rd, dtype=torch.bfloat16)
+    for k in range(rd // 2):
+        P[2 * k, 2 * k + 1] = 1.0
+        P[2 * k + 1, 2 * k] = 1.0
+    return P
+
+
+def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
+                           sharded_input_memcfg, softmax_scale: float):
     """Mega kernel for Lk-Dsparse.
 
     Pipeline:
@@ -173,7 +244,6 @@ def make_lk_dsparse_kernel(mesh, sharded_input_memcfg, softmax_scale: float):
     H = N_HEADS
     D = HEAD_DIM
     rd = ROPE_HEAD_DIM
-    rd_half = rd // 2
 
     # SUMMA score: M=H=64, K=D=512, N=K=128. Mt=2, Kt=16, Nt=4.
     # block (1, 2, 4) part (2, 2, 1): Mb=2, Nb=2, Kb=4 -> 4 cores.
@@ -199,9 +269,25 @@ def make_lk_dsparse_kernel(mesh, sharded_input_memcfg, softmax_scale: float):
         M=TILE, K_dim=N_GROUPS * O_LORA_RANK, N=DIM,
         block_cfg=(1, 16, 8), part_cfg=(1, 8, 1))
 
+    # Inverse rotary swap-SUMMA: M=H=64, K=N=rd=64. block=(1,1,2),
+    # part=(2,2,1) -> 4 cores.
+    swap_kernel = _make_summa_matmul_kernel(
+        M=H, K_dim=rd, N=rd,
+        block_cfg=(1, 1, 2), part_cfg=(2, 2, 1))
+    rotary_combine_kernel = _make_rotary_combine_kernel(
+        num_row_tiles=H // TILE, num_h_tiles=rd // TILE)
+
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+
+    cos_ext_packed, sin_signed_packed = _build_rotary_tables(
+        cos_full_cpu, sin_full_cpu, inverse=True)
+    cos_ext_tt = ttnn.as_tensor(cos_ext_packed, dtype=ttnn.bfloat16, **rep)
+    sin_signed_tt = ttnn.as_tensor(sin_signed_packed, dtype=ttnn.bfloat16, **rep)
+    P_cpu = _build_swap_matrix(rd)
+    P_tt = ttnn.as_tensor(P_cpu.contiguous(), dtype=ttnn.bfloat16, **rep)
+
     state: dict = {}
 
     def lk_dsparse_kernel(q_tt, kv_tt, kv_cache_tt, kv_slot_tt, topk_idxs_tt,
@@ -225,6 +311,12 @@ def make_lk_dsparse_kernel(mesh, sharded_input_memcfg, softmax_scale: float):
             ]
             state["wo_b_out_padded"] = ttnn.from_torch(
                 torch.zeros(TILE, DIM, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
+            state["o_rope_swap"] = ttnn.from_torch(
+                torch.zeros(H, ROPE_HEAD_DIM, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
+            state["o_rope_rot"] = ttnn.from_torch(
+                torch.zeros(H, ROPE_HEAD_DIM, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
             state["init"] = True
 
@@ -285,19 +377,20 @@ def make_lk_dsparse_kernel(mesh, sharded_input_memcfg, softmax_scale: float):
         kv_gather_2d = ttnn.reshape(kv_gather_4d, [K, D])
         matmul_output(probs_2d, kv_gather_2d, state["o_padded"])
 
-        # 9. Inverse rotary on o[..., -rd:].
-        # TODO: mega fusion blocked: ttnn used for embedding(start_pos, table)
-        # + slice/reshape/multiply rotary chain. Lowering needs tt-lang
-        # gather (cos/sin lookup) and a tt-lang rotary primitive.
-        o_4d = ttnn.reshape(state["o_padded"], [B, S, H, D])
-        cos = ttnn.embedding(start_pos_tt, cos_full_tt, layout=ttnn.TILE_LAYOUT)
-        sin = ttnn.embedding(start_pos_tt, sin_full_tt, layout=ttnn.TILE_LAYOUT)
-        cos = ttnn.reshape(cos, [1, S, 1, rd_half])
-        sin = ttnn.reshape(sin, [1, S, 1, rd_half])
-        o_nope = ttnn.slice(o_4d, [0, 0, 0, 0], [B, S, H, D - rd])
-        o_rope = ttnn.slice(o_4d, [0, 0, 0, D - rd], [B, S, H, D])
-        o_rope = _device_apply_rotary_interleaved(ttnn, o_rope, cos, sin, inverse=True)
-        o_concat = ttnn.concat([o_nope, o_rope], dim=-1)
+        # 9. Inverse rotary on o[..., -rd:] via swap-SUMMA + rotary-combine.
+        # Operates on the 2D [H, D] layout and slices the rope tail directly.
+        # TODO: mega fusion blocked: ttnn used for embedding(start_pos, ...).
+        cos_b_2d = ttnn.embedding(start_pos_tt, cos_ext_tt, layout=ttnn.TILE_LAYOUT)
+        sin_b_2d = ttnn.embedding(start_pos_tt, sin_signed_tt, layout=ttnn.TILE_LAYOUT)
+        cos_b = ttnn.reshape(cos_b_2d, [TILE, rd])
+        sin_b = ttnn.reshape(sin_b_2d, [TILE, rd])
+        o_nope_2d = ttnn.slice(state["o_padded"], [0, 0], [H, D - rd])
+        o_rope_2d = ttnn.slice(state["o_padded"], [0, D - rd], [H, D])
+        swap_kernel(o_rope_2d, P_tt, state["o_rope_swap"])
+        rotary_combine_kernel(
+            o_rope_2d, state["o_rope_swap"], cos_b, sin_b, state["o_rope_rot"])
+        o_full_2d = ttnn.concat([o_nope_2d, state["o_rope_rot"]], dim=-1)
+        o_concat = ttnn.reshape(o_full_2d, [B, S, H, D])
 
         # 10. Group reshape + permute.
         # TODO: mega fusion blocked: ttnn used for permute + per-group slice.
@@ -468,7 +561,8 @@ def main():
             wo_a_w_tt, wo_b_w_tt, softmax_scale, sharded_memcfg)
         ref_host = download_chip0(mesh, mesh_shape, ref_out_tt)
 
-        kernel = make_lk_dsparse_kernel(mesh, sharded_memcfg, softmax_scale)
+        kernel = make_lk_dsparse_kernel(
+            mesh, cos_full, sin_full, sharded_memcfg, softmax_scale)
         out_tt = ttnn.from_torch(
             torch.zeros(1, 1, DIM, dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, **rep)
