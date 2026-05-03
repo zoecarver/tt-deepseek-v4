@@ -42,7 +42,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 from inference import (
     DeviceSparseAttn, _device_apply_rotary_interleaved,
@@ -641,6 +641,21 @@ def main():
         kernel_host = download_chip0(mesh, mesh_shape, out_tt)
 
         ok = report_pcc("Lk-Dsparse", ref_host, kernel_host)
+
+        benchmark("Lk-Dsparse ref",
+                  lambda: reference(
+                      mesh, q_tt, kv_tt, kv_cache_ref_tt, kv_slot_tt,
+                      topk_idxs_tt, attn_sink, cos_full_tt, sin_full_tt,
+                      start_pos_tt, wo_a_w_tt, wo_b_w_tt, softmax_scale,
+                      sharded_memcfg),
+                  mesh)
+        benchmark("Lk-Dsparse ttl",
+                  lambda: kernel(
+                      q_tt, kv_tt, kv_cache_kernel_tt, kv_slot_tt,
+                      topk_idxs_tt, sink_4d_tt, cos_full_tt, sin_full_tt,
+                      start_pos_tt, wo_a_w_tt, wo_b_w_tt, out_tt),
+                  mesh)
+
         sys.exit(0 if ok else 1)
     finally:
         close_mesh(mesh)

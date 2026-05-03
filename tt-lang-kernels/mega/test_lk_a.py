@@ -19,7 +19,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401  (sets up sys.path for `inference` import)
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 from inference import (
     DeviceMHC, DeviceRMSNorm, _MHC_TILE, _MHC_PAD_SENTINEL,
@@ -876,6 +876,15 @@ def main():
         kernel_host = download_chip0(mesh, mesh_shape, out_tt)
 
         ok = report_pcc("Lk-A", ref_host, kernel_host)
+
+        benchmark("Lk-A ref",
+                  lambda: reference(mesh, a_tt, hc_fn, hc_scale, hc_base,
+                                    gamma, wq_a_w_tt),
+                  mesh)
+        benchmark("Lk-A ttl",
+                  lambda: kernel(a_tt, wq_a_w_tt, out_tt),
+                  mesh)
+
         sys.exit(0 if ok else 1)
     finally:
         close_mesh(mesh)
