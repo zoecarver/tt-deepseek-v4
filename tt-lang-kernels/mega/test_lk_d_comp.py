@@ -446,7 +446,7 @@ def make_lk_d_comp_kernel(mesh, cos_compressor_cpu, sin_compressor_cpu,
       slice/reshape -> kv_front, kv_back, score_front, score_back [B, 1, d]
       4x paged_update_cache to state_front/back (TODO: mega).
       cssn over (now updated) front/back state buffers -> kv_normed [TILE, d]
-      reshape, slice nope/rope, rotary on rope, concat (TODO: mega).
+      slice nope/rope, swap-SUMMA + rotary-combine on rope, concat.
       paged_update_cache to kv_cache @ emit_slot (TODO: mega).
       4x slot_shift + 4x ttnn.copy.
     """

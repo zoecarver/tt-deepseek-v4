@@ -234,7 +234,7 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
       6. multiply by softmax_scale + add mask            [TODO: mega]
       7. concat sink, softmax, drop sink                 [TODO: mega]
       8. SUMMA output: probs [H, K] @ kv_gather [K, D] -> o [H, D]
-      9. inverse rotary on o[..., -rd:]                  [TODO: mega]
+      9. inverse rotary: swap-SUMMA + rotary-combine on o[..., -rd:]
      10. group reshape/permute                           [TODO: mega]
      11. SUMMA wo_a x 8 groups: o_g [TILE, per_group] @ wo_a_g [per_group, O_LORA_RANK]
      12. permute back + reshape -> o_flat [TILE, N_GROUPS*O_LORA_RANK]
