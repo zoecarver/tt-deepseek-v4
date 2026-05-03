@@ -3,6 +3,12 @@
 Reference is the exact ttnn / ttl chain: reshape into [B*S, q_lora_rank]
 → DeviceRMSNorm.forward_device(q_norm) → reshape to [B, S, q_lora_rank]
 → ttnn.matmul(wq_b). The all_gather after the matmul is excluded.
+
+All tt-lang kernel definitions live in this file (rmsnorm + SUMMA
+matmul). The reference path still calls into inference.py's wrappers so
+the comparison is apples-to-apples; the candidate path uses only the
+local @ttl.operation definitions so they can be fused / re-tuned here
+without round-tripping through inference.py.
 """
 from __future__ import annotations
 
@@ -14,7 +20,7 @@ import ttl
 import _refs  # noqa: F401
 from _refs import open_mesh, close_mesh, report_pcc, download_chip0
 
-from inference import DeviceRMSNorm, _RMS_TILE, _get_ttl_rmsnorm_kernel
+from inference import DeviceRMSNorm, _RMS_TILE
 
 
 Q_LORA_RANK = 1024
@@ -24,6 +30,99 @@ N = N_HEADS * HEAD_DIM    # 32768
 NORM_EPS = 1e-6
 B, S = 1, 1
 TILE = 32
+
+
+def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
+                         rms_eps: float, inv_D: float):
+    """RMSNorm kernel inlined from inference.py / tt-lang-kernels/rmsnorm.py.
+
+    Streams one row-tile (32 tokens) per core. Two passes over x per
+    row-tile: sum(x^2), then gamma * rsqrt(mean(x^2) + eps) apply.
+    """
+
+    @ttl.operation(
+        grid="auto",
+        options="--no-ttl-reduce-full-fp32",
+        fp32_dest_acc_en=True,
+    )
+    def rmsnorm_kernel(x, gamma, scaler, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        tiles_per_core = -(-num_row_tiles // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        g_dfb = ttl.make_dataflow_buffer_like(gamma, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        xsq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        red_step_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        inv_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            sc = sc_dfb.wait()
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    x0 = x_dfb.wait()
+                    xsq_dfb.reserve().store(x0 * x0)
+                    sq_dfb.reserve().store(
+                        ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
+                    )
+                    for _ in range(h_tiles - 1):
+                        xk = x_dfb.wait()
+                        xsq_dfb.reserve().store(xk * xk)
+                        red_step_dfb.reserve().store(
+                            ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
+                        )
+                        prev = sq_dfb.wait()
+                        sq_dfb.reserve().store(prev + red_step_dfb.wait())
+
+                    sq = sq_dfb.wait()
+                    inv_bc = inv_bc_dfb.reserve()
+                    inv_bc.store(ttl.math.broadcast(
+                        ttl.math.rsqrt(
+                            sq * ttl.math.fill(sq, inv_D)
+                            + ttl.math.fill(sq, rms_eps)
+                        ),
+                        inv_bc, dims=[1],
+                    ))
+                    inv = inv_bc_dfb.wait()
+
+                    for _ in range(h_tiles):
+                        xk = x_dfb.wait()
+                        gk = g_dfb.wait()
+                        out_dfb.reserve().store(xk * gk * inv)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    for h in range(h_tiles):
+                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
+                    for h in range(h_tiles):
+                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
+                        ttl.copy(gamma[0, h], g_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_row_tiles:
+                    for h in range(h_tiles):
+                        ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
+
+    return rmsnorm_kernel
 
 
 def _make_summa_matmul_kernel(M: int, K: int, N: int,
@@ -118,28 +217,36 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
     return summa_matmul
 
 
-def make_lk_b_kernel():
+def make_lk_b_kernel(mesh, gamma_cpu):
     """Mega kernel for Lk-B = rmsnorm(q_lora, gamma) @ wq_b.
 
-    Composes two tt-lang dispatches (rmsnorm + SUMMA matmul). Wrapper is
-    responsible for the [1,1,K] -> [TILE,K] padding and [TILE,N] -> [1,1,N]
-    slice/reshape glue around the kernels.
+    Two tt-lang dispatches (rmsnorm + SUMMA matmul) defined locally in
+    this file. Wrapper handles [1,1,K] -> [TILE,K] padding and
+    [TILE,N] -> [1,1,N] slice/reshape glue.
     """
     state: dict = {}
     M_PAD = TILE
-    rms_kernel = _get_ttl_rmsnorm_kernel(
+    rms_kernel = _make_rmsnorm_kernel(
         num_row_tiles=1, h_tiles=Q_LORA_RANK // TILE,
         rms_eps=NORM_EPS, inv_D=1.0 / Q_LORA_RANK)
     matmul_kernel = _make_summa_matmul_kernel(
         M=M_PAD, K=Q_LORA_RANK, N=N,
         block_cfg=(1, 8, 8), part_cfg=(1, 8, 1))
 
-    def lk_b_kernel(q_lora, q_norm_gamma, wq_b_w, out):
+    rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
+               memory_config=ttnn.DRAM_MEMORY_CONFIG,
+               mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    # Pack gamma to [TILE, K] (rmsnorm kernel reads gamma[0, h] but
+    # tile granularity needs the tile's full row dim populated).
+    gamma_packed = gamma_cpu.flatten().to(torch.bfloat16) \
+        .unsqueeze(0).expand(TILE, -1).contiguous()
+    gamma_tt = ttnn.as_tensor(gamma_packed, dtype=ttnn.bfloat16, **rep)
+
+    def lk_b_kernel(q_lora, wq_b_w, out):
         if "scratch" not in state:
-            mesh = q_lora.device()
-            sc_host = torch.ones((TILE, TILE), dtype=torch.bfloat16)
             state["scaler_tt"] = ttnn.from_torch(
-                sc_host, device=mesh, dtype=ttnn.bfloat16,
+                torch.ones((TILE, TILE), dtype=torch.bfloat16),
+                device=mesh, dtype=ttnn.bfloat16,
                 layout=ttnn.TILE_LAYOUT,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
@@ -163,7 +270,7 @@ def make_lk_b_kernel():
             q_2d, padding=[(0, M_PAD - B * S), (0, 0)], value=0.0)
 
         # 2. RMSNorm -> normed_tt [TILE, K].
-        rms_kernel(x_padded, q_norm_gamma, state["scaler_tt"], state["normed_tt"])
+        rms_kernel(x_padded, gamma_tt, state["scaler_tt"], state["normed_tt"])
 
         # 3. Matmul -> y_padded_tt [TILE, N].
         matmul_kernel(state["normed_tt"], wq_b_w, state["y_padded_tt"])
@@ -183,7 +290,6 @@ def reference(mesh, q_lora_tt, gamma_cpu, wq_b_w_tt):
     #   qr_2d = self._rmsnorm_device(self.q_norm_dev, q_lora_2d, B*S)
     #   qr_tt = ttnn.reshape(qr_2d, [B, S, q_lora_rank])
     q_lora_2d = ttnn.reshape(q_lora_tt, [B * S, Q_LORA_RANK])
-    # _rmsnorm_device pads M to TILE; for B*S=1, pad to _RMS_TILE.
     Mpad = -(-(B * S) // _RMS_TILE) * _RMS_TILE
     if (B * S) < Mpad:
         q_lora_2d = ttnn.pad(
@@ -213,14 +319,11 @@ def main():
         ref_out_tt = reference(mesh, q_lora_tt, gamma, wq_b_w_tt)
         ref_host = download_chip0(mesh, mesh_shape, ref_out_tt)
 
-        kernel = make_lk_b_kernel()
-        gamma_tt = ttnn.as_tensor(
-            gamma.unsqueeze(0).expand(_RMS_TILE, -1).contiguous(),
-            dtype=ttnn.bfloat16, **rep)
+        kernel = make_lk_b_kernel(mesh, gamma)
         out_tt = ttnn.from_torch(
             torch.zeros(1, 1, N, dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, **rep)
-        kernel(q_lora_tt, gamma_tt, wq_b_w_tt, out_tt)
+        kernel(q_lora_tt, wq_b_w_tt, out_tt)
         kernel_host = download_chip0(mesh, mesh_shape, out_tt)
 
         ok = report_pcc("Lk-B", ref_host, kernel_host)

@@ -10,6 +10,15 @@ the wq_b all_gather and the wkv all_gather:
 
 The wq_a/wq_b path that produces q_full / qr is upstream (Lk-A/B).
 For this test we feed in random q_full and x directly.
+
+TODO: mega two helpers in the q-stack are still pure-ttnn op chains and
+have NOT been lowered into @ttl.operation kernels in this file:
+  1. `_device_q_rsqrt_norm` (multiply + reduce_mean + add + rsqrt +
+     multiply) — needs a tt-lang kernel doing per-head rsqrt-norm.
+  2. `_device_apply_rotary_interleaved` (slice + transpose + multiply +
+     concat) — needs a tt-lang kernel doing the interleave/multiply.
+The optimization stage requires every op in this zone to live as
+tt-lang in this file; lower these before fusion work begins.
 """
 from __future__ import annotations
 

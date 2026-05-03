@@ -473,6 +473,20 @@ After you complete a kernel and it passes, commit the kernel with a detailed des
 
 If you need a component, you can prototype it in isolation, for example you could create a topk kernel in tt-lang in /tmp and iterate on that before dropping it in with the other logic.
 
+## IMPORTANT: all tt-lang code must be in the file
+
+You can duplicate tt-lang kernels from inference, but they need to all be in the same file. This will be important for the optimization stage (later) when we need to tweak the implementation and actually fuse the kernels together. You can start by reference kernels from inference.py, but then please inline them. Multiple kernels is OK for now, so you can have multiple factory functions, but all tt-lang source code needs to be in the file.
+
+You are allowed to create a single library of tt-lang kernels file if you want to share one kernel across several mega kernels and you are SURE that it will use the same config in each mega kernel. Still default to duplicating if you are unusure, but it is OK to create a library file next to _refs.py and use that, this library file should contain only tt-lang kernels (and factory functions) and maybe some light helpers.
+
+## Note on helpers and kernel boilerplate
+
+Sometimes you will need some helpers to reshape or typecast inputs before you invoke the tt-lang kernel(s), this is OK but not ideal. We can handle this in the next phase, but ideally, please keep this setup minimal. If at all possible, do this in the tt-lang kernel instead of in the caller in ttnn. For example, can reshape or slice be implemented with data movement?
+
+## Note on keeping things in ttnn
+
+Don't do it :) The point of this is to produce mega kernels in tt-lang, if there is logic in between in ttnn, this defeats the purpose and will block future fusion and optimization. If you absolutely need to keep something in ttnn, please add the following TODO so that we can revisit: "TODO: mega fusion blocked: ttnn used for X" (make sure to say "TODO: mega" exactly so it can be grepped for).
+
 ## Existing TTL kernels these absorb
 
 The eleven kernels already wired in `inference.py` are the building blocks:
