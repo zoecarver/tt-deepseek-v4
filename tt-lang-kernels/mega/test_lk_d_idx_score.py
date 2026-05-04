@@ -252,10 +252,10 @@ def make_lk_d_idx_score_kernel(mesh):
         block_cfg=(1, 1, 8), part_cfg=(1, 2, 1))
 
     # SUMMA2: M=H=64, K=d=128, N=T=128. Mt=2, Kt=4, Nt=4.
-    # block=(1, 2, 4) part=(2, 2, 1) -> 4 cores (Mb=2, Nb=2, M_BPN=N_BPN=1, Kb=1).
+    # block=(1, 1, 4) part=(2, 4, 1) -> 8 cores (Mb=2, Nb=4, M_BPN=N_BPN=1, Kb=1).
     matmul_score_kernel = _make_summa_matmul_kernel(
         M=H, K=d, N=T,
-        block_cfg=(1, 2, 4), part_cfg=(2, 2, 1))
+        block_cfg=(1, 1, 4), part_cfg=(2, 4, 1))
 
     # SUMMA3 (relu fused on B): M=TILE, K=H=64, N=T=128. Mt=1, Kt=2, Nt=4.
     # block=(1, 1, 2) part=(1, 4, 1) -> 4 cores (Nb=4, Mb=1, M_BPN=N_BPN=1, Kb=1).
