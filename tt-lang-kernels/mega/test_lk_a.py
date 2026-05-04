@@ -45,9 +45,14 @@ NORM_FN_KP = 8
 
 def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
                                     rms_eps: float, inv_D: float,
-                                    *, grid_cols: int = 8):
+                                    *, grid_cols: int = 8,
+                                    bk: int = 2):
     """K-axis-parallel mhc norm_fn for num_out_tiles=1 (decode).
-    Inlined from inference.py / tt-lang-kernels/pre_norm_fn_ksplit.py.
+
+    a_cb shape=(1, bk), b_cb shape=(bk, 1): each core's K-loop runs
+    K_NB=K_BPN/bk SUMMA-style accumulations of bk-tile products.
+    bk=2 is the max valid block size; bk=4 hits PCC due to DST register
+    pressure with fp32_dest_acc_en (a*a (1,bk)=(1,bk) tile + matmul DST).
     """
     if Kp < 2:
         raise ValueError(f"ksplit kernel requires Kp >= 2, got {Kp}")
@@ -61,6 +66,9 @@ def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
         raise ValueError(f"Kp={Kp} requires block_count={Kp-1} > 32")
 
     K_BPN = K_tiles // Kp
+    if K_BPN % bk:
+        raise ValueError(f"K_BPN={K_BPN} not divisible by bk={bk}")
+    K_NB = K_BPN // bk
     COL = grid_cols
     ROW = Kp // grid_cols
 
@@ -86,8 +94,8 @@ def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
         ]
         sq_reduce_net = ttl.PipeNet(sq_reduce_pipes)
 
-        a_cb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
-        b_cb = ttl.make_dataflow_buffer_like(b, shape=(1, 1), block_count=2)
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(1, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(b, shape=(bk, 1), block_count=2)
         sc_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
         out_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
 
@@ -95,7 +103,7 @@ def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
         sq_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
         inv_bc_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
 
-        asq_cb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
+        asq_cb = ttl.make_dataflow_buffer_like(a, shape=(1, bk), block_count=2)
         red_step_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
 
         recv_c_cb = ttl.make_dataflow_buffer_like(
@@ -116,11 +124,11 @@ def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
                 ttl.math.reduce_sum(asq_cb.wait(), sc, dims=[1])
             )
 
-            for _ in range(K_BPN - 1):
+            for _ in range(K_NB - 1):
                 ak = a_cb.wait()
-                bk = b_cb.wait()
+                bk_blk = b_cb.wait()
                 prev_c = c_cb.wait()
-                c_cb.reserve().store(prev_c + ak @ bk)
+                c_cb.reserve().store(prev_c + ak @ bk_blk)
 
                 asq_cb.reserve().store(ak * ak)
                 red_step_cb.reserve().store(
@@ -160,10 +168,10 @@ def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
 
             ttl.copy(scaler[0, 0], sc_cb.reserve()).wait()
 
-            for kb_local in range(K_BPN):
-                kc = k_p * K_BPN + kb_local
-                ttl.copy(a[0, kc], a_cb.reserve()).wait()
-                ttl.copy(b[kc, 0], b_cb.reserve()).wait()
+            for kb_local in range(K_NB):
+                kc = (k_p * K_NB + kb_local) * bk
+                ttl.copy(a[0:1, kc:kc + bk], a_cb.reserve()).wait()
+                ttl.copy(b[kc:kc + bk, 0:1], b_cb.reserve()).wait()
 
             is_root = (col_c == 0 and row_c == 0)
             if is_root:
@@ -394,11 +402,20 @@ def _make_mhc_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
     return sinkhorn_kernel
 
 
-def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
+def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int,
+                                 *, h_block: int = 16):
     """h-axis-sharded apply_mix. Per-(token, h-tile): out[t, h] = sum_m x[t,m,h] * mix[t,m].
-    Inlined from inference.py / tt-lang-kernels/pre_apply_mix_h.py.
+
+    DFBs hold shape=(1, h_block) tile blocks. Total work shrinks
+    h_blocks=h_tiles/h_block; each work unit batches h_block consecutive
+    h-tiles. mix stays (1, 1) (per-token scalar).
     """
-    total_work = num_tokens * h_tiles
+    if h_tiles % h_block:
+        raise ValueError(
+            f"h_tiles={h_tiles} not divisible by h_block={h_block}")
+    h_blocks = h_tiles // h_block
+    total_work = num_tokens * h_blocks
+    BH = h_block
 
     @ttl.operation(grid="auto")
     def apply_mix_h_kernel(x, mix, scaler, out):
@@ -406,14 +423,14 @@ def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
         total_cores = grid_rows * grid_cols
         work_per_core = -(-total_work // total_cores)
 
-        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
         mix_dfb = ttl.make_dataflow_buffer_like(mix, shape=(1, 1), block_count=2)
         sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, BH), block_count=2)
 
-        mix_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        prod_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        mix_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
+        prod_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
+        red_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, BH), block_count=2)
 
         @ttl.compute()
         def compute():
@@ -429,8 +446,8 @@ def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
                     mx.store(ttl.math.broadcast(mix_raw, mx, dims=[1]))
                     mix_bc = mix_bc_dfb.wait()
 
-                    x_tile = x_dfb.wait()
-                    prod_dfb.reserve().store(x_tile * mix_bc)
+                    x_blk = x_dfb.wait()
+                    prod_dfb.reserve().store(x_blk * mix_bc)
                     red_dfb.reserve().store(
                         ttl.math.reduce_sum(prod_dfb.wait(), sc, dims=[0])
                     )
@@ -445,10 +462,14 @@ def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
             for local_w in range(work_per_core):
                 global_w = core_idx * work_per_core + local_w
                 if global_w < total_work:
-                    global_t = global_w // h_tiles
-                    global_h = global_w % h_tiles
+                    global_t = global_w // h_blocks
+                    global_hb = global_w % h_blocks
+                    h_start = global_hb * BH
                     ttl.copy(mix[global_t, 0], mix_dfb.reserve()).wait()
-                    ttl.copy(x[global_t, global_h], x_dfb.reserve()).wait()
+                    ttl.copy(
+                        x[global_t:global_t + 1, h_start:h_start + BH],
+                        x_dfb.reserve(),
+                    ).wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -458,9 +479,13 @@ def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
             for local_w in range(work_per_core):
                 global_w = core_idx * work_per_core + local_w
                 if global_w < total_work:
-                    global_t = global_w // h_tiles
-                    global_h = global_w % h_tiles
-                    ttl.copy(out_dfb.wait(), out[global_t, global_h]).wait()
+                    global_t = global_w // h_blocks
+                    global_hb = global_w % h_blocks
+                    h_start = global_hb * BH
+                    ttl.copy(
+                        out_dfb.wait(),
+                        out[global_t:global_t + 1, h_start:h_start + BH],
+                    ).wait()
 
     return apply_mix_h_kernel
 
@@ -682,7 +707,7 @@ def make_lk_a_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
 
-    def lk_a_kernel(a_tt, wq_a_w_tt, out_tt):
+    def lk_a_kernel(a_tt, wq_a_w_tt, out_tt, x_pre_norm_bf16_out=None):
         if "scratch" not in state:
             # mhc scratch
             state["mixes_tt"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
@@ -770,6 +795,15 @@ def make_lk_a_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
                            [NUM_TOKENS, Q_LORA_RANK])
         y_3d = ttnn.reshape(y_row, [1, 1, Q_LORA_RANK])
         ttnn.copy(y_3d, out_tt)
+
+        # 10. Optionally publish the bf16 pre-norm hc_pre output as
+        # [TILE, DIM] for downstream consumers. Lk-C needs the post-norm
+        # bf16 tensor; the fused rms+matmul kernel above pre-bakes gamma
+        # into wq_a so it doesn't materialize a separate norm tile. The
+        # caller runs a tiny rms_norm on this pre-norm buffer to get the
+        # post-norm bridge tensor for wkv (one extra device op, no host).
+        if x_pre_norm_bf16_out is not None:
+            ttnn.copy(state["rms_in_tt"], x_pre_norm_bf16_out)
 
     return lk_a_kernel
 
