@@ -365,7 +365,7 @@ def _make_mhc_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
 
 
 def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int,
-                                 *, h_block: int = 4):
+                                 *, h_block: int = 16):
     """Per (token, h_tile): out[t, h] = reduce_sum(x[t, h] * mix[t]_bc, dim=0).
 
     Batches h_block consecutive h-tiles per work unit. DFBs hold
@@ -447,7 +447,7 @@ def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int,
     return apply_mix_h_kernel
 
 
-def _make_mhc_post_kernel(num_tokens: int, h_tiles: int, *, h_block: int = 4):
+def _make_mhc_post_kernel(num_tokens: int, h_tiles: int, *, h_block: int = 16):
     """Inlined from inference.py / tt-lang-kernels/post.py.
 
     Per-token, per-h-tile: out = x * post_mix_bc + comb^T @ residual.
@@ -542,7 +542,7 @@ def _make_mhc_post_kernel(num_tokens: int, h_tiles: int, *, h_block: int = 4):
 
 def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
                          rms_eps: float, inv_D: float,
-                         *, h_block: int = 4):
+                         *, h_block: int = 16):
     """Per row-tile rmsnorm. ssq accumulates across the row in BH-tile
     chunks, then inv_rms scales the row in matching BH-tile chunks.
 
