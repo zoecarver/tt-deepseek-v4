@@ -304,10 +304,10 @@ def make_lk_d_idx_score_kernel(mesh):
     T = T_PAD
 
     # SUMMA1: M=TILE, K=4096, N=H=64. Mt=1, Kt=128, Nt=2.
-    # block=(1, 1, 8) part=(1, 2, 1) -> 2 cores (Nb=2, M_BPN=N_BPN=1, Kb=16).
+    # block=(1, 1, 16) part=(1, 2, 1) -> 2 cores (Nb=2, Kb=8).
     matmul_wproj_kernel = _make_summa_matmul_kernel(
         M=TILE, K=DIM, N=H,
-        block_cfg=(1, 1, 8), part_cfg=(1, 2, 1))
+        block_cfg=(1, 1, 16), part_cfg=(1, 2, 1))
 
     # Fused score (q_idx @ kv.T, B-transpose) + relu + reduce
     # (w @ relu(score)). Grid (Np=4, Mp=2) = 8 cores. Each (n, m) core
