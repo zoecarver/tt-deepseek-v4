@@ -7,8 +7,8 @@ Reference is `DeviceLMHead.forward_argmax_device` end-to-end:
   -> matmul(y, w_lmhead) -> topk(k=1).
 
 Pipeline (3 inlined tt-lang kernels + ttnn glue):
-  hc_combiner_kernel: a [TILE, D] fp32, hc_fn_t_scaled [D, TILE] fp32 ->
-      pre [TILE, TILE] fp32 (cols 0..3 = sigmoid(mixes*rsqrt+hc_base)+hc_eps).
+  hc_combiner_kernel: a [TILE, D] bf16, hc_fn_t_scaled [D, TILE] bf16 ->
+      pre [TILE, TILE] bf16 (cols 0..3 = sigmoid(mixes*rsqrt+hc_base)+hc_eps).
   rmsnorm_kernel: y [TILE, hidden] bf16, gamma -> y_normed [TILE, hidden] bf16.
   ksplit_matmul: y_normed [TILE, hidden] bf16 @ w_lmhead [hidden, vocab] bf16 ->
       logits [TILE, vocab] bf16 (only row 0 valid).
@@ -16,11 +16,14 @@ Pipeline (3 inlined tt-lang kernels + ttnn glue):
 Math fold: hc_scale (scalar) is pre-multiplied into hc_fn_t on host so the
 kernel post-process is just sigmoid(mixes*rsqrt + hc_base) + hc_eps.
 
+a_tt is demoted to bf16 at offload (caller's responsibility) — the kernel
+runs end-to-end in bf16 with no typecast boundary between combiner and
+rmsnorm.
+
 ttnn glue (TODO: mega):
   - ttnn.slice (last row of a_tt) - tt-lang sub-tile-row dataflow not yet wired.
   - ttnn.reshape (x_2d->x_3d, pre->pre_3d) at sub-tile mhc=4 width.
   - ttnn.matmul (pre_3d @ x_3d) - sub-tile reshape requires intra-tile shuffle.
-  - ttnn.typecast (fp32 -> bf16).
   - ttnn.pad (sub-tile -> tile-aligned).
   - ttnn.topk (no tt-lang topk yet).
 """
@@ -367,20 +370,20 @@ def _make_ksplit_matmul_kernel(M: int, K: int, N: int,
 
 
 def _pack_hc_base_tile(hc_base: torch.Tensor) -> torch.Tensor:
-    """[1, mhc] fp32 -> [TILE, TILE] fp32 with cols 0..mhc-1 broadcast across
+    """[1, mhc] fp32 -> [TILE, TILE] bf16 with cols 0..mhc-1 broadcast across
     all rows and cols mhc..TILE-1 = 0. Cols 4..31 of pre/mixes are unused
     downstream but they participate in the tile-wise add; zero keeps them
     quiet (sigmoid(0)+hc_eps would leak garbage, so we slice mhc out before
     any consumer)."""
     if hc_base.shape != (1, MHC):
         raise ValueError(f"hc_base shape={tuple(hc_base.shape)} != (1, {MHC})")
-    out = torch.zeros(TILE, TILE, dtype=torch.float32)
-    out[:, :MHC] = hc_base[0:1, :].to(torch.float32).expand(TILE, MHC)
+    out = torch.zeros(TILE, TILE, dtype=torch.bfloat16)
+    out[:, :MHC] = hc_base[0:1, :].to(torch.bfloat16).expand(TILE, MHC)
     return out
 
 
 def _pack_hc_fn_t_scaled(hc_fn: torch.Tensor, hc_scale: torch.Tensor) -> torch.Tensor:
-    """hc_fn [mhc, mhc*hidden] fp32 + hc_scale [1] fp32 -> [D, TILE] fp32.
+    """hc_fn [mhc, mhc*hidden] fp32 + hc_scale [1] fp32 -> [D, TILE] bf16.
 
     Rows 0..D-1 of the output match (hc_fn.T * hc_scale). Cols 0..mhc-1 are
     the scaled fn columns; cols mhc..TILE-1 = 0 (since the kernel matmul
@@ -389,8 +392,8 @@ def _pack_hc_fn_t_scaled(hc_fn: torch.Tensor, hc_scale: torch.Tensor) -> torch.T
         raise ValueError(f"hc_fn shape={tuple(hc_fn.shape)} != ({MHC}, {D})")
     scaled = hc_fn.to(torch.float32) * float(hc_scale.item())
     t = scaled.transpose(0, 1).contiguous()                   # [D, mhc]
-    out = torch.zeros(D, TILE, dtype=torch.float32)
-    out[:, :MHC] = t
+    out = torch.zeros(D, TILE, dtype=torch.bfloat16)
+    out[:, :MHC] = t.to(torch.bfloat16)
     return out
 
 
@@ -435,12 +438,12 @@ def make_final_kernel(mesh, debug_state=None):
     if debug_state is None:
         debug_state = {}
 
-    def final_kernel(a_tt, hc_fn_t_scaled_tt, scaler_fp32_tt, hc_base_tile_tt,
+    def final_kernel(a_bf16_tt, hc_fn_t_scaled_tt, hc_base_tile_tt,
                      norm_gamma_packed_tt, scaler_bf16_tt, w_lmhead_tt):
         if "init" not in state:
             state["pre_tile"] = ttnn.from_torch(
-                torch.zeros(TILE, TILE, dtype=torch.float32),
-                dtype=ttnn.float32, **rep)
+                torch.zeros(TILE, TILE, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
             state["y_padded"] = ttnn.from_torch(
                 torch.zeros(TILE, DIM, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
@@ -452,25 +455,25 @@ def make_final_kernel(mesh, debug_state=None):
                 dtype=ttnn.bfloat16, **rep)
             state["init"] = True
 
-        # 1. HC combiner: a [TILE, D] fp32 + hc_fn_t_scaled [D, TILE] fp32
-        #    -> pre_tile [TILE, TILE] fp32 (cols 0..mhc-1 of row 0 valid).
-        # TODO: claude: can you please try a_tt in bf16 (whole thing bf16) and then fuse hc_combiner + rmsnorm + lmhead_summa and inline the slice, reshape, matmul etc so we have a genuine mega kernel with all the logic in one ttl.operation?
-        hc_combiner(a_tt, hc_fn_t_scaled_tt, scaler_fp32_tt,
+        # 1. HC combiner: a [TILE, D] bf16 + hc_fn_t_scaled [D, TILE] bf16
+        #    -> pre_tile [TILE, TILE] bf16 (cols 0..mhc-1 of row 0 valid).
+        # TODO: claude: fuse hc_combiner + rmsnorm + lmhead_summa via cross-row
+        # PipeNet (broadcast pre to all 80 cores in the lmhead grid).
+        hc_combiner(a_bf16_tt, hc_fn_t_scaled_tt, scaler_bf16_tt,
                     hc_base_tile_tt, state["pre_tile"])
 
-        # 2. pre_3d [1,1,mhc] @ x_3d [1,mhc,hidden] -> y [1,1,hidden] fp32.
+        # 2. pre_3d [1,1,mhc] @ x_3d [1,mhc,hidden] -> y [1,1,hidden] bf16.
         # TODO: mega fusion blocked: ttnn used for sub-tile slice/reshape
-        # at mhc=4 < TILE=32 (intra-tile shuffle not yet wired in tt-lang),
-        # for fp32->bf16 typecast (no tt-lang typecast op), and for the
-        # sub-tile [1, hidden] -> [TILE, hidden] padding before rmsnorm.
+        # at mhc=4 < TILE=32 (intra-tile shuffle not yet wired in tt-lang)
+        # and for the sub-tile [1, hidden] -> [TILE, hidden] padding before
+        # rmsnorm. Now that everything is bf16 the explicit typecast is gone.
         last = NUM_TOKENS - 1
-        x_2d = ttnn.slice(a_tt, [last, 0], [last + 1, D])
+        x_2d = ttnn.slice(a_bf16_tt, [last, 0], [last + 1, D])
         x_3d = ttnn.reshape(x_2d, [1, MHC, DIM])
         pre = ttnn.slice(state["pre_tile"], [0, 0], [1, MHC])
         pre_3d = ttnn.reshape(pre, [1, 1, MHC])
         y_3d = ttnn.matmul(pre_3d, x_3d)
-        y_bf16_3d = ttnn.typecast(y_3d, dtype=ttnn.bfloat16)
-        y_2d = ttnn.reshape(y_bf16_3d, [1, DIM])
+        y_2d = ttnn.reshape(y_3d, [1, DIM])
         y_padded_in = ttnn.pad(y_2d, padding=[(0, TILE - 1), (0, 0)],
                                value=0.0)
         ttnn.copy(y_padded_in, state["y_padded"])
@@ -578,27 +581,29 @@ def main():
         ref_logits_host = download_chip0(mesh, mesh_shape, ref_debug["logits"])
 
         # Kernel inputs: hc_fn_t pre-scaled by hc_scale (folded into b).
+        # bf16 across the board: a_tt demoted at offload so the combiner
+        # reads bf16 and the prologue matmul output stays bf16 (no typecast).
+        a_bf16 = a.to(torch.bfloat16)
         hc_fn_t_scaled = _pack_hc_fn_t_scaled(hc_fn, hc_scale)
         hc_base_tile = _pack_hc_base_tile(hc_base)
         norm_gamma_packed = norm_gamma.unsqueeze(0).expand(TILE, -1).contiguous()
-        scaler_fp32 = torch.ones(TILE, TILE, dtype=torch.float32)
         scaler_bf16 = torch.ones(TILE, TILE, dtype=torch.bfloat16)
 
+        a_bf16_tt = ttnn.as_tensor(
+            a_bf16.contiguous(), dtype=ttnn.bfloat16, **rep)
         hc_fn_t_scaled_tt = ttnn.as_tensor(
-            hc_fn_t_scaled.contiguous(), dtype=ttnn.float32, **rep)
+            hc_fn_t_scaled.contiguous(), dtype=ttnn.bfloat16, **rep)
         hc_base_tile_tt = ttnn.as_tensor(
-            hc_base_tile.contiguous(), dtype=ttnn.float32, **rep)
+            hc_base_tile.contiguous(), dtype=ttnn.bfloat16, **rep)
         norm_gamma_packed_tt = ttnn.as_tensor(
             norm_gamma_packed.contiguous(), dtype=ttnn.bfloat16, **rep)
-        scaler_fp32_tt = ttnn.as_tensor(
-            scaler_fp32.contiguous(), dtype=ttnn.float32, **rep)
         scaler_bf16_tt = ttnn.as_tensor(
             scaler_bf16.contiguous(), dtype=ttnn.bfloat16, **rep)
 
         kernel_debug = {}
         kernel = make_final_kernel(mesh, debug_state=kernel_debug)
         top_val_out_tt, top_idx_out_tt = kernel(
-            a_tt, hc_fn_t_scaled_tt, scaler_fp32_tt, hc_base_tile_tt,
+            a_bf16_tt, hc_fn_t_scaled_tt, hc_base_tile_tt,
             norm_gamma_packed_tt, scaler_bf16_tt, w_lmhead_tt)
         kernel_vals_host = download_chip0(mesh, mesh_shape, top_val_out_tt)
         kernel_idxs_host = download_chip0(mesh, mesh_shape, top_idx_out_tt)
@@ -646,7 +651,7 @@ def main():
                                     hc_base_ref, norm_gamma_tt, w_lmhead_tt),
                   mesh)
         benchmark("Final ttl",
-                  lambda: kernel(a_tt, hc_fn_t_scaled_tt, scaler_fp32_tt,
+                  lambda: kernel(a_bf16_tt, hc_fn_t_scaled_tt,
                                  hc_base_tile_tt, norm_gamma_packed_tt,
                                  scaler_bf16_tt, w_lmhead_tt),
                   mesh)
