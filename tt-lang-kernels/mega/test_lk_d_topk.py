@@ -161,12 +161,6 @@ def make_lk_d_topk_kernel(mesh):
 
     def lk_d_topk_kernel(score_in_tt, ramp_int_tt, t_active_tt, cmp_idxs_out):
         if "init" not in state:
-            state["score_padded"] = ttnn.from_torch(
-                torch.zeros(TILE, BUCKET, dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
-            state["t_active_padded"] = ttnn.from_torch(
-                torch.zeros(TILE, BUCKET, dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
             state["masked_padded"] = ttnn.from_torch(
                 torch.zeros(TILE, BUCKET, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
@@ -176,21 +170,19 @@ def make_lk_d_topk_kernel(mesh):
         # TODO: mega fusion blocked: ttnn.slice/reshape sub-tile.
         score_slice = ttnn.slice(score_in_tt, [0, 0, 0], [B, S, BUCKET])
         score_2d = ttnn.reshape(score_slice, [B, BUCKET])
-        score_padded_in = ttnn.pad(score_2d, padding=[(0, TILE - B), (0, 0)],
-                                   value=0.0)
-        ttnn.copy(score_padded_in, state["score_padded"])
+        score_padded = ttnn.pad(score_2d, padding=[(0, TILE - B), (0, 0)],
+                                value=0.0)
 
         # Convert t_active int32 -> bf16; pad to [TILE, BUCKET].
         # TODO: mega fusion blocked: ttnn.typecast int32->bf16.
         t_active_bf16 = ttnn.typecast(t_active_tt, dtype=ttnn.bfloat16)
         t_active_2d = ttnn.reshape(t_active_bf16, [B, BUCKET])
-        t_active_padded_in = ttnn.pad(t_active_2d, padding=[(0, TILE - B), (0, 0)],
-                                       value=0.0)
-        ttnn.copy(t_active_padded_in, state["t_active_padded"])
+        t_active_padded = ttnn.pad(t_active_2d, padding=[(0, TILE - B), (0, 0)],
+                                   value=0.0)
 
         # tt-lang fused mask build + score add.
-        mask_build(state["score_padded"], state["ramp_bf16"],
-                   state["t_active_padded"], state["masked_padded"])
+        mask_build(score_padded, state["ramp_bf16"],
+                   t_active_padded, state["masked_padded"])
 
         # Slice back to [1, 1, BUCKET] for topk consumption.
         # TODO: mega fusion blocked: ttnn.slice/reshape sub-tile.
