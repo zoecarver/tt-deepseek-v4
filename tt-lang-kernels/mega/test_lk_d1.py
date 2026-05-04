@@ -12,10 +12,13 @@ Reference is the attn.kv stage in DeviceAttention.forward_device:
 Boundaries: pre-CCL is wkv all_gather; post-CCL is whichever indexer/
 compressor matmul comes next (or Lk-Dsparse's gather if no compressor).
 
-All tt-lang kernel definitions are inlined in this file (rmsnorm,
-swap-SUMMA + rotary combine, act_quant_block). The reference path
-still calls into inference.py's wrappers so the comparison is
-apples-to-apples.
+Fused as a single ttl.operation. Grid is (Np=8, 1) with each core
+owning two tile-columns of HEAD_DIM. The first NOPE_CORES=7 cores own
+the nope half (cols 0..447) and run act_quant_block; the last core
+owns the rope half (cols 448..511) and runs the swap-matmul rotary
+combine. ssq is reduced across all cores via a PipeNet, and inv_rms
+is broadcast back via a second PipeNet so every core normalizes its
+own column shard before the leaf operation.
 
 Rotary lowering trick (same as Lk-C): bake the rotate_half permutation
 into a swap matrix P and the rotate_half sign into the sin table
@@ -55,407 +58,241 @@ B, S = 1, 1
 TILE = 32
 
 
-def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
-                         rms_eps: float, inv_D: float):
-    """RMSNorm kernel inlined from inference.py / tt-lang-kernels/rmsnorm.py."""
+def _make_fused_lkd1_kernel(M: int, K: int, NOPE: int, ROPE: int,
+                            block_cfg, part_cfg,
+                            rms_eps: float,
+                            fp8_max: float = 448.0, eps: float = 1e-4,
+                            fp32_dest_acc_en: bool = True):
+    """Fused rmsnorm + rotary(rope_half) + act_quant_block(nope_half) as
+    a single ttl.operation.
 
-    @ttl.operation(
-        grid="auto",
-        options="--no-ttl-reduce-full-fp32",
-        fp32_dest_acc_en=True,
-    )
-    def rmsnorm_kernel(x, gamma, scaler, out):
-        grid_cols, grid_rows = ttl.grid_size(dims=2)
-        total_cores = grid_rows * grid_cols
-        tiles_per_core = -(-num_row_tiles // total_cores)
+    Grid: (Np, 1). Each core owns `bn` tile-columns of HEAD_DIM=NOPE+ROPE.
+    Cores [0, NOPE_CORES) own the nope half and run act_quant_block on
+    their normalized shard. The remaining cores own the rope half and
+    run the swap-matmul rotary combine; ROPE is small (typically 1 tile-
+    block wide) so a single rope core handles the whole rope half.
 
-        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        g_dfb = ttl.make_dataflow_buffer_like(gamma, shape=(1, 1), block_count=2)
-        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+    All-reduce on ssq:
+    - reduce: each non-root sends its ssq partial to (0, 0).
+    - bcast:  root computes inv = rsqrt(ssq/D + eps) and mcasts it back
+      to all cores via a second PipeNet.
 
-        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        xsq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        red_step_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        inv_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-
-        @ttl.compute()
-        def compute():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            sc = sc_dfb.wait()
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_row_tiles:
-                    x0 = x_dfb.wait()
-                    xsq_dfb.reserve().store(x0 * x0)
-                    sq_dfb.reserve().store(
-                        ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
-                    )
-                    for _ in range(h_tiles - 1):
-                        xk = x_dfb.wait()
-                        xsq_dfb.reserve().store(xk * xk)
-                        red_step_dfb.reserve().store(
-                            ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
-                        )
-                        prev = sq_dfb.wait()
-                        sq_dfb.reserve().store(prev + red_step_dfb.wait())
-
-                    sq = sq_dfb.wait()
-                    inv_bc = inv_bc_dfb.reserve()
-                    inv_bc.store(ttl.math.broadcast(
-                        ttl.math.rsqrt(
-                            sq * ttl.math.fill(sq, inv_D)
-                            + ttl.math.fill(sq, rms_eps)
-                        ),
-                        inv_bc, dims=[1],
-                    ))
-                    inv = inv_bc_dfb.wait()
-
-                    for _ in range(h_tiles):
-                        xk = x_dfb.wait()
-                        gk = g_dfb.wait()
-                        out_dfb.reserve().store(xk * gk * inv)
-
-        @ttl.datamovement()
-        def dm_read():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_row_tiles:
-                    for h in range(h_tiles):
-                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
-                    for h in range(h_tiles):
-                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
-                        ttl.copy(gamma[0, h], g_dfb.reserve()).wait()
-
-        @ttl.datamovement()
-        def dm_write():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_row_tiles:
-                    for h in range(h_tiles):
-                        ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
-
-    return rmsnorm_kernel
-
-
-def _make_act_quant_block_kernel(M_pad: int, N: int, BLOCK: int = 64,
-                                 fp8_max: float = 448.0, eps: float = 1e-4):
-    """Per-block max-abs scale round-trip in bf16, inlined from inference.py.
-
-        amax = max(|x|, dim=last(block))
-        s    = max(amax, eps) / fp8_max
-        out  = clamp(x / s, -fp8_max, fp8_max) * s
+    M is fixed at one bm-block (Mp = 1, Kp = 1).
     """
-    if N % BLOCK != 0:
-        raise ValueError(f"N={N} not divisible by BLOCK={BLOCK}")
-    if BLOCK % TILE != 0:
-        raise ValueError(f"BLOCK={BLOCK} not multiple of TILE={TILE}")
-    if M_pad % TILE != 0:
-        raise ValueError(f"M_pad={M_pad} not multiple of TILE={TILE}")
-
-    M_tiles = M_pad // TILE
-    NB = N // BLOCK
-    BLOCK_TILES = BLOCK // TILE
-    total_work = M_tiles * NB
-    inv_fp8_max = 1.0 / fp8_max
-
-    @ttl.operation(grid="auto", fp32_dest_acc_en=True)
-    def act_quant_kernel(x, scaler, out):
-        grid_cols, grid_rows = ttl.grid_size(dims=2)
-        total_cores = grid_rows * grid_cols
-        work_per_core = -(-total_work // total_cores)
-
-        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BLOCK_TILES), block_count=2)
-        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, BLOCK_TILES), block_count=2)
-
-        abs_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BLOCK_TILES), block_count=2)
-        amax_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
-        amax_eps_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
-        inv_s_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
-        s_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
-        inv_s_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BLOCK_TILES), block_count=2)
-        s_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BLOCK_TILES), block_count=2)
-
-        @ttl.compute()
-        def compute():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            sc = sc_dfb.wait()
-
-            for local_w in range(work_per_core):
-                global_w = core_idx * work_per_core + local_w
-                if global_w < total_work:
-                    x_blk = x_dfb.wait()
-                    abs_dfb.reserve().store(ttl.math.abs(x_blk))
-                    amax_dfb.reserve().store(
-                        ttl.math.reduce_max(abs_dfb.wait(), sc, dims=[1])
-                    )
-                    amax = amax_dfb.wait()
-                    amax_eps_dfb.reserve().store(
-                        amax + ttl.math.fill(amax, eps)
-                    )
-                    amax_eps = amax_eps_dfb.wait()
-
-                    inv_s_dfb.reserve().store(
-                        ttl.math.recip(amax_eps)
-                        * ttl.math.fill(amax_eps, fp8_max)
-                    )
-                    inv_s = inv_s_dfb.wait()
-                    inv_s_bc_blk = inv_s_bc_dfb.reserve()
-                    inv_s_bc_blk.store(
-                        ttl.math.broadcast(inv_s, inv_s_bc_blk, dims=[1])
-                    )
-                    inv_s_bc = inv_s_bc_dfb.wait()
-
-                    s_dfb.reserve().store(
-                        amax_eps * ttl.math.fill(amax_eps, inv_fp8_max)
-                    )
-                    s = s_dfb.wait()
-                    s_bc_blk = s_bc_dfb.reserve()
-                    s_bc_blk.store(
-                        ttl.math.broadcast(s, s_bc_blk, dims=[1])
-                    )
-                    s_bc = s_bc_dfb.wait()
-
-                    out_dfb.reserve().store(x_blk * inv_s_bc * s_bc)
-
-        @ttl.datamovement()
-        def dm_read():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-
-            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
-            for local_w in range(work_per_core):
-                global_w = core_idx * work_per_core + local_w
-                if global_w < total_work:
-                    m = global_w // NB
-                    nb = global_w % NB
-                    c0 = nb * BLOCK_TILES
-                    c1 = c0 + BLOCK_TILES
-                    blk = x_dfb.reserve()
-                    ttl.copy(x[m:m+1, c0:c1], blk).wait()
-
-        @ttl.datamovement()
-        def dm_write():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-
-            for local_w in range(work_per_core):
-                global_w = core_idx * work_per_core + local_w
-                if global_w < total_work:
-                    m = global_w // NB
-                    nb = global_w % NB
-                    c0 = nb * BLOCK_TILES
-                    c1 = c0 + BLOCK_TILES
-                    ttl.copy(out_dfb.wait(), out[m:m+1, c0:c1]).wait()
-
-    return act_quant_kernel
-
-
-def _make_summa_matmul_kernel(M: int, K: int, N: int,
-                              block_cfg, part_cfg,
-                              fp32_dest_acc_en: bool = True):
-    """Pure-SUMMA matmul kernel modelled on tt-lang-kernels/attention_matmul.py."""
     bm, bn, bk = block_cfg
-    Mp, Np, Kp = part_cfg
-    if Kp != 1:
-        raise ValueError(f"K_parts must be 1, got {Kp}")
-    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
-    if Mt % bm or Nt % bn or Kt % bk:
+    Mp, Np, _Kp = part_cfg
+    if Mp != 1 or _Kp != 1:
+        raise ValueError(f"fused Lk-D1 assumes Mp=Kp=1, got Mp={Mp} Kp={_Kp}")
+    HEAD = NOPE + ROPE
+    if HEAD != K:
+        raise ValueError(f"K={K} must equal NOPE+ROPE={HEAD}")
+    Mt = M // TILE
+    HEAD_t = HEAD // TILE
+    if Mt != bm or HEAD_t % bn:
         raise ValueError(
-            f"block must divide shape: Mt={Mt} Nt={Nt} Kt={Kt} "
-            f"block=(bm={bm}, bn={bn}, bk={bk})")
-    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
-    if Mb % Mp or Nb % Np:
-        raise ValueError(f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
-    M_BPN = Mb // Mp
-    N_BPN = Nb // Np
+            f"shape/block: Mt={Mt} bm={bm} HEAD_t={HEAD_t} bn={bn}")
+    if HEAD_t // bn != Np:
+        raise ValueError(f"Np={Np} must equal HEAD_t/bn = {HEAD_t // bn}")
+    NOPE_t = NOPE // TILE
+    NOPE_CORES = NOPE_t // bn
+    if NOPE_CORES * bn != NOPE_t:
+        raise ValueError(
+            f"NOPE doesn't align with bn: NOPE_t={NOPE_t} bn={bn}")
+    ROPE_t = ROPE // TILE
+    if ROPE_t != bn:
+        raise ValueError(
+            f"rope core handles a single bn-block: ROPE_t={ROPE_t} bn={bn}")
+    if NOPE_CORES + 1 != Np:
+        raise ValueError(
+            f"expected Np = NOPE_CORES + 1 (one rope core), "
+            f"got Np={Np} NOPE_CORES={NOPE_CORES}")
 
-    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
-    def summa_matmul(a, w, out):
-        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
-                   for m_p in range(Mp)]
-        mcast_a_net = ttl.PipeNet(a_pipes)
-        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
-                   for n_p in range(Np)]
-        mcast_b_net = ttl.PipeNet(b_pipes)
+    inv_D = 1.0 / float(HEAD)
+    inv_fp8_max = 1.0 / fp8_max
+    # Block_count for the receive CB at root: each non-root core sends one
+    # ssq partial. min 2 to keep dataflow happy.
+    SSQ_RECV_BC = max(2, Np - 1)
 
-        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
-        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+    @ttl.operation(grid=(Np, 1),
+                   fp32_dest_acc_en=fp32_dest_acc_en,
+                   options="--no-ttl-reduce-full-fp32")
+    def fused_kernel(kv, gamma, P, cos_b, sin_b, scaler, out):
+        # Reduce ssq partials (non-root → root) and broadcast inv_rms back.
+        ssq_reduce_pipes = [ttl.Pipe(src=(n_p, 0), dst=(0, 0))
+                            for n_p in range(1, Np)]
+        ssq_reduce_net = ttl.PipeNet(ssq_reduce_pipes)
+        inv_bcast_pipes = [ttl.Pipe(src=(0, 0), dst=(slice(0, Np), 0))]
+        inv_bcast_net = ttl.PipeNet(inv_bcast_pipes)
+
+        # Common CBs.
+        x_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, bn), block_count=2)
+        g_cb = ttl.make_dataflow_buffer_like(gamma, shape=(bm, bn), block_count=2)
+        sc_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        xsq_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, bn), block_count=2)
+        ssq_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, 1), block_count=2)
+        ssq_recv_cb = ttl.make_dataflow_buffer_like(
+            kv, shape=(bm, 1), block_count=SSQ_RECV_BC)
+        inv_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, 1), block_count=2)
+        inv_recv_cb = ttl.make_dataflow_buffer_like(
+            kv, shape=(bm, 1), block_count=2)
+        inv_bc_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, bn), block_count=2)
+        normed_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, bn), block_count=2)
         out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
 
-        @ttl.compute()
-        def compute():
-            for _ in range(M_BPN):
-                for _ in range(N_BPN):
-                    p = out_cb.reserve()
-                    for _ in range(Kb):
-                        a_blk = a_cb.wait()
-                        b_blk = b_cb.wait()
-                        p += a_blk @ b_blk
+        # Nope-only (act_quant_block) CBs.
+        abs_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, bn), block_count=2)
+        amax_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, 1), block_count=2)
+        aeps_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, 1), block_count=2)
+        inv_s_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, 1), block_count=2)
+        s_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, 1), block_count=2)
+        inv_s_bc_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, bn), block_count=2)
+        s_bc_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, bn), block_count=2)
 
-        @ttl.datamovement()
-        def dm_read():
-            _, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for _ in range(N_BPN):
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        a_blk = a_cb.reserve()
-
-                        def read_a(pipe):
-                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
-                            ttl.copy(a_blk, pipe).wait()
-
-                        mcast_a_net.if_src(read_a)
-                        mcast_a_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
-
-        @ttl.datamovement()
-        def dm_write():
-            col_c, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for local_nb in range(N_BPN):
-                    nb = col_c * N_BPN + local_nb
-                    nc = nb * bn
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        b_blk = b_cb.reserve()
-
-                        def read_b(pipe):
-                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
-                            ttl.copy(b_blk, pipe).wait()
-
-                        mcast_b_net.if_src(read_b)
-                        mcast_b_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
-                    o = out_cb.wait()
-                    ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
-
-    return summa_matmul
-
-
-def _make_swap_combine_kernel(M: int, K_dim: int, N: int,
-                              block_cfg, part_cfg,
-                              fp32_dest_acc_en: bool = True):
-    """SUMMA matmul fused with rotary combine.
-      out[m, n] = x[m, n] * cos[0, n] + (x @ P)[m, n] * sin[0, n]
-    cos, sin shape: [TILE, N] (only row 0 is consumed; downstream broadcasts).
-    P shape: [K_dim, N] swap-pairs constant.
-    """
-    bm, bn, bk = block_cfg
-    Mp, Np, Kp = part_cfg
-    if Kp != 1:
-        raise ValueError(f"K_parts must be 1, got {Kp}")
-    Mt, Nt, Kt = M // TILE, N // TILE, K_dim // TILE
-    if Mt % bm or Nt % bn or Kt % bk:
-        raise ValueError(
-            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
-            f"block=(bm={bm}, bn={bn}, bk={bk})")
-    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
-    if Mb % Mp or Nb % Np:
-        raise ValueError(
-            f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
-    M_BPN = Mb // Mp
-    N_BPN = Nb // Np
-
-    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
-    def swap_combine(x, P, cos, sin, out):
-        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
-                   for m_p in range(Mp)]
-        mcast_a_net = ttl.PipeNet(a_pipes)
-        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
-                   for n_p in range(Np)]
-        mcast_b_net = ttl.PipeNet(b_pipes)
-
-        a_cb = ttl.make_dataflow_buffer_like(x, shape=(bm, bk), block_count=2)
-        b_cb = ttl.make_dataflow_buffer_like(P, shape=(bk, bn), block_count=2)
-        x_diag_cb = ttl.make_dataflow_buffer_like(
-            x, shape=(bm, bn), block_count=2)
-        cos_cb = ttl.make_dataflow_buffer_like(
-            cos, shape=(1, bn), block_count=2)
-        sin_cb = ttl.make_dataflow_buffer_like(
-            sin, shape=(1, bn), block_count=2)
-        swap_cb = ttl.make_dataflow_buffer_like(
-            out, shape=(bm, bn), block_count=2)
-        out_cb = ttl.make_dataflow_buffer_like(
-            out, shape=(bm, bn), block_count=2)
+        # Rope-only (swap-matmul + rotary combine) CBs.
+        P_cb = ttl.make_dataflow_buffer_like(P, shape=(bn, bn), block_count=2)
+        cos_cb = ttl.make_dataflow_buffer_like(cos_b, shape=(bm, bn), block_count=2)
+        sin_cb = ttl.make_dataflow_buffer_like(sin_b, shape=(bm, bn), block_count=2)
+        swap_cb = ttl.make_dataflow_buffer_like(kv, shape=(bm, bn), block_count=2)
 
         @ttl.compute()
         def compute():
-            for _ in range(M_BPN):
-                for _ in range(N_BPN):
-                    p = swap_cb.reserve()
-                    for _ in range(Kb):
-                        a_blk = a_cb.wait()
-                        b_blk = b_cb.wait()
-                        p += a_blk @ b_blk
-                    s = swap_cb.wait()
-                    xd = x_diag_cb.wait()
-                    c = cos_cb.wait()
-                    si = sin_cb.wait()
-                    out_cb.reserve().store(xd * c + s * si)
+            n_p, _ = ttl.node(dims=2)
+            sc = sc_cb.wait()
+
+            # Local ssq partial over this core's bn-tile column shard.
+            x = x_cb.wait()
+            xsq_cb.reserve().store(x * x)
+            ssq_cb.reserve().store(
+                ttl.math.reduce_sum(xsq_cb.wait(), sc, dims=[1])
+            )
+
+            if n_p == 0:
+                # Root: receive Np-1 ssq partials, sum, finalize inv_rms.
+                for _ in range(Np - 1):
+                    prev = ssq_cb.wait()
+                    r = ssq_recv_cb.wait()
+                    ssq_cb.reserve().store(prev + r)
+                sq = ssq_cb.wait()
+                inv_t = inv_cb.reserve()
+                inv_t.store(ttl.math.broadcast(
+                    ttl.math.rsqrt(
+                        sq * ttl.math.fill(sq, inv_D)
+                        + ttl.math.fill(sq, rms_eps)
+                    ),
+                    inv_t, dims=[1],
+                ))
+
+            # All cores: receive inv from broadcast pipe, expand to (bm, bn).
+            inv = inv_recv_cb.wait()
+            inv_bc_t = inv_bc_cb.reserve()
+            inv_bc_t.store(ttl.math.broadcast(inv, inv_bc_t, dims=[1]))
+            inv_bc = inv_bc_cb.wait()
+
+            # Compute normed = x * gamma * inv_bc into a scratch CB so it can
+            # be reused twice (matmul + elementwise on the rope core, abs +
+            # final mul on nope cores) without re-reading from DRAM.
+            x2 = x_cb.wait()
+            g = g_cb.wait()
+            normed_cb.reserve().store(x2 * g * inv_bc)
+            normed = normed_cb.wait()
+
+            if n_p == NOPE_CORES:
+                # Rope core: out = normed * cos + (normed @ P) * sin.
+                P_blk = P_cb.wait()
+                c = cos_cb.wait()
+                si = sin_cb.wait()
+                swap_cb.reserve().store(normed @ P_blk)
+                swap_blk = swap_cb.wait()
+                out_cb.reserve().store(normed * c + swap_blk * si)
+            else:
+                # Nope core: act_quant_block round-trip in bf16.
+                #   amax = reduce_max(|normed|, dim=1)
+                #   inv_s = fp8_max / (amax + eps)
+                #   s     = (amax + eps) / fp8_max
+                #   out   = normed * inv_s_bc * s_bc
+                abs_cb.reserve().store(ttl.math.abs(normed))
+                amax_cb.reserve().store(
+                    ttl.math.reduce_max(abs_cb.wait(), sc, dims=[1])
+                )
+                amax = amax_cb.wait()
+                aeps_cb.reserve().store(
+                    amax + ttl.math.fill(amax, eps)
+                )
+                aeps = aeps_cb.wait()
+                inv_s_cb.reserve().store(
+                    ttl.math.recip(aeps) * ttl.math.fill(aeps, fp8_max)
+                )
+                inv_s = inv_s_cb.wait()
+                inv_s_bc_t = inv_s_bc_cb.reserve()
+                inv_s_bc_t.store(
+                    ttl.math.broadcast(inv_s, inv_s_bc_t, dims=[1])
+                )
+                inv_s_bc = inv_s_bc_cb.wait()
+                s_cb.reserve().store(
+                    aeps * ttl.math.fill(aeps, inv_fp8_max)
+                )
+                s = s_cb.wait()
+                s_bc_t = s_bc_cb.reserve()
+                s_bc_t.store(
+                    ttl.math.broadcast(s, s_bc_t, dims=[1])
+                )
+                s_bc = s_bc_cb.wait()
+                out_cb.reserve().store(normed * inv_s_bc * s_bc)
 
         @ttl.datamovement()
         def dm_read():
-            _, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for _ in range(N_BPN):
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        a_blk = a_cb.reserve()
+            n_p, _ = ttl.node(dims=2)
+            nc = n_p * bn
 
-                        def read_a(pipe):
-                            ttl.copy(x[mr:mr + bm, kc:kc + bk], a_blk).wait()
-                            ttl.copy(a_blk, pipe).wait()
+            ttl.copy(scaler[0, 0], sc_cb.reserve()).wait()
 
-                        mcast_a_net.if_src(read_a)
-                        mcast_a_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+            # x for ssq.
+            ttl.copy(kv[0:bm, nc:nc + bn], x_cb.reserve()).wait()
+
+            # ssq all-reduce: non-root sends, root receives Np-1 partials.
+            if n_p == 0:
+                def recv_ssq(pipe):
+                    r = ssq_recv_cb.reserve()
+                    ttl.copy(pipe, r).wait()
+                ssq_reduce_net.if_dst(recv_ssq)
+            else:
+                ssq = ssq_cb.wait()
+
+                def send_ssq(pipe):
+                    ttl.copy(ssq, pipe).wait()
+                ssq_reduce_net.if_src(send_ssq)
+
+            # inv_rms broadcast: root sends, all cores (incl. self) receive.
+            if n_p == 0:
+                inv = inv_cb.wait()
+
+                def send_inv(pipe):
+                    ttl.copy(inv, pipe).wait()
+                inv_bcast_net.if_src(send_inv)
+
+            def recv_inv(pipe):
+                r = inv_recv_cb.reserve()
+                ttl.copy(pipe, r).wait()
+            inv_bcast_net.if_dst(recv_inv)
+
+            # x and gamma for the normalize step.
+            ttl.copy(kv[0:bm, nc:nc + bn], x_cb.reserve()).wait()
+            ttl.copy(gamma[0:bm, nc:nc + bn], g_cb.reserve()).wait()
+
+            # Rope core only: P / cos / sin for the rotary combine.
+            if n_p == NOPE_CORES:
+                ttl.copy(P[0:bn, 0:bn], P_cb.reserve()).wait()
+                ttl.copy(cos_b[0:bm, 0:bn], cos_cb.reserve()).wait()
+                ttl.copy(sin_b[0:bm, 0:bn], sin_cb.reserve()).wait()
 
         @ttl.datamovement()
         def dm_write():
-            col_c, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for local_nb in range(N_BPN):
-                    nb = col_c * N_BPN + local_nb
-                    nc = nb * bn
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        b_blk = b_cb.reserve()
+            n_p, _ = ttl.node(dims=2)
+            nc = n_p * bn
+            o = out_cb.wait()
+            ttl.copy(o, out[0:bm, nc:nc + bn]).wait()
 
-                        def read_b(pipe):
-                            ttl.copy(P[kc:kc + bk, nc:nc + bn], b_blk).wait()
-                            ttl.copy(b_blk, pipe).wait()
-
-                        mcast_b_net.if_src(read_b)
-                        mcast_b_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
-                    ttl.copy(x[mr:mr + bm, nc:nc + bn],
-                             x_diag_cb.reserve()).wait()
-                    ttl.copy(cos[0:1, nc:nc + bn],
-                             cos_cb.reserve()).wait()
-                    ttl.copy(sin[0:1, nc:nc + bn],
-                             sin_cb.reserve()).wait()
-                    ttl.copy(out_cb.wait(),
-                             out[mr:mr + bm, nc:nc + bn]).wait()
-
-    return swap_combine
+    return fused_kernel
 
 
 def _build_rotary_tables(cos_full_cpu: torch.Tensor, sin_full_cpu: torch.Tensor,
@@ -498,20 +335,18 @@ def _build_swap_matrix(rd: int) -> torch.Tensor:
 def make_lk_d1_kernel(mesh, gamma_cpu, cos_full_cpu, sin_full_cpu):
     """Mega kernel for Lk-D1 = kv_norm → rotary(rope) → act_quant_block(nope).
 
-    Three tt-lang dispatches inlined: rmsnorm, swap-SUMMA + rotary
-    combine, act_quant_block. Cos/sin tables are pre-processed on host
-    so the kernel reads tile-aligned cos/sin tiles.
+    Single fused ttl.operation. The cos/sin row gather still happens via
+    ttnn.embedding (no tt-lang scalar-indexed gather yet). The final
+    slice/reshape into the [B, S, HEAD_DIM] caller buffer is also ttnn,
+    same as every other mega test.
     """
-    rms_kernel = _make_rmsnorm_kernel(
-        num_row_tiles=1, h_tiles=HEAD_DIM // TILE,
-        rms_eps=NORM_EPS, inv_D=1.0 / HEAD_DIM)
-    act_kernel = _make_act_quant_block_kernel(
-        M_pad=TILE, N=NOPE_DIM, BLOCK=ACT_QUANT_BLOCK)
-    # Fused swap SUMMA + rotary combine: M=TILE=32, K=N=rd=64.
-    # Mt=1, Kt=Nt=2. block=(1,1,2), part=(1,2,1) -> 2 cores.
-    swap_combine_kernel = _make_swap_combine_kernel(
-        M=TILE, K_dim=ROPE_HEAD_DIM, N=ROPE_HEAD_DIM,
-        block_cfg=(1, 1, 2), part_cfg=(1, 2, 1))
+    # M=TILE=32, K=HEAD_DIM=512. Mt=1, HEAD_t=16.
+    # block=(1, 2, _) part=(1, 8, 1) → 8 cores, 7 nope + 1 rope.
+    fused_kernel = _make_fused_lkd1_kernel(
+        M=TILE, K=HEAD_DIM, NOPE=NOPE_DIM, ROPE=ROPE_HEAD_DIM,
+        block_cfg=(1, 2, 2), part_cfg=(1, 8, 1),
+        rms_eps=NORM_EPS,
+    )
 
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -529,14 +364,6 @@ def make_lk_d1_kernel(mesh, gamma_cpu, cos_full_cpu, sin_full_cpu):
 
     state: dict = {}
 
-    def _alloc_replicated_zeros(shape):
-        return ttnn.from_torch(
-            torch.zeros(*shape, dtype=torch.bfloat16),
-            device=mesh, dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
-
     def lk_d1_kernel(kv, cos_full, sin_full, start_pos, kv_out):
         if "scratch" not in state:
             state["scaler_tt"] = ttnn.from_torch(
@@ -545,51 +372,34 @@ def make_lk_d1_kernel(mesh, gamma_cpu, cos_full_cpu, sin_full_cpu):
                 layout=ttnn.TILE_LAYOUT,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
-            state["normed_tt"] = _alloc_replicated_zeros((TILE, HEAD_DIM))
-            state["nope_quant_tt"] = _alloc_replicated_zeros((TILE, NOPE_DIM))
-            state["rope_rot_tt"] = _alloc_replicated_zeros((TILE, ROPE_HEAD_DIM))
+            state["out_padded_tt"] = ttnn.from_torch(
+                torch.zeros((TILE, HEAD_DIM), dtype=torch.bfloat16),
+                device=mesh, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
             state["scratch"] = True
 
-        # kv_norm: pad → rmsnorm → slice/reshape.
+        # 1. Pad input [1, 1, K] -> [TILE, K].
         kv_2d = ttnn.reshape(kv, [B * S, HEAD_DIM])
         kv_padded = ttnn.pad(
             kv_2d, padding=[(0, TILE - B * S), (0, 0)], value=0.0)
-        rms_kernel(kv_padded, gamma_tt, state["scaler_tt"], state["normed_tt"])
-        kv_normed_2d = ttnn.slice(state["normed_tt"], [0, 0], [B * S, HEAD_DIM])
-        kv_normed = ttnn.reshape(kv_normed_2d, [B, S, HEAD_DIM])
 
-        # Rotary on rope-half.
-        # TODO: mega fusion investigate if we can use element_read/write for this or build some gather primtive like maybe reduce_max or max or pipes
-        # TODO: claude I would really you to turn this whole def into a single ttl.operation call
+        # 2. Gather cos/sin row for start_pos. ttnn.embedding stays here
+        # because tt-lang has no scalar-indexed row gather yet (TODO: mega).
         cos_b_2d = ttnn.embedding(start_pos, cos_ext_tt, layout=ttnn.TILE_LAYOUT)
         sin_b_2d = ttnn.embedding(start_pos, sin_signed_tt, layout=ttnn.TILE_LAYOUT)
         cos_b = ttnn.reshape(cos_b_2d, [TILE, ROPE_HEAD_DIM])
         sin_b = ttnn.reshape(sin_b_2d, [TILE, ROPE_HEAD_DIM])
 
-        kv_nope = ttnn.slice(kv_normed, [0, 0, 0], [B, S, NOPE_DIM])
-        kv_rope = ttnn.slice(kv_normed, [0, 0, NOPE_DIM], [B, S, HEAD_DIM])
-        kv_rope_2d = ttnn.reshape(kv_rope, [B * S, ROPE_HEAD_DIM])
-        kv_rope_padded = ttnn.pad(
-            kv_rope_2d, padding=[(0, TILE - B * S), (0, 0)], value=0.0)
+        # 3. Single fused ttl.operation: rmsnorm + rotary(rope) + act_quant(nope).
+        fused_kernel(kv_padded, gamma_tt, P_tt, cos_b, sin_b,
+                     state["scaler_tt"], state["out_padded_tt"])
 
-        swap_combine_kernel(
-            kv_rope_padded, P_tt, cos_b, sin_b, state["rope_rot_tt"])
-
-        kv_rope_rot_2d = ttnn.slice(
-            state["rope_rot_tt"], [0, 0], [B * S, ROPE_HEAD_DIM])
-        kv_rope_rot = ttnn.reshape(kv_rope_rot_2d, [B, S, ROPE_HEAD_DIM])
-
-        # act_quant_block on nope-half.
-        nope_2d = ttnn.reshape(kv_nope, [B * S, NOPE_DIM])
-        nope_padded = ttnn.pad(
-            nope_2d, padding=[(0, TILE - B * S), (0, 0)], value=0.0)
-        act_kernel(nope_padded, state["scaler_tt"], state["nope_quant_tt"])
-        kv_nope_q_2d = ttnn.slice(state["nope_quant_tt"], [0, 0], [B * S, NOPE_DIM])
-        kv_nope_q = ttnn.reshape(kv_nope_q_2d, [B, S, NOPE_DIM])
-
-        # Concat nope_q + rope_rot and copy into the test-provided out.
-        merged = ttnn.concat([kv_nope_q, kv_rope_rot], dim=-1)
-        ttnn.copy(merged, kv_out)
+        # 4. Slice + reshape + copy into the test-provided [1, 1, HEAD_DIM] out.
+        out_2d = ttnn.slice(state["out_padded_tt"], [0, 0], [B * S, HEAD_DIM])
+        out_3d = ttnn.reshape(out_2d, [B, S, HEAD_DIM])
+        ttnn.copy(out_3d, kv_out)
 
     return lk_d1_kernel
 
@@ -638,7 +448,9 @@ def reference(mesh, kv_tt, gamma_cpu, cos_full_tt, sin_full_tt, start_pos_tt):
 
 def main():
     torch.manual_seed(0)
-    mesh = open_mesh()
+    # Fused kernel program is large; grow the kernel-config buffer at the
+    # cost of per-core L1. See mega/README.md "Large fused programs".
+    mesh = open_mesh(kernel_config_extra_bytes=128 * 1024)
     mesh_shape = tuple(mesh.shape)
     try:
         kv = torch.randn(1, 1, HEAD_DIM, dtype=torch.bfloat16) * 0.1
