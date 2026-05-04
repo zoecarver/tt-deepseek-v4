@@ -48,98 +48,6 @@ B, S = 1, 1
 TILE = 32
 
 
-def _make_summa_matmul_kernel(M: int, K: int, N: int,
-                              block_cfg, part_cfg,
-                              fp32_dest_acc_en: bool = True):
-    """Pure-SUMMA matmul kernel (same shape as Lk-A/Lk-B).
-
-    Output = a @ w. A is row-mcast across Np cores, B is column-mcast
-    across Mp cores. Each core owns an M_BPN x N_BPN output sub-grid.
-    """
-    bm, bn, bk = block_cfg
-    Mp, Np, Kp = part_cfg
-    if Kp != 1:
-        raise ValueError(f"K_parts must be 1, got {Kp}")
-    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
-    if Mt % bm or Nt % bn or Kt % bk:
-        raise ValueError(
-            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
-            f"block=(bm={bm}, bn={bn}, bk={bk})")
-    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
-    if Mb % Mp or Nb % Np:
-        raise ValueError(
-            f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
-    M_BPN = Mb // Mp
-    N_BPN = Nb // Np
-
-    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
-    def summa_matmul(a, w, out):
-        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
-                   for m_p in range(Mp)]
-        mcast_a_net = ttl.PipeNet(a_pipes)
-        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
-                   for n_p in range(Np)]
-        mcast_b_net = ttl.PipeNet(b_pipes)
-
-        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
-        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
-        out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
-
-        @ttl.compute()
-        def compute():
-            for _ in range(M_BPN):
-                for _ in range(N_BPN):
-                    p = out_cb.reserve()
-                    for _ in range(Kb):
-                        a_blk = a_cb.wait()
-                        b_blk = b_cb.wait()
-                        p += a_blk @ b_blk
-
-        @ttl.datamovement()
-        def dm_read():
-            _, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for _ in range(N_BPN):
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        a_blk = a_cb.reserve()
-
-                        def read_a(pipe):
-                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
-                            ttl.copy(a_blk, pipe).wait()
-
-                        mcast_a_net.if_src(read_a)
-                        mcast_a_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
-
-        @ttl.datamovement()
-        def dm_write():
-            col_c, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for local_nb in range(N_BPN):
-                    nb = col_c * N_BPN + local_nb
-                    nc = nb * bn
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        b_blk = b_cb.reserve()
-
-                        def read_b(pipe):
-                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
-                            ttl.copy(b_blk, pipe).wait()
-
-                        mcast_b_net.if_src(read_b)
-                        mcast_b_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
-                    o = out_cb.wait()
-                    ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
-
-    return summa_matmul
-
-
 def _make_ksplit_matmul_kernel(M: int, K: int, N: int,
                                block_cfg, part_cfg,
                                fp32_dest_acc_en: bool = True):
@@ -249,116 +157,123 @@ def _make_ksplit_matmul_kernel(M: int, K: int, N: int,
     return ksplit_matmul
 
 
-def _make_swap_combine_kernel(M: int, K_dim: int, N: int,
-                              block_cfg, part_cfg,
-                              fp32_dest_acc_en: bool = True):
-    """SUMMA matmul fused with rotary combine.
-      out[m, n] = x[m, n] * cos[0, n] + (x @ P)[m, n] * sin[0, n]
-    cos, sin shape: [TILE, N] (only row 0 is consumed; downstream broadcasts).
-    P shape: [K_dim, N] swap-pairs constant.
+def _make_fused_rot_hada_kernel(M: int, D: int, rd: int,
+                                fp32_dest_acc_en: bool = True):
+    """Fused rotary + Walsh-Hadamard matmul on the [H, D] post-wq_b layout.
+
+    Computes per output row h, output col n:
+      q_rot[h, c] = q_full[h, D-rd+c] * cos[c] + (q_rope @ P_diag)[h, c] * sin[c]
+      out[h, n] = sum_{k in [0, D-rd)} q_full[h, k] * H[k, n]
+                + sum_{c in [0, rd)} q_rot[h, c]   * H[D-rd+c, n]
+
+    P is block-diagonal: P[c1, c2] = 1 iff c1==c2 XOR 1 within a 2-wide pair.
+    Per K-tile, P[k_tile, k_tile] is a 32x32 swap matrix; off-diagonal blocks
+    are 0. So the swap is local within each K-tile.
+
+    Grid: (1, Mp). Each core handles one M-tile of output.
+    K-axis split into nope_t nope tiles + rd_t rope tiles.
     """
-    bm, bn, bk = block_cfg
-    Mp, Np, Kp = part_cfg
-    if Kp != 1:
-        raise ValueError(f"K_parts must be 1, got {Kp}")
-    Mt, Nt, Kt = M // TILE, N // TILE, K_dim // TILE
-    if Mt % bm or Nt % bn or Kt % bk:
-        raise ValueError(
-            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
-            f"block=(bm={bm}, bn={bn}, bk={bk})")
-    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
-    if Mb % Mp or Nb % Np:
-        raise ValueError(
-            f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
-    M_BPN = Mb // Mp
-    N_BPN = Nb // Np
+    Mt = M // TILE
+    Dt = D // TILE
+    rd_t = rd // TILE
+    nope_t = Dt - rd_t
+
+    Mp = Mt
+    Np = 1
+    bm = 1
+    bn = Dt
+    bk = 1
+
+    M_BPN = 1
+    N_BPN = 1
+    Kb_nope = nope_t
+    Kb_rope = rd_t
 
     @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
-    def swap_combine(x, P, cos, sin, out):
-        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
-                   for m_p in range(Mp)]
-        mcast_a_net = ttl.PipeNet(a_pipes)
-        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
-                   for n_p in range(Np)]
-        mcast_b_net = ttl.PipeNet(b_pipes)
-
-        a_cb = ttl.make_dataflow_buffer_like(x, shape=(bm, bk), block_count=2)
-        b_cb = ttl.make_dataflow_buffer_like(P, shape=(bk, bn), block_count=2)
-        x_diag_cb = ttl.make_dataflow_buffer_like(
-            x, shape=(bm, bn), block_count=2)
+    def fused_rot_hada(q_full, P, cos, sin, H_mat, out):
+        q_nope_cb = ttl.make_dataflow_buffer_like(
+            q_full, shape=(bm, bk), block_count=2)
+        q_rope_cb = ttl.make_dataflow_buffer_like(
+            q_full, shape=(bm, bk), block_count=2)
+        P_cb = ttl.make_dataflow_buffer_like(
+            P, shape=(bk, bk), block_count=2)
         cos_cb = ttl.make_dataflow_buffer_like(
-            cos, shape=(1, bn), block_count=2)
+            cos, shape=(1, bk), block_count=2)
         sin_cb = ttl.make_dataflow_buffer_like(
-            sin, shape=(1, bn), block_count=2)
+            sin, shape=(1, bk), block_count=2)
         swap_cb = ttl.make_dataflow_buffer_like(
-            out, shape=(bm, bn), block_count=2)
+            q_full, shape=(bm, bk), block_count=2)
+        rope_rot_cb = ttl.make_dataflow_buffer_like(
+            q_full, shape=(bm, bk), block_count=max(2, rd_t))
+        H_cb = ttl.make_dataflow_buffer_like(
+            H_mat, shape=(bk, bn), block_count=2)
         out_cb = ttl.make_dataflow_buffer_like(
             out, shape=(bm, bn), block_count=2)
 
         @ttl.compute()
         def compute():
-            for _ in range(M_BPN):
-                for _ in range(N_BPN):
-                    p = swap_cb.reserve()
-                    for _ in range(Kb):
-                        a_blk = a_cb.wait()
-                        b_blk = b_cb.wait()
-                        p += a_blk @ b_blk
-                    s = swap_cb.wait()
-                    xd = x_diag_cb.wait()
-                    c = cos_cb.wait()
-                    si = sin_cb.wait()
-                    out_cb.reserve().store(xd * c + s * si)
+            # Phase 1: rotate rope half, store all rd_t tiles in rope_rot_cb.
+            for _ in range(Kb_rope):
+                q_rope_blk = q_rope_cb.wait()
+                P_blk = P_cb.wait()
+                c_blk = cos_cb.wait()
+                si_blk = sin_cb.wait()
+                swap_cb.reserve().store(q_rope_blk @ P_blk)
+                swap_blk = swap_cb.wait()
+                rope_rot_cb.reserve().store(
+                    q_rope_blk * c_blk + swap_blk * si_blk)
+
+            # Phase 2: Walsh-Hadamard matmul over full K=D.
+            p = out_cb.reserve()
+            for _ in range(Kb_nope):
+                q_blk = q_nope_cb.wait()
+                H_blk = H_cb.wait()
+                p += q_blk @ H_blk
+            for _ in range(Kb_rope):
+                q_blk = rope_rot_cb.wait()
+                H_blk = H_cb.wait()
+                p += q_blk @ H_blk
 
         @ttl.datamovement()
         def dm_read():
             _, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for _ in range(N_BPN):
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        a_blk = a_cb.reserve()
-
-                        def read_a(pipe):
-                            ttl.copy(x[mr:mr + bm, kc:kc + bk], a_blk).wait()
-                            ttl.copy(a_blk, pipe).wait()
-
-                        mcast_a_net.if_src(read_a)
-                        mcast_a_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+            mr = row_c * M_BPN * bm
+            # Phase 1 inputs: rope tiles + per-tile P-diag + cos + sin.
+            for k in range(Kb_rope):
+                rope_kc = nope_t + k * bk
+                diag_kc = k * bk
+                ttl.copy(q_full[mr:mr + bm, rope_kc:rope_kc + bk],
+                         q_rope_cb.reserve()).wait()
+                ttl.copy(P[diag_kc:diag_kc + bk, diag_kc:diag_kc + bk],
+                         P_cb.reserve()).wait()
+                ttl.copy(cos[0:1, diag_kc:diag_kc + bk],
+                         cos_cb.reserve()).wait()
+                ttl.copy(sin[0:1, diag_kc:diag_kc + bk],
+                         sin_cb.reserve()).wait()
+            # Phase 2 nope inputs: q_nope tiles in K-order.
+            for k in range(Kb_nope):
+                kc = k * bk
+                ttl.copy(q_full[mr:mr + bm, kc:kc + bk],
+                         q_nope_cb.reserve()).wait()
 
         @ttl.datamovement()
         def dm_write():
             col_c, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for local_nb in range(N_BPN):
-                    nb = col_c * N_BPN + local_nb
-                    nc = nb * bn
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        b_blk = b_cb.reserve()
+            mr = row_c * M_BPN * bm
+            nc = col_c * N_BPN * bn
+            # H tiles in K-order: nope range first, then rope range.
+            for k in range(Kb_nope):
+                kc = k * bk
+                ttl.copy(H_mat[kc:kc + bk, nc:nc + bn],
+                         H_cb.reserve()).wait()
+            for k in range(Kb_rope):
+                kc = (nope_t + k) * bk
+                ttl.copy(H_mat[kc:kc + bk, nc:nc + bn],
+                         H_cb.reserve()).wait()
+            o = out_cb.wait()
+            ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
 
-                        def read_b(pipe):
-                            ttl.copy(P[kc:kc + bk, nc:nc + bn], b_blk).wait()
-                            ttl.copy(b_blk, pipe).wait()
-
-                        mcast_b_net.if_src(read_b)
-                        mcast_b_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
-                    ttl.copy(x[mr:mr + bm, nc:nc + bn],
-                             x_diag_cb.reserve()).wait()
-                    ttl.copy(cos[0:1, nc:nc + bn],
-                             cos_cb.reserve()).wait()
-                    ttl.copy(sin[0:1, nc:nc + bn],
-                             sin_cb.reserve()).wait()
-                    ttl.copy(out_cb.wait(),
-                             out[mr:mr + bm, nc:nc + bn]).wait()
-
-    return swap_combine
+    return fused_rot_hada
 
 
 def _build_rotary_tables(cos_full_cpu: torch.Tensor, sin_full_cpu: torch.Tensor,
@@ -396,17 +311,21 @@ def _build_swap_matrix(rd: int) -> torch.Tensor:
 def make_lk_d_idx_q_kernel(mesh, cos_full_cpu, sin_full_cpu):
     """Mega kernel for Lk-D-idx-q.
 
-    Four tt-lang dispatches: indexer.wq_b SUMMA, swap-SUMMA, rotary
-    combine, Walsh-Hadamard SUMMA.
+    Two tt-lang dispatches: indexer.wq_b ksplit SUMMA, then a single
+    fused rotary + Walsh-Hadamard kernel.
 
       qr [1,1,1024]
         → pad to [TILE, 1024]
         → SUMMA matmul against indexer.wq_b [1024, 8192]
-        → [TILE, 8192] -> reshape [1, 1, H=64, D=128]
-        → slice nope/rope, swap-SUMMA + rotary combine, concat
-        → reshape [H, D] = [64, 128]
-        → SUMMA matmul against H_d/sqrt(d) [128, 128]
+        → [TILE, 8192] -> reshape [H=64, D=128]
+        → fused (rotary on rope half + matmul against Hadamard [D, D])
         → reshape [1, 1, 64, 128]
+
+    The wq_b ksplit (64 cores) and rot+hada (Mp=2 cores) cannot share a
+    grid — wq_b's output is sharded across 8 root cores by N-cols while
+    rot+hada partitions by H-rows. # TODO: mega fusion blocked: wq_b
+    output redistribution to rot+hada grid requires DRAM staging or a
+    fan-in PipeNet that buffers >100KB per phase-2 core.
     """
     H = INDEX_N_HEADS
     D = INDEX_HEAD_DIM
@@ -423,18 +342,10 @@ def make_lk_d_idx_q_kernel(mesh, cos_full_cpu, sin_full_cpu):
         M=M_PAD, K=Q_LORA_RANK, N=N_WQB,
         block_cfg=(1, 4, 4), part_cfg=(1, 8, 8))
 
-    # SUMMA #2: [H=64, D=128] @ [D, D] -> [H, D]
-    # Mt=2, Kt=4, Nt=4. block=(1, 4, 4) -> Mb=2, Nb=1, Kb=1. Mp=2, Np=1
-    # -> M_BPN=1, N_BPN=1.
-    matmul_hada_kernel = _make_summa_matmul_kernel(
-        M=H, K=D, N=D,
-        block_cfg=(1, 4, 4), part_cfg=(2, 1, 1))
-
-    # Fused swap SUMMA + rotary combine: M=H=64, K=N=rd=64.
-    # Mt=Kt=Nt=2. block=(1,1,2), part=(2,2,1) -> 4 cores.
-    swap_combine_kernel = _make_swap_combine_kernel(
-        M=H, K_dim=rd, N=rd,
-        block_cfg=(1, 1, 2), part_cfg=(2, 2, 1))
+    # Fused rotary + Hadamard: M=H=64 split over Mp=2 (2 cores, each
+    # handling one M-tile of 32 rows). bk=1 so we walk K-tiles individually
+    # and branch nope vs rope per-tile.
+    rot_hada_kernel = _make_fused_rot_hada_kernel(M=H, D=D, rd=rd)
 
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -456,9 +367,6 @@ def make_lk_d_idx_q_kernel(mesh, cos_full_cpu, sin_full_cpu):
             state["q_rotated_tt"] = ttnn.from_torch(
                 torch.zeros((H, D), dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
-            state["q_rope_rot_tt"] = ttnn.from_torch(
-                torch.zeros((H, rd), dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
             state["scratch"] = True
 
         # 1. Pad qr [1,1,K] -> [TILE, K] for SUMMA M-axis.
@@ -469,34 +377,22 @@ def make_lk_d_idx_q_kernel(mesh, cos_full_cpu, sin_full_cpu):
         # 2. SUMMA #1: indexer.wq_b matmul -> [TILE, 8192].
         matmul_wqb_kernel(qr_padded, indexer_wq_b_tt, state["q_padded_tt"])
 
-        # 3. Slice [TILE, 8192] -> [B*S, 8192] and reshape [1, 1, H, D].
+        # 3. Slice [TILE, 8192] -> [B*S, 8192] and reshape [H, D].
         q_row = ttnn.slice(state["q_padded_tt"], [0, 0], [B * S, N_WQB])
-        q_4d = ttnn.reshape(q_row, [B, S, H, D])
+        q_2d = ttnn.reshape(q_row, [H, D])
 
-        # 4. Rotary on rope half via swap-SUMMA + rotary-combine.
+        # 4. Fused rotary on rope half + Walsh-Hadamard matmul.
         # TODO: mega fusion blocked: ttnn used for embedding(start_pos, ...)
-        # to look up cos/sin (depends on a device uint32 index). Slice/
-        # reshape/concat stay in ttnn around the lookup.
+        # to look up cos/sin (depends on a device uint32 index). Element_read
+        # primitive exists; gather wiring is task C8.
         cos_b_2d = ttnn.embedding(start_pos_tt, cos_ext_tt, layout=ttnn.TILE_LAYOUT)
         sin_b_2d = ttnn.embedding(start_pos_tt, sin_signed_tt, layout=ttnn.TILE_LAYOUT)
         cos_b = ttnn.reshape(cos_b_2d, [TILE, rd])
         sin_b = ttnn.reshape(sin_b_2d, [TILE, rd])
 
-        q_nope = ttnn.slice(q_4d, [0, 0, 0, 0], [B, 1, H, D - rd])
-        q_rope = ttnn.slice(q_4d, [0, 0, 0, D - rd], [B, 1, H, D])
-        q_rope_2d = ttnn.reshape(q_rope, [H, rd])
-        swap_combine_kernel(
-            q_rope_2d, P_tt, cos_b, sin_b, state["q_rope_rot_tt"])
-        q_rope_rot_4d = ttnn.reshape(state["q_rope_rot_tt"], [B, S, H, rd])
-        q_full = ttnn.concat([q_nope, q_rope_rot_4d], dim=-1)
+        rot_hada_kernel(q_2d, P_tt, cos_b, sin_b, H_tt, state["q_rotated_tt"])
 
-        # 5. Reshape [1, 1, H, D] -> [H, D] for SUMMA #2.
-        q_2d = ttnn.reshape(q_full, [H, D])
-
-        # 6. SUMMA #2: Walsh-Hadamard matmul -> [H, D].
-        matmul_hada_kernel(q_2d, H_tt, state["q_rotated_tt"])
-
-        # 7. Reshape back [1, 1, H, D] and copy to test-provided out.
+        # 5. Reshape back [1, 1, H, D] and copy to test-provided out.
         q_out_4d = ttnn.reshape(state["q_rotated_tt"], [B, S, H, D])
         ttnn.copy(q_out_4d, out)
 
