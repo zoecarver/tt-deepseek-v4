@@ -4517,9 +4517,9 @@ class DeviceCompressor(nn.Module):
         # Slot-shift via tt-lang kernel (compressor_slot_shift). One kernel
         # call per buffer (4 dispatches) replaces the old 16-dispatch loop
         # of slice + update_cache_for_token_. Compute is `out = P @ in`;
-        # the result is copied back into the input buffer (single-tensor
-        # state with no Python attribute swap, so trace capture sees fixed
-        # tensor identities). The `_out_2d_tt` buffers act as scratch.
+        # we run it in-place (out == in) since each output tile depends only
+        # on the same-coordinate input tile, dropping the prior 4 ttnn.copy
+        # writebacks.
         if self.overlap:
             if d == 512:
                 slot_shift = ttl_compressor_slot_shift_B1_pad32_d512
@@ -4534,9 +4534,7 @@ class DeviceCompressor(nn.Module):
             for base in ("kv_state_front", "kv_state_back",
                          "score_state_front", "score_state_back"):
                 in_2d = getattr(self, f"{base}_2d_tt")
-                out_2d = getattr(self, f"{base}_out_2d_tt")
-                slot_shift(in_2d, self.shift_P_tt, out_2d)
-                ttnn.copy(out_2d, in_2d)
+                slot_shift(in_2d, self.shift_P_tt, in_2d)
 
         return kv_normed
 
