@@ -288,7 +288,7 @@ def make_lk_f_kernel(mesh, gate_bias_cpu):
     state: dict = {"bias_padded": bias_padded_tt}
 
     def lk_f_kernel(x_tt, gate_w_tt, gate_bias_tt,
-                    w1_tt, w2_tt, w3_tt, chip_ids_4d_tt):
+                    w13_tt, w2_tt, chip_ids_4d_tt):
         if "init" not in state:
             state["scores_padded"] = ttnn.from_torch(
                 torch.zeros(TILE, N_ROUTED, dtype=torch.bfloat16),
@@ -336,13 +336,17 @@ def make_lk_f_kernel(mesh, gate_bias_cpu):
         match_weighted = ttnn.multiply(weights_4d, match_bf16)
         mask = ttnn.sum(match_weighted, dim=-1, keepdim=True)
 
-        # 6. Batched routed-expert path: w1, w3, swiglu, w2, mask, sum-experts.
-        # TODO: mega: replace batched ttnn.matmul x3 with batched-SUMMA tt-lang
+        # 6. Batched routed-expert path: w13 (w1 + w3 fused), swiglu, w2,
+        # mask, sum-experts. w1 and w3 share the A operand so we concat the
+        # weights on the N axis at offload and split y13 here.
+        # TODO: mega: replace batched ttnn.matmul x2 with batched-SUMMA tt-lang
         # kernel; SwiGLU body (clamp + silu + multiply) also still in ttnn.
         x_4d = ttnn.reshape(x_tt, [1, 1, 1, DIM])
         x_grouped = ttnn.repeat(x_4d, [1, PER_CHIP, 1, 1])
-        y1 = ttnn.matmul(x_grouped, w1_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        y3 = ttnn.matmul(x_grouped, w3_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        y13 = ttnn.matmul(x_grouped, w13_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        y1 = ttnn.slice(y13, [0, 0, 0, 0], [1, PER_CHIP, 1, INTER_DIM])
+        y3 = ttnn.slice(y13, [0, 0, 0, INTER_DIM],
+                        [1, PER_CHIP, 1, 2 * INTER_DIM])
         if SWIGLU_LIMIT > 0:
             ttnn.clamp(y1, max=SWIGLU_LIMIT, output_tensor=y1)
             ttnn.clamp(y3, min=-SWIGLU_LIMIT, max=SWIGLU_LIMIT, output_tensor=y3)
@@ -419,6 +423,10 @@ def main():
         w1_tt = ttnn.as_tensor(w1.contiguous(), dtype=ttnn.bfloat16, **rep)
         w2_tt = ttnn.as_tensor(w2.contiguous(), dtype=ttnn.bfloat16, **rep)
         w3_tt = ttnn.as_tensor(w3.contiguous(), dtype=ttnn.bfloat16, **rep)
+        # w1+w3 share the same A operand; concat on the N axis so the kernel
+        # does one batched matmul + slice instead of two independent matmuls.
+        w13 = torch.cat([w1, w3], dim=-1).contiguous()
+        w13_tt = ttnn.as_tensor(w13, dtype=ttnn.bfloat16, **rep)
         chip_ids_tt = ttnn.as_tensor(chip_ids.contiguous(),
                                      dtype=ttnn.int32, **rep)
 
@@ -428,7 +436,7 @@ def main():
 
         kernel = make_lk_f_kernel(mesh, gate_bias)
         kernel_out_tt = kernel(x_tt, gate_w_tt, gate_bias_tt,
-                               w1_tt, w2_tt, w3_tt, chip_ids_tt)
+                               w13_tt, w2_tt, chip_ids_tt)
         kernel_host = download_chip0(mesh, mesh_shape, kernel_out_tt)
 
         ok = report_pcc("Lk-F", ref_host, kernel_host)
@@ -439,7 +447,7 @@ def main():
                   mesh)
         benchmark("Lk-F ttl",
                   lambda: kernel(x_tt, gate_w_tt, gate_bias_tt,
-                                 w1_tt, w2_tt, w3_tt, chip_ids_tt),
+                                 w13_tt, w2_tt, chip_ids_tt),
                   mesh)
 
         sys.exit(0 if ok else 1)
