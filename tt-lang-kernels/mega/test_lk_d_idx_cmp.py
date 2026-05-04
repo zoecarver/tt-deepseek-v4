@@ -143,36 +143,36 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
 def make_lk_d_idx_cmp_kernel(mesh, sharded_input_memcfg):
     """Mega kernel for Lk-D-idx-cmp.
 
-    Two SUMMA matmuls (wkv, wgate) plus ttnn glue (APE +
-    paged_update_cache; see TODO above).
+    Single fused SUMMA matmul against `cat([wkv, wgate], dim=-1)` so that
+    x is mcast once (was mcast twice when wkv and wgate were separate
+    matmuls). Output is sliced into kv and score halves. APE +
+    paged_update_cache remain ttnn glue (see TODO above).
     """
     d = INDEX_HEAD_DIM
     c = CDIM
     M_PAD = TILE
+    NCAT = 2 * CDIM
     state: dict = {}
 
-    # Both matmuls have the same shape: M=TILE, K=DIM, N=CDIM.
-    # Mt=1, Kt=128, Nt=8.
-    # block=(1, 4, 4) -> Mb=1, Nb=2, Kb=32. part=(1, 2, 1) -> N_BPN=1.
+    # Fused matmul shape: M=TILE, K=DIM, N=2*CDIM.
+    # Mt=1, Kt=128, Nt=16. block=(1,4,8) part=(1,4,1) -> 4 cores,
+    # Nb=4 N_BPN=1, Kb=16. x is mcast once across both linears.
     matmul_kernel = _make_summa_matmul_kernel(
-        M=M_PAD, K=DIM, N=CDIM,
-        block_cfg=(1, 4, 4), part_cfg=(1, 2, 1))
+        M=M_PAD, K=DIM, N=NCAT,
+        block_cfg=(1, 4, 8), part_cfg=(1, 4, 1))
 
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
 
-    def lk_d_idx_cmp_kernel(x_tt, wkv_w_tt, wgate_w_tt, ape_padded_tt,
+    def lk_d_idx_cmp_kernel(x_tt, wkv_gate_w_tt, ape_padded_tt,
                             start_pos_tt, state_slot_tt,
                             kv_state_front_tt, kv_state_back_tt,
                             score_state_front_tt, score_state_back_tt,
                             kv_out, score_out):
         if "scratch" not in state:
-            state["kv_padded_tt"] = ttnn.from_torch(
-                torch.zeros((M_PAD, CDIM), dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
-            state["score_padded_tt"] = ttnn.from_torch(
-                torch.zeros((M_PAD, CDIM), dtype=torch.bfloat16),
+            state["kv_gate_padded_tt"] = ttnn.from_torch(
+                torch.zeros((M_PAD, NCAT), dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
             state["scratch"] = True
 
@@ -180,15 +180,14 @@ def make_lk_d_idx_cmp_kernel(mesh, sharded_input_memcfg):
         x_2d = ttnn.reshape(x_tt, [B, DIM])
         x_padded = ttnn.pad(x_2d, padding=[(0, M_PAD - B), (0, 0)], value=0.0)
 
-        # SUMMA #1: kv = x · wkv -> [TILE, CDIM].
-        matmul_kernel(x_padded, wkv_w_tt, state["kv_padded_tt"])
-        # SUMMA #2: score = x · wgate -> [TILE, CDIM].
-        matmul_kernel(x_padded, wgate_w_tt, state["score_padded_tt"])
+        # Fused SUMMA: kv|gate = x · [wkv|wgate] -> [TILE, 2*CDIM].
+        matmul_kernel(x_padded, wkv_gate_w_tt, state["kv_gate_padded_tt"])
 
-        # Slice + reshape to [1, 1, CDIM].
-        kv_row = ttnn.slice(state["kv_padded_tt"], [0, 0], [B, CDIM])
+        # Slice halves + reshape to [1, 1, CDIM].
+        kv_row = ttnn.slice(state["kv_gate_padded_tt"], [0, 0], [B, CDIM])
         kv_3d = ttnn.reshape(kv_row, [B, 1, CDIM])
-        score_row = ttnn.slice(state["score_padded_tt"], [0, 0], [B, CDIM])
+        score_row = ttnn.slice(
+            state["kv_gate_padded_tt"], [0, CDIM], [B, NCAT])
         score_3d = ttnn.reshape(score_row, [B, 1, CDIM])
 
         # APE add (TODO: mega).
@@ -281,6 +280,9 @@ def main():
         x_tt = ttnn.as_tensor(x.contiguous(), dtype=ttnn.bfloat16, **rep)
         wkv_w_tt = ttnn.as_tensor(wkv_w.contiguous(), dtype=ttnn.bfloat16, **rep)
         wgate_w_tt = ttnn.as_tensor(wgate_w.contiguous(), dtype=ttnn.bfloat16, **rep)
+        # Pre-concat for the fused kernel (offline, would happen at offload time).
+        wkv_gate_w = torch.cat([wkv_w, wgate_w], dim=-1).contiguous()
+        wkv_gate_w_tt = ttnn.as_tensor(wkv_gate_w, dtype=ttnn.bfloat16, **rep)
         ape_padded_tt = ttnn.as_tensor(ape_padded.contiguous(), dtype=ttnn.bfloat16, **rep)
         kv_state_front_tt = ttnn.as_tensor(kv_state_front.contiguous(),
                                            dtype=ttnn.bfloat16, **rep)
@@ -328,7 +330,7 @@ def main():
         score_out_tt = ttnn.from_torch(
             torch.zeros(1, 1, CDIM, dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, **rep)
-        kernel(x_tt, wkv_w_tt, wgate_w_tt, ape_padded_tt, start_pos_tt,
+        kernel(x_tt, wkv_gate_w_tt, ape_padded_tt, start_pos_tt,
                state_slot_tt,
                kv_state_front_tt, kv_state_back_tt,
                score_state_front_tt, score_state_back_tt,
@@ -347,7 +349,7 @@ def main():
                                     sharded_memcfg),
                   mesh)
         benchmark("Lk-D-idx-cmp ttl",
-                  lambda: kernel(x_tt, wkv_w_tt, wgate_w_tt, ape_padded_tt,
+                  lambda: kernel(x_tt, wkv_gate_w_tt, ape_padded_tt,
                                  start_pos_tt, state_slot_tt,
                                  kv_state_front_tt, kv_state_back_tt,
                                  score_state_front_tt, score_state_back_tt,
