@@ -50,22 +50,19 @@ TILE = 32
 
 
 def _make_hc_combiner_kernel(num_out_tiles: int, K_tiles: int,
-                             rms_eps: float, inv_D: float, hc_eps: float):
+                             rms_eps: float, inv_D: float, hc_eps: float,
+                             *, bk: int = 64):
     """Inlined and extended from inference._compile_mhc_norm_fn_kernel.
 
-    Computes per row tile:
-      mixes  = a @ hc_fn_t_scaled                       (ping-pong c += a@b)
-      ssq    = sum(a^2) over the row                    (parallel ssq accum)
-      rsqrt  = rsqrt(ssq * inv_D + rms_eps)
-      pre    = sigmoid(mixes * rsqrt + hc_base) + hc_eps
-
-    Inputs (all fp32):
-      a:        [num_out_tiles, K_tiles] (TILE x TILE per tile)
-      b:        [K_tiles, 1] (hc_fn_t pre-scaled by hc_scale, mhc<=TILE in cols)
-      scaler:   [1, 1] (all-ones broadcast tile)
-      hc_base:  [1, 1] (hc_base packed; cols 0..mhc-1 = base[m], rest 0)
-      out:      [num_out_tiles, 1] fp32 (cols 0..mhc-1 valid)
+    a_dfb shape=(1, bk), b_dfb shape=(bk, 1): per-core K-loop runs
+    K_NB=K_tiles/bk SUMMA-style accumulations. xsq matches at (1, bk)
+    and reduce_sum dim=[1] collapses both within-tile cols and across
+    bk tile-cols. bk=2 is the max stable; bk=4 hits PCC due to DST
+    register pressure with fp32_dest_acc_en.
     """
+    if K_tiles % bk:
+        raise ValueError(f"K_tiles={K_tiles} not divisible by bk={bk}")
+    K_NB = K_tiles // bk
 
     @ttl.operation(
         grid="auto",
@@ -77,8 +74,8 @@ def _make_hc_combiner_kernel(num_out_tiles: int, K_tiles: int,
         total_cores = grid_rows * grid_cols
         tiles_per_core = -(-num_out_tiles // total_cores)
 
-        a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
-        b_dfb = ttl.make_dataflow_buffer_like(b, shape=(1, 1), block_count=2)
+        a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, bk), block_count=2)
+        b_dfb = ttl.make_dataflow_buffer_like(b, shape=(bk, 1), block_count=2)
         sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
         hcb_dfb = ttl.make_dataflow_buffer_like(hc_base, shape=(1, 1), block_count=1)
         out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
@@ -87,7 +84,7 @@ def _make_hc_combiner_kernel(num_out_tiles: int, K_tiles: int,
         sq_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
         inv_bc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
 
-        asq_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
+        asq_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, bk), block_count=2)
         red_step_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
 
         @ttl.compute()
@@ -109,7 +106,7 @@ def _make_hc_combiner_kernel(num_out_tiles: int, K_tiles: int,
                         ttl.math.reduce_sum(asq_dfb.wait(), sc, dims=[1])
                     )
 
-                    for _ in range(K_tiles - 1):
+                    for _ in range(K_NB - 1):
                         a_k = a_dfb.wait()
                         b_k = b_dfb.wait()
                         prev_c = c_dfb.wait()
@@ -147,9 +144,16 @@ def _make_hc_combiner_kernel(num_out_tiles: int, K_tiles: int,
             for local_t in range(tiles_per_core):
                 global_t = core_idx * tiles_per_core + local_t
                 if global_t < num_out_tiles:
-                    for k in range(K_tiles):
-                        ttl.copy(a[global_t, k], a_dfb.reserve()).wait()
-                        ttl.copy(b[k, 0], b_dfb.reserve()).wait()
+                    for kb_local in range(K_NB):
+                        kc = kb_local * bk
+                        ttl.copy(
+                            a[global_t:global_t + 1, kc:kc + bk],
+                            a_dfb.reserve(),
+                        ).wait()
+                        ttl.copy(
+                            b[kc:kc + bk, 0:1],
+                            b_dfb.reserve(),
+                        ).wait()
 
         @ttl.datamovement()
         def dm_write():
