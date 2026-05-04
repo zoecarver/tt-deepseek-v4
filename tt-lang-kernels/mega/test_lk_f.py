@@ -299,7 +299,7 @@ def make_lk_f_kernel(mesh, gate_bias_cpu):
             state["init"] = True
 
         # 1. Pad x [1, DIM] -> [TILE, DIM] for SUMMA.
-        # TODO: mega fusion blocked: ttnn.pad/reshape sub-tile -> tile-aligned.
+        # TODO: mega fusion
         x_2d = ttnn.reshape(x_tt, [B, DIM])
         x_padded = ttnn.pad(x_2d, padding=[(0, TILE - B), (0, 0)],
                             value=0.0)

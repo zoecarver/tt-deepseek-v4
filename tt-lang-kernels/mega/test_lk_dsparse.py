@@ -942,9 +942,7 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         o_concat = ttnn.reshape(o_full_2d, [B, S, H, D])
 
         # 10. Group reshape + permute.
-        # TODO: mega fusion blocked: ttnn used for permute + per-group slice.
-        # Lowering needs a tt-lang batched-matmul-with-replicated-A primitive
-        # so we can fold the 8 wo_a dispatches into one.
+        # TODO: mega fusion you should be able to build a a tt-lang batched-matmul-with-replicated-A operation.
         o_perm = ttnn.reshape(o_concat, [B, S, N_GROUPS, PER_GROUP])
         o_perm = ttnn.permute(o_perm, [2, 0, 1, 3])  # [G, B, S, per_group]
         o_g = ttnn.reshape(o_perm, [N_GROUPS, B * S, PER_GROUP])

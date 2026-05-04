@@ -487,6 +487,12 @@ Sometimes you will need some helpers to reshape or typecast inputs before you in
 
 Don't do it :) The point of this is to produce mega kernels in tt-lang, if there is logic in between in ttnn, this defeats the purpose and will block future fusion and optimization. If you absolutely need to keep something in ttnn, please add the following TODO so that we can revisit: "TODO: mega fusion blocked: ttnn used for X" (make sure to say "TODO: mega" exactly so it can be grepped for).
 
+## Note on chaining ops in one ttl.operation
+
+There is no limit in tt-lang on how many matmuls you can have in a single `ttl.operation` — chain as many matmuls and elementwise/reduce/etc. ops together as you want; fusion is never blocked by a "one matmul per operation" rule. You can declare many `PipeNet`s and `make_dataflow_buffer_like` CBs in the same operation and combine any ops you need across compute / dm_read / dm_write threads.
+
+If you hit a compiler error about too many dfbs or pipenets in one operation, skip that fusion — we have fused as much as we can.
+
 ## Important note on remotes
 
 For this part of the project, only use sterling-all.conf, this is the machine we have dedicated to writing mega kernels in tt-lang.

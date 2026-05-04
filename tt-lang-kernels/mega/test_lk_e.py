@@ -825,6 +825,7 @@ def make_lk_e_kernel(mesh, hc_attn_fn_cpu, hc_attn_scale_cpu, hc_attn_base_cpu,
             state["partial_pad"] = _zeros_bf16((TILE, DIM))
             state["scratch"] = True
 
+        # TODO: claude: I don't see any reason this whole thing cannot be a single fused kernel, you should have all the primtives you need for reshape, slice, etc in datamovement and you can use element_read/write if needed. If you need to do some ttnn ceremony before or after the kernel that's OK.
         # 1. hc_pre_attn on prev_a -> populates post_a, comb_sk_out_a stash.
         post_attn_tt, comb_sk_attn_tt, _ = _run_hc_pre(
             attn_consts, prev_a_tt,

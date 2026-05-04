@@ -559,11 +559,8 @@ def make_lk_d1_kernel(mesh, gamma_cpu, cos_full_cpu, sin_full_cpu):
         kv_normed = ttnn.reshape(kv_normed_2d, [B, S, HEAD_DIM])
 
         # Rotary on rope-half.
-        # TODO: mega fusion blocked: ttnn used for embedding(start_pos, ...)
-        # to look up cos/sin (depends on a device uint32 index, no tt-lang
-        # gather primitive). Slice/pad/reshape stay in ttnn for the same
-        # reason. The actual rotary math (swap_pairs + cos/sin combine) is
-        # in tt-lang.
+        # TODO: mega fusion investigate if we can use element_read/write for this or build some gather primtive like maybe reduce_max or max or pipes
+        # TODO: claude I would really you to turn this whole def into a single ttl.operation call
         cos_b_2d = ttnn.embedding(start_pos, cos_ext_tt, layout=ttnn.TILE_LAYOUT)
         sin_b_2d = ttnn.embedding(start_pos, sin_signed_tt, layout=ttnn.TILE_LAYOUT)
         cos_b = ttnn.reshape(cos_b_2d, [TILE, ROPE_HEAD_DIM])
