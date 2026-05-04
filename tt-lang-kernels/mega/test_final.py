@@ -573,10 +573,11 @@ def make_final_kernel(mesh, debug_state=None):
         num_row_tiles=1, h_tiles=h_tiles_norm,
         rms_eps=NORM_EPS, inv_D=inv_D_norm)
     # SUMMA lm_head: M=TILE, K=4096, N=129280. Mt=1, Kt=128, Nt=4040.
-    # block=(1, 8, 4) part=(1, 5, 1) -> Nb=505, M_BPN=1, N_BPN=101 (5 cores).
+    # block=(1, 4, 4) part=(1, 10, 1) -> Nb=1010, N_BPN=101 (10 cores, 2x).
+    # Nb factorization 4040 = 2^3 * 5 * 101, so Np maxes at 10 with bn>=4.
     lmhead_summa = _make_summa_matmul_kernel(
         M=TILE, K=DIM, N=VOCAB,
-        block_cfg=(1, 8, 4), part_cfg=(1, 5, 1))
+        block_cfg=(1, 4, 4), part_cfg=(1, 10, 1))
 
     # Argmax over full padded vocab. Multi-core ttnn.argmax (variant B from
     # argmax_2pass.py) + ttnn.max replaces ttnn.topk(k=1). The tt-lang
