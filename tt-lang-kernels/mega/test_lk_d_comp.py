@@ -599,7 +599,9 @@ def make_lk_d_comp_kernel(mesh, cos_compressor_cpu, sin_compressor_cpu,
         ape_slot = ttnn.embedding(start_pos_tt, ape_padded_tt, layout=ttnn.TILE_LAYOUT)
         score_3d = ttnn.add(score_3d, ttnn.reshape(ape_slot, [1, 1, c]))
 
-        # 4x paged_update_cache to state buffers (TODO: mega).
+        # 4x paged_update_cache to state buffers.
+        # TODO: mega fusion blocked (bucket #1 — unwired): element_write
+        # available; lower the 4 slot-writes into the fused kernel. C10.
         kv_front = ttnn.slice(kv_3d, [0, 0, 0], [B, 1, d])
         kv_back = ttnn.slice(kv_3d, [0, 0, d], [B, 1, c])
         score_front = ttnn.slice(score_3d, [0, 0, 0], [B, 1, d])
@@ -640,7 +642,9 @@ def make_lk_d_comp_kernel(mesh, cos_compressor_cpu, sin_compressor_cpu,
         kv_2d = ttnn.slice(kv_full_2d, [0, 0], [B, d])
         kv_normed = ttnn.reshape(kv_2d, [B, 1, d])
 
-        # paged_update_cache to kv_cache (TODO: mega).
+        # paged_update_cache to kv_cache.
+        # TODO: mega fusion blocked (bucket #1 — unwired): element_write
+        # available; lower this slot-write into the fused kernel. C10.
         kv_4d = ttnn.reshape(kv_normed, [1, B, 1, d])
         kv_sharded = ttnn.to_memory_config(kv_4d, memory_config=sharded_input_memcfg)
         ttnn.experimental.paged_update_cache(

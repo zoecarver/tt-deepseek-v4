@@ -189,8 +189,10 @@ def make_lk_d_topk_kernel(mesh):
         masked_2d = ttnn.slice(state["masked_padded"], [0, 0], [B, BUCKET])
         masked_tt = ttnn.reshape(masked_2d, [1, B, BUCKET])
 
-        # topk + post-correction stay in ttnn until B1 lands.
-        # TODO: mega fusion blocked: ttnn.topk + the int post-correction chain.
+        # No working tt-lang topk yet (see topk_iter_hangs.py). Goal here
+        # is mask_build as the pre_topk mega kernel (already done) with
+        # topk + post-correction as trailing ttnn ceremony — no downstream
+        # tt-lang consumer in this zone, so no post_topk mega kernel needed.
         vals_tt, idxs_tt = ttnn.topk(
             masked_tt, k=K_FIXED, dim=-1, largest=True, sorted=True)
         invalid_bf16 = ttnn.lt(vals_tt, -1000.0)

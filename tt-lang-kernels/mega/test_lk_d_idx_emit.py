@@ -628,7 +628,9 @@ def make_lk_d_idx_emit_kernel(mesh, cos_compressor_cpu, sin_compressor_cpu,
         kv_row = ttnn.slice(state["hada_out"], [0, 0], [B, d])
         kv_normed = ttnn.reshape(kv_row, [B, 1, d])
 
-        # paged_update_cache to indexer kv_cache (TODO: mega).
+        # paged_update_cache to indexer kv_cache.
+        # TODO: mega fusion blocked (bucket #1 — unwired): element_write
+        # available; lower this slot-write into the fused kernel. C10.
         kv_4d = ttnn.reshape(kv_normed, [1, B, 1, d])
         kv_sharded = ttnn.to_memory_config(kv_4d, memory_config=sharded_input_memcfg)
         ttnn.experimental.paged_update_cache(

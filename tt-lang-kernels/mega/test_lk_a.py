@@ -739,6 +739,8 @@ def make_lk_a_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
         comb_sk_out_tt = state["comb_sk_out_tt"]
         apply_mix_out_tt = state["apply_mix_out_tt"]
         a_sliced_scratch_tt = state["a_sliced_scratch_tt"]
+        
+        # TODO: claude: can you please fuse the following kernels into one ttl.operation and inline the reshape and slice using data movement threads? You can demote f32 tensors to bf16 if needed. Ideally this whole kernel body is a single ttl.operation.
 
         # 1. mhc.norm_fn (ksplit) on residual a_tt -> mixes_tt
         norm_fn_kernel(a_tt, fn_tt, sc_fp32_tt, mixes_tt)

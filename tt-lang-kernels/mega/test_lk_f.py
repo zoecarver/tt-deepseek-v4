@@ -313,9 +313,13 @@ def make_lk_f_kernel(mesh, gate_bias_cpu):
         biased = ttnn.reshape(biased_2d, [1, B, N_ROUTED])
 
         # 4. topk + gather + normalize + scale.
-        # TODO: mega fusion blocked: no tt-lang topk; no tt-lang gather.
+        # No working tt-lang topk yet (see topk_iter_hangs.py). Goal here
+        # is two mega kernels per zone: pre_topk (everything up through the
+        # gate post / biased) and post_topk (gather + normalize + selection
+        # mask + routed-expert SwiGLU + reduce), with ttnn topk as the
+        # trailing/leading ceremony between them.
         _, indices_tt = ttnn.topk(
-            biased, k=TOPK, dim=-1, largest=True, sorted=True)
+            biased, k=TOPK, dim=-1, largest=True, sorted=True) # TODO: investigate if there is a argmax(use_multicore=True) equivilant here (i.e., can we use multicore impl to speed this up).
         gathered = ttnn.gather(scores, dim=-1, index=indices_tt)
         wsum = ttnn.sum(gathered, dim=-1, keepdim=True)
         normed = ttnn.div(gathered, wsum)

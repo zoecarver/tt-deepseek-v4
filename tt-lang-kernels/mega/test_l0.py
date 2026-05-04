@@ -732,6 +732,8 @@ def make_l0_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
         comb_sk_out_tt = state["comb_sk_out_tt"]
         apply_mix_out_tt = state["apply_mix_out_tt"]
         a_sliced_scratch_tt = state["a_sliced_scratch_tt"]
+        
+        # TODO: claude: can the following kernels all be fused into one ttl.operation and the slice/reshape inlined? apply_mix_kernel can maybe be bf16 to allow further fusion, ideally this whole kernel body would be a single fused ttl.operation.
 
         # 2. mhc.norm_fn (ksplit) -> mixes_tt.
         norm_fn_kernel(a_tt, fn_tt, sc_fp32_tt, mixes_tt)

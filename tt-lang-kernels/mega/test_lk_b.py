@@ -380,6 +380,8 @@ def make_lk_b_kernel(mesh, gamma_cpu):
         q_2d = ttnn.reshape(q_lora, [B * S, Q_LORA_RANK])
         x_padded = ttnn.pad(
             q_2d, padding=[(0, M_PAD - B * S), (0, 0)], value=0.0)
+            
+        # TODO: claude: can these two kernels be fused together? the ceremony with reshape and pad ideally can be inlined into the single ttl.operation in dm, otherwise it's OK out of the main fusion. I also don't understand why we need a copy, feels like we are hooking some tensors up wrong, but if it's needed, can it be part of the dm of the fused ttl.operation too?
 
         # 2. RMSNorm -> normed_tt [TILE, K].
         rms_kernel(x_padded, gamma_tt, state["scaler_tt"], state["normed_tt"])

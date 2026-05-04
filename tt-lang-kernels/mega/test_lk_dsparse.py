@@ -875,8 +875,11 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
             state["init"] = True
 
         # 1. paged_update_cache.
-        # TODO: mega fusion blocked: ttnn used for paged_update_cache (kv slot
-        # write). Lowering needs a tt-lang slot-write primitive.
+        # TODO: mega fusion blocked (bucket #1 — unwired, not primitive):
+        # tt-lang now has element_write (see /Users/zcarver/Developer/
+        # tt-lang/element_read_write). Slot-write at kv_slot_tt is a
+        # straight element_write of kv_4d into kv_cache_tt[kv_slot, :].
+        # See README bucket #1. Tracked as task C10.
         kv_4d = ttnn.reshape(kv_tt, [1, B, 1, D])
         kv_4d_sharded = ttnn.to_memory_config(kv_4d, memory_config=sharded_input_memcfg)
         ttnn.experimental.paged_update_cache(

@@ -195,7 +195,9 @@ def make_lk_d_idx_cmp_kernel(mesh, sharded_input_memcfg):
             start_pos_tt, ape_padded_tt, layout=ttnn.TILE_LAYOUT)
         score_3d = ttnn.add(score_3d, ttnn.reshape(ape_slot, [1, 1, c]))
 
-        # paged_update_cache writes (TODO: mega).
+        # paged_update_cache writes.
+        # TODO: mega fusion blocked (bucket #1 — unwired): element_write
+        # available; lower the 4 slot-writes into the fused kernel. C10.
         kv_front = ttnn.slice(kv_3d, [0, 0, 0], [B, 1, d])
         kv_back = ttnn.slice(kv_3d, [0, 0, d], [B, 1, c])
         score_front = ttnn.slice(score_3d, [0, 0, 0], [B, 1, d])

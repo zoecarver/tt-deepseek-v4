@@ -689,17 +689,19 @@ def make_final_kernel(mesh, debug_state=None):
         num_row_tiles=1, h_tiles=h_tiles_norm,
         rms_eps=NORM_EPS, inv_D=inv_D_norm)
     # KSPLIT lm_head: M=TILE, K=4096, N=129280. Mt=1, Kt=128, Nt=4040.
-    # block=(1, 4, 4) part=(1, 10, 10) -> Nb=1010 N_BPN=101, Kb=32 K_BPN=3.2.
-    # Wait Kb=32 % Kp=10 != 0; use Kp=8 -> K_BPN=4. Or bk=8: Kb=16, Kp=8 -> K_BPN=2.
-    # Pick Kp=8 with bk=4: 80-core grid (10 wide, 8 tall on 11x10 device).
+    # block=(1, 4, 4) part=(1, 10, 8) -> Nb=1010, Kb=32, K_BPN=4 (80 cores).
     lmhead_summa = _make_ksplit_matmul_kernel(
         M=TILE, K=DIM, N=VOCAB,
         block_cfg=(1, 4, 4), part_cfg=(1, 10, 8))
 
     # Argmax over full padded vocab. Multi-core ttnn.argmax (variant B from
-    # argmax_2pass.py) + ttnn.max replaces ttnn.topk(k=1). The tt-lang
-    # 2-pass kernel works at NUM_ITERS=4 (per-chip slice) but loses
-    # within-tile resolution at NUM_ITERS=127 (full vocab on one chip).
+    # argmax_2pass.py) + ttnn.max replaces ttnn.topk(k=1).
+    # TODO: mega fusion blocked (bucket #5 — primitive): single-stage
+    # argmax_2pass cannot encode indices in [0, VOCAB=129280) into the
+    # `i + sign(v - max) * BIG` trick because bf16's 8-bit mantissa only
+    # holds integers exactly up to 256, and fp32 reduce_max is broken
+    # upstream. Fix is hierarchical argmax (3 stages of ≤256). See README
+    # "What's actually unwired vs primitive-blocked", bucket #5. Punted.
     n_valid_tiles = VOCAB // TILE                          # 4040
     n_total_tiles = n_valid_tiles  # no extra padding needed for ttnn.argmax
 
@@ -729,6 +731,7 @@ def make_final_kernel(mesh, debug_state=None):
 
         # 1. HC combiner: a [TILE, D] fp32 + hc_fn_t_scaled [D, TILE] fp32
         #    -> pre_tile [TILE, TILE] fp32 (cols 0..mhc-1 of row 0 valid).
+        # TODO: claude: can you please try a_tt in bf16 (whole thing bf16) and then fuse hc_combiner + rmsnorm + lmhead_summa and inline the slice, reshape, matmul etc so we have a genuine mega kernel with all the logic in one ttl.operation?
         hc_combiner(a_tt, hc_fn_t_scaled_tt, scaler_fp32_tt,
                     hc_base_tile_tt, state["pre_tile"])
 
