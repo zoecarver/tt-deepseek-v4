@@ -634,15 +634,14 @@ def make_lk_d_idx_emit_kernel(mesh, cos_compressor_cpu, sin_compressor_cpu,
         ttnn.experimental.paged_update_cache(
             kv_cache, kv_sharded, update_idxs_tensor=emit_slot)
 
-        # 4x slot-shift + ttnn.copy (writes back into the live state buffers).
-        slot_shift_kernel(kv_state_front_2d, shift_P, kv_state_front_scratch)
-        ttnn.copy(kv_state_front_scratch, kv_state_front_2d)
-        slot_shift_kernel(kv_state_back_2d, shift_P, kv_state_back_scratch)
-        ttnn.copy(kv_state_back_scratch, kv_state_back_2d)
-        slot_shift_kernel(score_state_front_2d, shift_P, score_state_front_scratch)
-        ttnn.copy(score_state_front_scratch, score_state_front_2d)
-        slot_shift_kernel(score_state_back_2d, shift_P, score_state_back_scratch)
-        ttnn.copy(score_state_back_scratch, score_state_back_2d)
+        # 4x in-place slot-shift. out == buf is safe because each output tile
+        # depends only on the same-coordinate input tile, so per-core tile
+        # iteration reads then writes without cross-tile hazards. Eliminates
+        # 4 ttnn.copy dispatches.
+        slot_shift_kernel(kv_state_front_2d, shift_P, kv_state_front_2d)
+        slot_shift_kernel(kv_state_back_2d, shift_P, kv_state_back_2d)
+        slot_shift_kernel(score_state_front_2d, shift_P, score_state_front_2d)
+        slot_shift_kernel(score_state_back_2d, shift_P, score_state_back_2d)
 
         ttnn.copy(kv_normed, kv_normed_out)
 

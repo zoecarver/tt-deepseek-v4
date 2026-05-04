@@ -646,15 +646,15 @@ def make_lk_d_comp_kernel(mesh, cos_compressor_cpu, sin_compressor_cpu,
         ttnn.experimental.paged_update_cache(
             kv_cache_tt, kv_sharded, update_idxs_tensor=emit_slot_tt)
 
-        # 4x slot_shift + 4x ttnn.copy.
-        slot_shift_kernel(kv_state_front_2d_tt, shift_P_tt, kv_state_front_scratch_tt)
-        ttnn.copy(kv_state_front_scratch_tt, kv_state_front_2d_tt)
-        slot_shift_kernel(kv_state_back_2d_tt, shift_P_tt, kv_state_back_scratch_tt)
-        ttnn.copy(kv_state_back_scratch_tt, kv_state_back_2d_tt)
-        slot_shift_kernel(score_state_front_2d_tt, shift_P_tt, score_state_front_scratch_tt)
-        ttnn.copy(score_state_front_scratch_tt, score_state_front_2d_tt)
-        slot_shift_kernel(score_state_back_2d_tt, shift_P_tt, score_state_back_scratch_tt)
-        ttnn.copy(score_state_back_scratch_tt, score_state_back_2d_tt)
+        # 4x in-place slot_shift. Each slot_shift writes back to its source
+        # buffer (out == buf). Per-tile dependency is local: out[m,n] depends
+        # only on buf[m,n], so in-place is safe (read completes before the
+        # write for the same tile within a core, and different cores own
+        # disjoint tiles). Eliminates 4 ttnn.copy dispatches.
+        slot_shift_kernel(kv_state_front_2d_tt, shift_P_tt, kv_state_front_2d_tt)
+        slot_shift_kernel(kv_state_back_2d_tt, shift_P_tt, kv_state_back_2d_tt)
+        slot_shift_kernel(score_state_front_2d_tt, shift_P_tt, score_state_front_2d_tt)
+        slot_shift_kernel(score_state_back_2d_tt, shift_P_tt, score_state_back_2d_tt)
 
         ttnn.copy(kv_normed, kv_normed_out)
 
