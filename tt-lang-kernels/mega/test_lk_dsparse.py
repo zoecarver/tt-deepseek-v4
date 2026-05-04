@@ -213,6 +213,132 @@ def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
     return rotary_combine
 
 
+def _make_summa_matmul_scale_mask_kernel(M: int, K_dim: int, N: int,
+                                          block_cfg, part_cfg,
+                                          scale: float, mask_amp: float,
+                                          fp32_dest_acc_en: bool = True):
+    """SUMMA matmul fused with scale + sign-trick mask.
+
+      masked[m, n] = (a @ w)[m, n] * scale +
+                     (sign(idx[0, n] + 0.5) - 1) * (mask_amp / 2)
+
+    Each (m_p, n_p) core accumulates its (bm, bn) tile, then applies the
+    scale and additive mask in compute and writes masked from dm_write.
+    idx tile depends only on n; mcast across Mp like B.
+    """
+    half_amp = mask_amp / 2.0
+    bm, bn, bk = block_cfg
+    Mp, Np, Kp = part_cfg
+    if Kp != 1:
+        raise ValueError(f"K_parts must be 1, got {Kp}")
+    Mt, Nt, Kt = M // TILE, N // TILE, K_dim // TILE
+    if Mt % bm or Nt % bn or Kt % bk:
+        raise ValueError(
+            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
+            f"block=(bm={bm}, bn={bn}, bk={bk})")
+    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
+    if Mb % Mp or Nb % Np:
+        raise ValueError(
+            f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
+    M_BPN = Mb // Mp
+    N_BPN = Nb // Np
+
+    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
+    def matmul_scale_mask(a, w, idx, masked_out):
+        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
+                   for m_p in range(Mp)]
+        mcast_a_net = ttl.PipeNet(a_pipes)
+        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
+                   for n_p in range(Np)]
+        mcast_b_net = ttl.PipeNet(b_pipes)
+        idx_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
+                     for n_p in range(Np)]
+        mcast_idx_net = ttl.PipeNet(idx_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+        idx_cb = ttl.make_dataflow_buffer_like(
+            idx, shape=(1, bn), block_count=2)
+        raw_cb = ttl.make_dataflow_buffer_like(
+            masked_out, shape=(bm, bn), block_count=2)
+        mask_scratch = ttl.make_dataflow_buffer_like(
+            masked_out, shape=(1, bn), block_count=2)
+        masked_cb = ttl.make_dataflow_buffer_like(
+            masked_out, shape=(bm, bn), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for _ in range(M_BPN):
+                for _ in range(N_BPN):
+                    p = raw_cb.reserve()
+                    for _ in range(Kb):
+                        a_blk = a_cb.wait()
+                        b_blk = b_cb.wait()
+                        p += a_blk @ b_blk
+                    r = raw_cb.wait()
+                    i = idx_cb.wait()
+                    mask_scratch.reserve().store(
+                        (ttl.math.sign(i + ttl.math.fill(i, 0.5))
+                         - ttl.math.fill(i, 1.0))
+                        * ttl.math.fill(i, half_amp))
+                    m = mask_scratch.wait()
+                    masked_cb.reserve().store(
+                        r * ttl.math.fill(r, scale) + m)
+
+        @ttl.datamovement()
+        def dm_read():
+            _, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for _ in range(N_BPN):
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        a_blk = a_cb.reserve()
+
+                        def read_a(pipe):
+                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
+                            ttl.copy(a_blk, pipe).wait()
+
+                        mcast_a_net.if_src(read_a)
+                        mcast_a_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for local_nb in range(N_BPN):
+                    nb = col_c * N_BPN + local_nb
+                    nc = nb * bn
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        b_blk = b_cb.reserve()
+
+                        def read_b(pipe):
+                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                            ttl.copy(b_blk, pipe).wait()
+
+                        mcast_b_net.if_src(read_b)
+                        mcast_b_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
+                    idx_blk = idx_cb.reserve()
+
+                    def read_idx(pipe):
+                        ttl.copy(idx[0:1, nc:nc + bn], idx_blk).wait()
+                        ttl.copy(idx_blk, pipe).wait()
+
+                    mcast_idx_net.if_src(read_idx)
+                    mcast_idx_net.if_dst(
+                        lambda pipe: (ttl.copy(pipe, idx_blk).wait(),))
+                    ttl.copy(masked_cb.wait(),
+                             masked_out[mr:mr + bm, nc:nc + bn]).wait()
+
+    return matmul_scale_mask
+
+
 def _make_scale_sign_mask_kernel(num_row_tiles: int, num_k_tiles: int,
                                   scale: float, mask_amp: float):
     """Fused scale + sign-trick mask:
@@ -340,11 +466,12 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
     D = HEAD_DIM
     rd = ROPE_HEAD_DIM
 
-    # SUMMA score: M=H=64, K=D=512, N=K=128. Mt=2, Kt=16, Nt=4.
-    # block (1, 1, 4) part (2, 4, 1): Mb=2, Nb=4, Kb=4 -> 8 cores.
-    matmul_score = _make_summa_matmul_kernel(
+    # SUMMA score fused with scale + sign-trick mask. M=H=64, K=D=512, N=K=128.
+    # Mt=2, Kt=16, Nt=4. block (1, 1, 4) part (2, 4, 1): 8 cores.
+    matmul_score_scale_mask = _make_summa_matmul_scale_mask_kernel(
         M=H, K_dim=D, N=K,
-        block_cfg=(1, 1, 4), part_cfg=(2, 4, 1))
+        block_cfg=(1, 1, 4), part_cfg=(2, 4, 1),
+        scale=softmax_scale, mask_amp=1.0e4)
 
     # SUMMA output: M=H=64, K=K=128, N=D=512. Mt=2, Kt=4, Nt=16.
     # block (1, 4, 4) part (2, 4, 1): Mb=2, Nb=4, Kb=1 -> 8 cores.
@@ -372,11 +499,6 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
     rotary_combine_kernel = _make_rotary_combine_kernel(
         num_row_tiles=H // TILE, num_h_tiles=rd // TILE)
 
-    # Score scale + sign-trick mask: scores [H, K] * scale + sign_mask(idx_bf16).
-    scale_mask_kernel = _make_scale_sign_mask_kernel(
-        num_row_tiles=H // TILE, num_k_tiles=K // TILE,
-        scale=softmax_scale, mask_amp=1.0e4)
-
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
@@ -394,9 +516,6 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
                           sink_4d_tt, cos_full_tt, sin_full_tt, start_pos_tt,
                           wo_a_w_tt, wo_b_w_tt, out):
         if "init" not in state:
-            state["scores_padded"] = ttnn.from_torch(
-                torch.zeros(H, K, dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
             state["o_padded"] = ttnn.from_torch(
                 torch.zeros(H, D, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
@@ -450,14 +569,11 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         kv_gather_t_4d = ttnn.transpose(kv_gather_4d, -2, -1)
         kv_gather_t_2d = ttnn.reshape(kv_gather_t_4d, [D, K])
 
-        # 5. SUMMA score: q [H, D] @ kv_gather_t [D, K] -> scores [H, K].
+        # 5. SUMMA score fused with scale + sign-trick mask.
+        # masked = (q @ kv_gather_t) * softmax_scale + sign_mask(idx).
         q_2d = ttnn.reshape(q_tt, [H, D])
-        matmul_score(q_2d, kv_gather_t_2d, state["scores_padded"])
-
-        # 6. Multiply by softmax_scale + add bf16 sign-trick mask (fused).
-        scale_mask_kernel(state["scores_padded"],
-                          topk_padded_in,
-                          state["scores_masked_padded"])
+        matmul_score_scale_mask(q_2d, kv_gather_t_2d, topk_padded_in,
+                                state["scores_masked_padded"])
         scores_masked = ttnn.reshape(state["scores_masked_padded"], [B, S, H, K])
 
         # 7. Concat sink, softmax, drop sink.
