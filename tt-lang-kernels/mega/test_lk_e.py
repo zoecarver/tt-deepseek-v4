@@ -189,13 +189,17 @@ def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
 
 
 def _make_mhc_split_mixes_kernel(num_tiles: int):
-    @ttl.operation(grid="auto")
+    # Grid sized to num_tiles (one tile per core). Production callers pass
+    # num_tiles=1 (one MHC tile of mix scalars), so grid collapses to (1,1).
+    grid_cols = min(num_tiles, 8)
+    grid_rows = -(-num_tiles // grid_cols)
+
+    @ttl.operation(grid=(grid_cols, grid_rows))
     def split_mixes_kernel(
         input_mixes, scale_tile, base_tile,
         pre_mask, pre_eps_tile, post_mult_mask, comb_mask,
         pre_out, post_out, comb_out,
     ):
-        grid_cols, grid_rows = ttl.grid_size(dims=2)
         total_cores = grid_rows * grid_cols
         tiles_per_core = -(-num_tiles // total_cores)
 
@@ -261,9 +265,14 @@ def _make_mhc_split_mixes_kernel(num_tiles: int):
 
 
 def _make_mhc_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
-    @ttl.operation(grid="auto", options="--no-ttl-reduce-full-fp32")
+    # Grid sized to num_slices (one MHC tile per slice, ~20 reductions
+    # each). Production passes num_slices=NUM_TOKENS=1, so grid=(1,1).
+    grid_cols = min(num_slices, 8)
+    grid_rows = -(-num_slices // grid_cols)
+
+    @ttl.operation(grid=(grid_cols, grid_rows),
+                   options="--no-ttl-reduce-full-fp32")
     def sinkhorn_kernel(x, mask, eps_mask, scaler, out):
-        grid_cols, grid_rows = ttl.grid_size(dims=2)
         total_cores = grid_rows * grid_cols
         slices_per_core = -(-num_slices // total_cores)
 
