@@ -55,8 +55,19 @@ def report_pcc(name: str, expected: torch.Tensor, actual: torch.Tensor,
     return ok
 
 
-def open_mesh(shape=DEFAULT_MESH_SHAPE):
+def open_mesh(shape=DEFAULT_MESH_SHAPE, *, kernel_config_extra_bytes: int = 0):
+    """Open a mesh device. `kernel_config_extra_bytes` shrinks usable L1 to
+    enlarge the per-core kernel-config buffer (default ~70KB). Required for
+    large fused tt-lang kernels — see ttnn skill SKILL.md "Custom Program
+    Sizes" for the underlying mechanism.
+    """
     import ttnn
+    if kernel_config_extra_bytes > 0:
+        default_l1 = ttnn.device.get_max_worker_l1_unreserved_size()
+        return ttnn.open_mesh_device(
+            ttnn.MeshShape(*shape),
+            worker_l1_size=default_l1 - kernel_config_extra_bytes,
+        )
     return ttnn.open_mesh_device(ttnn.MeshShape(*shape))
 
 

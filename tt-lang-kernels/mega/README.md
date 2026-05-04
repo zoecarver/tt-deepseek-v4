@@ -497,6 +497,26 @@ If you hit a compiler error about too many dfbs or pipenets in one operation, sk
 
 For this part of the project, only use sterling-all.conf, this is the machine we have dedicated to writing mega kernels in tt-lang.
 
+## Large fused programs (>70KB kernel-config buffer)
+
+When a fused ttl.operation gets large, mesh open will fail at first
+dispatch with `TT_FATAL: Program size (NNNNN) too large for kernel config
+buffer (70656)`. The default config buffer is ~70KB and trades against
+worker L1.
+
+**Fix**: reduce `worker_l1_size` at mesh open. `_refs.open_mesh()` accepts
+`kernel_config_extra_bytes`; pass e.g. `128 * 1024` to grow the config
+buffer. Confirmed in `test_lk_b.py` for the fused rmsnorm + ksplit matmul
+(needed 128KB extra; 64KB was not enough on its own).
+
+```python
+mesh = open_mesh(kernel_config_extra_bytes=128 * 1024)
+```
+
+Cost: per-core CB budget shrinks by the same amount. If you start
+running out of L1 for tile buffers as you fuse, dial this back or shrink
+block sizes / block_count.
+
 ## element_read/write
 
 You now have the element_read and element_write ops, you can find examples and docs in /Users/zcarver/Developer/tt-lang/element_read_write. If you want any guidance on using them or have issues, pause and discuss with me.
