@@ -217,6 +217,116 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
     return summa_matmul
 
 
+def _make_ksplit_matmul_kernel(M: int, K: int, N: int,
+                               block_cfg, part_cfg,
+                               fp32_dest_acc_en: bool = True):
+    """SUMMA matmul with K-split on the row axis. grid=(Np, Kp), Mp=1.
+
+    K is split across Kp row cores; each core accumulates its K-slice partial
+    sum, then non-root rows ship partials to root (k_p=0) for summation and
+    write-out. M is fixed at one bm-block (Mp implicit = 1).
+    """
+    bm, bn, bk = block_cfg
+    Mp, Np, Kp = part_cfg
+    if Mp != 1:
+        raise ValueError(f"ksplit kernel here assumes Mp=1, got {Mp}")
+    if Kp < 2:
+        raise ValueError(f"K_parts must be >= 2, got {Kp}; use _make_summa_matmul_kernel")
+    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
+    if Mt % bm or Nt % bn or Kt % bk:
+        raise ValueError(
+            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
+            f"block=(bm={bm}, bn={bn}, bk={bk})")
+    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
+    if Nb % Np or Kb % Kp or Mb != 1:
+        raise ValueError(
+            f"block/part mismatch: Mb={Mb} Nb={Nb} Kb={Kb} Np={Np} Kp={Kp}")
+    N_BPN = Nb // Np
+    K_BPN = Kb // Kp
+
+    @ttl.operation(grid=(Np, Kp), fp32_dest_acc_en=fp32_dest_acc_en)
+    def ksplit_matmul(a, w, out):
+        a_pipes = [ttl.Pipe(src=(0, k_p), dst=(slice(0, Np), k_p))
+                   for k_p in range(Kp)]
+        mcast_a_net = ttl.PipeNet(a_pipes)
+        reduce_pipes = [ttl.Pipe(src=(n_p, k_p), dst=(n_p, 0))
+                        for n_p in range(Np) for k_p in range(1, Kp)]
+        reduce_net = ttl.PipeNet(reduce_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+        partial_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
+        recv_cb = ttl.make_dataflow_buffer_like(
+            out, shape=(bm, bn), block_count=max(2, Kp - 1))
+        out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            _, row_c = ttl.node(dims=2)
+            for _ in range(N_BPN):
+                p = partial_cb.reserve()
+                for _ in range(K_BPN):
+                    a_blk = a_cb.wait()
+                    b_blk = b_cb.wait()
+                    p += a_blk @ b_blk
+
+                if row_c == 0:
+                    for _ in range(Kp - 1):
+                        prev = partial_cb.wait()
+                        r = recv_cb.wait()
+                        new = partial_cb.reserve()
+                        new.store(prev + r)
+                    final = partial_cb.wait()
+                    o = out_cb.reserve()
+                    o.store(final)
+
+        @ttl.datamovement()
+        def dm_read():
+            _, row_c = ttl.node(dims=2)
+            for _ in range(N_BPN):
+                for kb_local in range(K_BPN):
+                    kc = (row_c * K_BPN + kb_local) * bk
+                    a_blk = a_cb.reserve()
+
+                    def read_a(pipe):
+                        ttl.copy(a[0:bm, kc:kc + bk], a_blk).wait()
+                        ttl.copy(a_blk, pipe).wait()
+
+                    mcast_a_net.if_src(read_a)
+                    mcast_a_net.if_dst(
+                        lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+
+                if row_c == 0:
+                    def recv(pipe):
+                        r = recv_cb.reserve()
+                        ttl.copy(pipe, r).wait()
+
+                    reduce_net.if_dst(recv)
+                else:
+                    p = partial_cb.wait()
+
+                    def send(pipe):
+                        ttl.copy(p, pipe).wait()
+
+                    reduce_net.if_src(send)
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, row_c = ttl.node(dims=2)
+            for local_nb in range(N_BPN):
+                nb = col_c * N_BPN + local_nb
+                nc = nb * bn
+                for kb_local in range(K_BPN):
+                    kc = (row_c * K_BPN + kb_local) * bk
+                    b_blk = b_cb.reserve()
+                    ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                if row_c == 0:
+                    o = out_cb.wait()
+                    ttl.copy(o, out[0:bm, nc:nc + bn]).wait()
+
+    return ksplit_matmul
+
+
 def make_lk_b_kernel(mesh, gamma_cpu):
     """Mega kernel for Lk-B = rmsnorm(q_lora, gamma) @ wq_b.
 
@@ -229,9 +339,11 @@ def make_lk_b_kernel(mesh, gamma_cpu):
     rms_kernel = _make_rmsnorm_kernel(
         num_row_tiles=1, h_tiles=Q_LORA_RANK // TILE,
         rms_eps=NORM_EPS, inv_D=1.0 / Q_LORA_RANK)
-    matmul_kernel = _make_summa_matmul_kernel(
+    # KSPLIT: M=32, K=1024, N=32768. Mt=1, Kt=32, Nt=1024.
+    # block=(1, 8, 4) part=(1, 8, 8) -> Nb=128, N_BPN=16, Kb=8 K_BPN=1 (64 cores).
+    matmul_kernel = _make_ksplit_matmul_kernel(
         M=M_PAD, K=Q_LORA_RANK, N=N,
-        block_cfg=(1, 8, 8), part_cfg=(1, 8, 1))
+        block_cfg=(1, 8, 4), part_cfg=(1, 8, 8))
 
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
