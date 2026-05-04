@@ -45,94 +45,6 @@ B = 1
 TILE = 32
 
 
-def _make_summa_matmul_kernel(M: int, K: int, N: int,
-                              block_cfg, part_cfg,
-                              fp32_dest_acc_en: bool = True):
-    """Pure SUMMA matmul. A row-mcast across Np cores; B col-mcast across Mp."""
-    bm, bn, bk = block_cfg
-    Mp, Np, Kp = part_cfg
-    if Kp != 1:
-        raise ValueError(f"K_parts must be 1, got {Kp}")
-    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
-    if Mt % bm or Nt % bn or Kt % bk:
-        raise ValueError(
-            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
-            f"block=(bm={bm}, bn={bn}, bk={bk})")
-    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
-    if Mb % Mp or Nb % Np:
-        raise ValueError(
-            f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
-    M_BPN = Mb // Mp
-    N_BPN = Nb // Np
-
-    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
-    def summa_matmul(a, w, out):
-        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
-                   for m_p in range(Mp)]
-        mcast_a_net = ttl.PipeNet(a_pipes)
-        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
-                   for n_p in range(Np)]
-        mcast_b_net = ttl.PipeNet(b_pipes)
-
-        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
-        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
-        out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
-
-        @ttl.compute()
-        def compute():
-            for _ in range(M_BPN):
-                for _ in range(N_BPN):
-                    p = out_cb.reserve()
-                    for _ in range(Kb):
-                        a_blk = a_cb.wait()
-                        b_blk = b_cb.wait()
-                        p += a_blk @ b_blk
-
-        @ttl.datamovement()
-        def dm_read():
-            _, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for _ in range(N_BPN):
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        a_blk = a_cb.reserve()
-
-                        def read_a(pipe):
-                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
-                            ttl.copy(a_blk, pipe).wait()
-
-                        mcast_a_net.if_src(read_a)
-                        mcast_a_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
-
-        @ttl.datamovement()
-        def dm_write():
-            col_c, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for local_nb in range(N_BPN):
-                    nb = col_c * N_BPN + local_nb
-                    nc = nb * bn
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        b_blk = b_cb.reserve()
-
-                        def read_b(pipe):
-                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
-                            ttl.copy(b_blk, pipe).wait()
-
-                        mcast_b_net.if_src(read_b)
-                        mcast_b_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
-                    o = out_cb.wait()
-                    ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
-
-    return summa_matmul
-
-
 def _make_matmul_gate_post_kernel(M: int, K: int, N: int,
                                    block_cfg, part_cfg,
                                    fp32_dest_acc_en: bool = True):
@@ -259,20 +171,6 @@ def make_lk_f_kernel(mesh, gate_bias_cpu):
     matmul_gate_post = _make_matmul_gate_post_kernel(
         M=TILE, K=DIM, N=N_ROUTED,
         block_cfg=(1, 1, 8), part_cfg=(1, 8, 1))
-
-    # SUMMA: w1 / w3. M=TILE, K=DIM=4096, N=INTER_DIM=2048.
-    # Mt=1, Kt=128, Nt=64. block=(1,8,4) part=(1,8,1) -> 8 cores, N_BPN=1, Kb=32.
-    matmul_w1 = _make_summa_matmul_kernel(
-        M=TILE, K=DIM, N=INTER_DIM,
-        block_cfg=(1, 8, 4), part_cfg=(1, 8, 1))
-    matmul_w3 = matmul_w1
-
-    # SUMMA: w2. M=TILE, K=INTER_DIM=2048, N=DIM=4096.
-    # Mt=1, Kt=64, Nt=128. block=(1,16,4) part=(1,8,1) -> 8 cores, N_BPN=1, Kb=16.
-    # (16-col grid exceeds BH 11x10 compute grid; widen block to stay <=11 cols.)
-    matmul_w2 = _make_summa_matmul_kernel(
-        M=TILE, K=INTER_DIM, N=DIM,
-        block_cfg=(1, 16, 4), part_cfg=(1, 8, 1))
 
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
