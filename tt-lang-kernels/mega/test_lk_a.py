@@ -465,95 +465,6 @@ def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
     return apply_mix_h_kernel
 
 
-def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
-                         rms_eps: float, inv_D: float):
-    """RMSNorm kernel inlined from inference.py / tt-lang-kernels/rmsnorm.py."""
-
-    @ttl.operation(
-        grid="auto",
-        options="--no-ttl-reduce-full-fp32",
-        fp32_dest_acc_en=True,
-    )
-    def rmsnorm_kernel(x, gamma, scaler, out):
-        grid_cols, grid_rows = ttl.grid_size(dims=2)
-        total_cores = grid_rows * grid_cols
-        tiles_per_core = -(-num_row_tiles // total_cores)
-
-        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        g_dfb = ttl.make_dataflow_buffer_like(gamma, shape=(1, 1), block_count=2)
-        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
-
-        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        xsq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        red_step_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        inv_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-
-        @ttl.compute()
-        def compute():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            sc = sc_dfb.wait()
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_row_tiles:
-                    x0 = x_dfb.wait()
-                    xsq_dfb.reserve().store(x0 * x0)
-                    sq_dfb.reserve().store(
-                        ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
-                    )
-                    for _ in range(h_tiles - 1):
-                        xk = x_dfb.wait()
-                        xsq_dfb.reserve().store(xk * xk)
-                        red_step_dfb.reserve().store(
-                            ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
-                        )
-                        prev = sq_dfb.wait()
-                        sq_dfb.reserve().store(prev + red_step_dfb.wait())
-
-                    sq = sq_dfb.wait()
-                    inv_bc = inv_bc_dfb.reserve()
-                    inv_bc.store(ttl.math.broadcast(
-                        ttl.math.rsqrt(
-                            sq * ttl.math.fill(sq, inv_D)
-                            + ttl.math.fill(sq, rms_eps)
-                        ),
-                        inv_bc, dims=[1],
-                    ))
-                    inv = inv_bc_dfb.wait()
-
-                    for _ in range(h_tiles):
-                        xk = x_dfb.wait()
-                        gk = g_dfb.wait()
-                        out_dfb.reserve().store(xk * gk * inv)
-
-        @ttl.datamovement()
-        def dm_read():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_row_tiles:
-                    for h in range(h_tiles):
-                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
-                    for h in range(h_tiles):
-                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
-                        ttl.copy(gamma[0, h], g_dfb.reserve()).wait()
-
-        @ttl.datamovement()
-        def dm_write():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_row_tiles:
-                    for h in range(h_tiles):
-                        ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
-
-    return rmsnorm_kernel
-
-
 def _make_fused_rms_summa_kernel(M: int, K: int, N: int,
                                  block_cfg, part_cfg,
                                  rms_eps: float,
@@ -699,94 +610,13 @@ def _make_fused_rms_summa_kernel(M: int, K: int, N: int,
     return fused_kernel
 
 
-def _make_summa_matmul_kernel(M: int, K: int, N: int,
-                              block_cfg, part_cfg,
-                              fp32_dest_acc_en: bool = True):
-    """Pure-SUMMA matmul kernel modelled on tt-lang-kernels/attention_matmul.py."""
-    bm, bn, bk = block_cfg
-    Mp, Np, Kp = part_cfg
-    if Kp != 1:
-        raise ValueError(f"K_parts must be 1, got {Kp}")
-    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
-    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
-    M_BPN = Mb // Mp
-    N_BPN = Nb // Np
-
-    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
-    def summa_matmul(a, w, out):
-        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
-                   for m_p in range(Mp)]
-        mcast_a_net = ttl.PipeNet(a_pipes)
-        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
-                   for n_p in range(Np)]
-        mcast_b_net = ttl.PipeNet(b_pipes)
-
-        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
-        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
-        out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
-
-        @ttl.compute()
-        def compute():
-            for _ in range(M_BPN):
-                for _ in range(N_BPN):
-                    p = out_cb.reserve()
-                    for _ in range(Kb):
-                        a_blk = a_cb.wait()
-                        b_blk = b_cb.wait()
-                        p += a_blk @ b_blk
-
-        @ttl.datamovement()
-        def dm_read():
-            _, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for _ in range(N_BPN):
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        a_blk = a_cb.reserve()
-
-                        def read_a(pipe):
-                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
-                            ttl.copy(a_blk, pipe).wait()
-
-                        mcast_a_net.if_src(read_a)
-                        mcast_a_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
-
-        @ttl.datamovement()
-        def dm_write():
-            col_c, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for local_nb in range(N_BPN):
-                    nb = col_c * N_BPN + local_nb
-                    nc = nb * bn
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        b_blk = b_cb.reserve()
-
-                        def read_b(pipe):
-                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
-                            ttl.copy(b_blk, pipe).wait()
-
-                        mcast_b_net.if_src(read_b)
-                        mcast_b_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
-                    o = out_cb.wait()
-                    ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
-
-    return summa_matmul
-
-
 def make_lk_a_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
     """Mega kernel for Lk-A = hc_pre + typecast + attn_norm + wq_a matmul.
 
-    Composes 6 tt-lang dispatches all defined locally in this file:
-    norm_fn_ksplit + split_mixes + sinkhorn + apply_mix_h + rmsnorm + SUMMA
-    matmul. Constants/scratch tensors are allocated up front from
-    cpu-side weights.
+    Composes 5 tt-lang dispatches all defined locally in this file:
+    norm_fn_ksplit + split_mixes + sinkhorn + apply_mix_h +
+    fused (rmsnorm + SUMMA wq_a matmul). Constants/scratch tensors are
+    allocated up front from cpu-side weights.
     """
     K_tiles = D // TILE                                # 512
     h_tiles = DIM // TILE                              # 128
