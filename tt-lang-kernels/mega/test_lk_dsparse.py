@@ -595,10 +595,10 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         block_cfg=(1, 4, 4), part_cfg=(2, 4, 1))
 
     # SUMMA wo_a per-group: M=TILE, K=PER_GROUP=4096, N=O_LORA_RANK=1024.
-    # Mt=1, Kt=128, Nt=32. block (1, 4, 4) part (1, 8, 1): Nb=8, Kb=32 -> 8 cores.
+    # Mt=1, Kt=128, Nt=32. block (1, 4, 8) part (1, 8, 1): Nb=8, Kb=16 -> 8 cores.
     matmul_wo_a = _make_summa_matmul_kernel(
         M=TILE, K_dim=PER_GROUP, N=O_LORA_RANK,
-        block_cfg=(1, 4, 4), part_cfg=(1, 8, 1))
+        block_cfg=(1, 4, 8), part_cfg=(1, 8, 1))
 
     # SUMMA wo_b: M=TILE, K=N_GROUPS*O_LORA_RANK=8192, N=DIM=4096.
     # Mt=1, Kt=256, Nt=128. block (1, 16, 8) part (1, 8, 1): Nb=8, Kb=32 -> 8 cores.
