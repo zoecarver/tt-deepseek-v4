@@ -182,12 +182,15 @@ def _make_fused_rot_hada_kernel(M: int, D: int, rd: int,
     Np = 1
     bm = 1
     bn = Dt
-    bk = 1
+    bk = 2
 
+    if nope_t % bk or rd_t % bk:
+        raise ValueError(
+            f"bk={bk} must divide nope_t={nope_t} and rd_t={rd_t}")
     M_BPN = 1
     N_BPN = 1
-    Kb_nope = nope_t
-    Kb_rope = rd_t
+    Kb_nope = nope_t // bk
+    Kb_rope = rd_t // bk
 
     @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
     def fused_rot_hada(q_full, P, cos, sin, H_mat, out):
@@ -204,7 +207,7 @@ def _make_fused_rot_hada_kernel(M: int, D: int, rd: int,
         swap_cb = ttl.make_dataflow_buffer_like(
             q_full, shape=(bm, bk), block_count=2)
         rope_rot_cb = ttl.make_dataflow_buffer_like(
-            q_full, shape=(bm, bk), block_count=max(2, rd_t))
+            q_full, shape=(bm, bk), block_count=max(2, Kb_rope))
         H_cb = ttl.make_dataflow_buffer_like(
             H_mat, shape=(bk, bn), block_count=2)
         out_cb = ttl.make_dataflow_buffer_like(
@@ -238,7 +241,7 @@ def _make_fused_rot_hada_kernel(M: int, D: int, rd: int,
         def dm_read():
             _, row_c = ttl.node(dims=2)
             mr = row_c * M_BPN * bm
-            # Phase 1 inputs: rope tiles + per-tile P-diag + cos + sin.
+            # Phase 1 inputs: rope blocks + per-block P-diag + cos + sin.
             for k in range(Kb_rope):
                 rope_kc = nope_t + k * bk
                 diag_kc = k * bk
@@ -250,7 +253,7 @@ def _make_fused_rot_hada_kernel(M: int, D: int, rd: int,
                          cos_cb.reserve()).wait()
                 ttl.copy(sin[0:1, diag_kc:diag_kc + bk],
                          sin_cb.reserve()).wait()
-            # Phase 2 nope inputs: q_nope tiles in K-order.
+            # Phase 2 nope inputs: q_nope blocks in K-order.
             for k in range(Kb_nope):
                 kc = k * bk
                 ttl.copy(q_full[mr:mr + bm, kc:kc + bk],
@@ -267,7 +270,7 @@ def _make_fused_rot_hada_kernel(M: int, D: int, rd: int,
                 ttl.copy(H_mat[kc:kc + bk, nc:nc + bn],
                          H_cb.reserve()).wait()
             for k in range(Kb_rope):
-                kc = (nope_t + k) * bk
+                kc = nope_t + k * bk
                 ttl.copy(H_mat[kc:kc + bk, nc:nc + bn],
                          H_cb.reserve()).wait()
             o = out_cb.wait()
