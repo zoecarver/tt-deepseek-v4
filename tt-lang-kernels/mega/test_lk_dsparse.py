@@ -582,10 +582,10 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
     rd = ROPE_HEAD_DIM
 
     # SUMMA score fused with scale + sign-trick mask. M=H=64, K=D=512, N=K=128.
-    # Mt=2, Kt=16, Nt=4. block (1, 1, 4) part (2, 4, 1): 8 cores.
+    # Mt=2, Kt=16, Nt=4. block (1, 1, 8) part (2, 4, 1): 8 cores, Kb=2.
     matmul_score_scale_mask = _make_summa_matmul_scale_mask_kernel(
         M=H, K_dim=D, N=K,
-        block_cfg=(1, 1, 4), part_cfg=(2, 4, 1),
+        block_cfg=(1, 1, 8), part_cfg=(2, 4, 1),
         scale=softmax_scale, mask_amp=1.0e4)
 
     # SUMMA output: M=H=64, K=K=128, N=D=512. Mt=2, Kt=4, Nt=16.
