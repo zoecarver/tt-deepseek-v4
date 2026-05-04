@@ -366,10 +366,16 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
 
 
 def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
-    """out = x * cos + x_swap * sin; cos/sin tile-replicated."""
+    """out = x * cos + x_swap * sin; cos/sin tile-replicated. Distributes
+    (row_tile, h_tile) pairs across an auto grid for better core usage."""
+    total_work = num_row_tiles * num_h_tiles
 
-    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
+    @ttl.operation(grid="auto", fp32_dest_acc_en=True)
     def rotary_combine(x, x_swap, cos, sin, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        work_per_core = -(-total_work // total_cores)
+
         x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
         xs_dfb = ttl.make_dataflow_buffer_like(x_swap, shape=(1, 1), block_count=2)
         c_dfb = ttl.make_dataflow_buffer_like(cos, shape=(1, 1), block_count=2)
@@ -378,8 +384,11 @@ def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
 
         @ttl.compute()
         def compute():
-            for _ in range(num_row_tiles):
-                for _ in range(num_h_tiles):
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
                     xt = x_dfb.wait()
                     xst = xs_dfb.wait()
                     ct = c_dfb.wait()
@@ -388,8 +397,13 @@ def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
 
         @ttl.datamovement()
         def dm_read():
-            for t in range(num_row_tiles):
-                for h in range(num_h_tiles):
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    t = global_w // num_h_tiles
+                    h = global_w % num_h_tiles
                     ttl.copy(x[t, h], x_dfb.reserve()).wait()
                     ttl.copy(x_swap[t, h], xs_dfb.reserve()).wait()
                     ttl.copy(cos[0, h], c_dfb.reserve()).wait()
@@ -397,8 +411,13 @@ def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
 
         @ttl.datamovement()
         def dm_write():
-            for t in range(num_row_tiles):
-                for h in range(num_h_tiles):
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    t = global_w // num_h_tiles
+                    h = global_w % num_h_tiles
                     ttl.copy(out_dfb.wait(), out[t, h]).wait()
 
     return rotary_combine
