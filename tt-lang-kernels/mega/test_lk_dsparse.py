@@ -152,6 +152,121 @@ def _make_summa_matmul_kernel(M: int, K_dim: int, N: int,
     return summa_matmul
 
 
+def _make_swap_combine_kernel(M: int, K_dim: int, N: int,
+                              block_cfg, part_cfg,
+                              fp32_dest_acc_en: bool = True):
+    """SUMMA matmul fused with rotary combine.
+      out[m, n] = x[m, n] * cos[0, n] + (x @ P)[m, n] * sin[0, n]
+    cos, sin shape: [TILE, N] (only row 0 is consumed; downstream broadcasts).
+    P shape: [K_dim, N] swap-pairs constant.
+
+    Each (m_p, n_p) core matmul-accumulates the swap tile, reads its
+    diagonal x tile + cos/sin tiles, combines, and writes out.
+    """
+    bm, bn, bk = block_cfg
+    Mp, Np, Kp = part_cfg
+    if Kp != 1:
+        raise ValueError(f"K_parts must be 1, got {Kp}")
+    Mt, Nt, Kt = M // TILE, N // TILE, K_dim // TILE
+    if Mt % bm or Nt % bn or Kt % bk:
+        raise ValueError(
+            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
+            f"block=(bm={bm}, bn={bn}, bk={bk})")
+    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
+    if Mb % Mp or Nb % Np:
+        raise ValueError(
+            f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
+    M_BPN = Mb // Mp
+    N_BPN = Nb // Np
+
+    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
+    def swap_combine(x, P, cos, sin, out):
+        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
+                   for m_p in range(Mp)]
+        mcast_a_net = ttl.PipeNet(a_pipes)
+        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
+                   for n_p in range(Np)]
+        mcast_b_net = ttl.PipeNet(b_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(x, shape=(bm, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(P, shape=(bk, bn), block_count=2)
+        x_diag_cb = ttl.make_dataflow_buffer_like(
+            x, shape=(bm, bn), block_count=2)
+        cos_cb = ttl.make_dataflow_buffer_like(
+            cos, shape=(1, bn), block_count=2)
+        sin_cb = ttl.make_dataflow_buffer_like(
+            sin, shape=(1, bn), block_count=2)
+        swap_cb = ttl.make_dataflow_buffer_like(
+            out, shape=(bm, bn), block_count=2)
+        out_cb = ttl.make_dataflow_buffer_like(
+            out, shape=(bm, bn), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for _ in range(M_BPN):
+                for _ in range(N_BPN):
+                    p = swap_cb.reserve()
+                    for _ in range(Kb):
+                        a_blk = a_cb.wait()
+                        b_blk = b_cb.wait()
+                        p += a_blk @ b_blk
+                    s = swap_cb.wait()
+                    xd = x_diag_cb.wait()
+                    c = cos_cb.wait()
+                    si = sin_cb.wait()
+                    out_cb.reserve().store(xd * c + s * si)
+
+        @ttl.datamovement()
+        def dm_read():
+            _, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for _ in range(N_BPN):
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        a_blk = a_cb.reserve()
+
+                        def read_a(pipe):
+                            ttl.copy(x[mr:mr + bm, kc:kc + bk], a_blk).wait()
+                            ttl.copy(a_blk, pipe).wait()
+
+                        mcast_a_net.if_src(read_a)
+                        mcast_a_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for local_nb in range(N_BPN):
+                    nb = col_c * N_BPN + local_nb
+                    nc = nb * bn
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        b_blk = b_cb.reserve()
+
+                        def read_b(pipe):
+                            ttl.copy(P[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                            ttl.copy(b_blk, pipe).wait()
+
+                        mcast_b_net.if_src(read_b)
+                        mcast_b_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
+                    ttl.copy(x[mr:mr + bm, nc:nc + bn],
+                             x_diag_cb.reserve()).wait()
+                    ttl.copy(cos[0:1, nc:nc + bn],
+                             cos_cb.reserve()).wait()
+                    ttl.copy(sin[0:1, nc:nc + bn],
+                             sin_cb.reserve()).wait()
+                    ttl.copy(out_cb.wait(),
+                             out[mr:mr + bm, nc:nc + bn]).wait()
+
+    return swap_combine
+
+
 def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
     """out = x * cos + x_swap * sin; cos/sin tile-replicated.
 
@@ -491,13 +606,11 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         M=TILE, K_dim=N_GROUPS * O_LORA_RANK, N=DIM,
         block_cfg=(1, 16, 8), part_cfg=(1, 8, 1))
 
-    # Inverse rotary swap-SUMMA: M=H=64, K=N=rd=64. block=(1,1,2),
-    # part=(2,2,1) -> 4 cores.
-    swap_kernel = _make_summa_matmul_kernel(
+    # Inverse rotary fused swap-SUMMA + cos/sin combine: M=H=64, K=N=rd=64.
+    # block=(1,1,2), part=(2,2,1) -> 4 cores.
+    swap_combine_kernel = _make_swap_combine_kernel(
         M=H, K_dim=rd, N=rd,
         block_cfg=(1, 1, 2), part_cfg=(2, 2, 1))
-    rotary_combine_kernel = _make_rotary_combine_kernel(
-        num_row_tiles=H // TILE, num_h_tiles=rd // TILE)
 
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -521,9 +634,6 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
                 dtype=ttnn.bfloat16, **rep)
             state["wo_b_out_padded"] = ttnn.from_torch(
                 torch.zeros(TILE, DIM, dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
-            state["o_rope_swap"] = ttnn.from_torch(
-                torch.zeros(H, ROPE_HEAD_DIM, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
             state["o_rope_rot"] = ttnn.from_torch(
                 torch.zeros(H, ROPE_HEAD_DIM, dtype=torch.bfloat16),
@@ -597,9 +707,8 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         sin_b = ttnn.reshape(sin_b_2d, [TILE, rd])
         o_nope_2d = ttnn.slice(state["o_padded"], [0, 0], [H, D - rd])
         o_rope_2d = ttnn.slice(state["o_padded"], [0, D - rd], [H, D])
-        swap_kernel(o_rope_2d, P_tt, state["o_rope_swap"])
-        rotary_combine_kernel(
-            o_rope_2d, state["o_rope_swap"], cos_b, sin_b, state["o_rope_rot"])
+        swap_combine_kernel(o_rope_2d, P_tt, cos_b, sin_b,
+                            state["o_rope_rot"])
         o_full_2d = ttnn.concat([o_nope_2d, state["o_rope_rot"]], dim=-1)
         o_concat = ttnn.reshape(o_full_2d, [B, S, H, D])
 
