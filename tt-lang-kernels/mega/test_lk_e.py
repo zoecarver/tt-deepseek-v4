@@ -887,7 +887,8 @@ def make_lk_e_kernel(mesh, hc_attn_fn_cpu, hc_attn_scale_cpu, hc_attn_base_cpu,
         return post_tt, comb_sk_out_tt, apply_mix_out_tt
 
     def lk_e_kernel(attn_out_tt, prev_a_tt, w1_tt, w2_tt, w3_tt,
-                    shared_partial_out, next_a_out):
+                    shared_partial_out, next_a_out,
+                    norm_slice_out=None):
         if "scratch" not in state:
             # attn-side hc_pre scratch
             state["mixes_a"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
@@ -993,6 +994,8 @@ def make_lk_e_kernel(mesh, hc_attn_fn_cpu, hc_attn_scale_cpu, hc_attn_base_cpu,
                    state["rms_out"])
         ttnn.slice(state["rms_out"], [0, 0], [NUM_TOKENS, DIM],
                    output_tensor=state["norm_slice"])
+        if norm_slice_out is not None:
+            ttnn.copy(state["norm_slice"], norm_slice_out)
 
         # 7. shared expert SwiGLU.
         x_padded_2d = ttnn.pad(

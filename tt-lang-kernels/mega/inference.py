@@ -120,7 +120,11 @@ from inference import (                            # noqa: E402
     DeviceCompressor,
     DeviceIndexer,
     DeviceColLinear,
+    DeviceMHC,
     DeviceRMSNorm,
+    _mhc_post_to_a_tt,
+    _build_window_topk_table,
+    _window_topk_row_for_pos,
     _open_mesh,
     _close_mesh,
     _phase, _phase_report, _phase_postwarm,
@@ -237,6 +241,7 @@ class LayerKernels:
         "lk_d_idx_score", "lk_d_topk",
         "lk_d_comp",
         "lk_dsparse", "lk_e", "lk_f",
+        "mhc_ffn", "attn_norm",
         "weights",
     )
 
@@ -255,6 +260,20 @@ class LayerKernels:
         self.lk_dsparse = None
         self.lk_e = None
         self.lk_f = None
+        # Legacy DeviceMHC for ffn-side hc_post bridge. The mega kernels
+        # (Lk-E + Lk-F) compute the FFN partial but do not apply
+        # hc_post_ffn; the residual stream needs the MHC-weighted combine
+        # `out = x*post_mix + comb^T @ residual` to match the reference.
+        # Until a proper Lk-G kernel exists, we run hc_pre_ffn (small)
+        # before the FFN body to populate the stash and hc_post_ffn after
+        # to assemble the next layer's a_tt.
+        self.mhc_ffn = None
+        # Legacy DeviceRMSNorm for the attn-side bridge (Lk-A bakes gamma
+        # into wq_a so it never materializes the post-norm tile, but Lk-C
+        # needs it). Using the kernel-based norm (matches legacy exactly)
+        # rather than `ttnn.rms_norm`, which gave numerically different
+        # output during bringup.
+        self.attn_norm = None
         # Per-layer device weight tensors uploaded once at offload time.
         # Kept here (not on the closures) so we can also free them on
         # tear-down without poking inside the kernel state.
@@ -555,6 +574,28 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
         # PER_CHIP=8 experts/chip on the (4, 8) mesh. Wire via
         # `_offload_routed_experts` from the legacy code path.
 
+    # --- mhc_ffn: legacy DeviceMHC for hc_post_ffn bridge ----------------
+    # Lk-E only does hc_post_attn → hc_pre_ffn → ffn_norm → shared expert.
+    # The full hc_post_ffn (`out = x*post_mix + comb^T @ residual`) is not
+    # in any mega kernel today; without it the FFN partial gets uniformly
+    # broadcast across MHC heads instead of the proper weighted combine
+    # and decode produces gibberish. Bringup workaround: run hc_pre_ffn +
+    # hc_post_ffn via the legacy DeviceMHC. TODO: mega — fold into Lk-F or
+    # add a dedicated Lk-G kernel.
+    lk.mhc_ffn = DeviceMHC(
+        mesh=mesh,
+        hc_fn=hc_ffn_fn, hc_scale=hc_ffn_scale, hc_base=hc_ffn_base,
+        hc_mult=args.hc_mult, hc_eps=args.hc_eps,
+        sinkhorn_iters=args.hc_sinkhorn_iters, norm_eps=args.norm_eps,
+    )
+
+    # Legacy DeviceRMSNorm for the attn-norm bridge (Lk-A bakes gamma
+    # into wq_a, so the post-norm tile must be reconstructed for Lk-C).
+    lk.attn_norm = DeviceRMSNorm(
+        mesh=mesh, cpu_gamma=layer.attn_norm.weight.data,
+        eps=args.norm_eps,
+    )
+
     return lk
 
 
@@ -635,6 +676,12 @@ class StepBuffers:
         # residual via ttnn.add inside `_block_forward_mega`.
         self.shared_partial = alloc_replicated(
             mesh, (1, 1, args.dim), ttnn.bfloat16, mem=L1)
+        # Post-ffn-norm slice exposed by Lk-E. Lk-F's gate/routed-FFN
+        # consumes the SAME post-norm input the shared FFN does, not the
+        # shared FFN's output. Lk-E writes its internal norm_slice tile
+        # (TILE rows, only row 0 carries the live token) here.
+        self.norm_slice = alloc_replicated(
+            mesh, (1, args.dim), ttnn.bfloat16, mem=L1)
         self.moe_out = alloc_replicated(
             mesh, (1, 1, args.dim), ttnn.bfloat16, mem=L1)
         # The next-layer residual `a_tt_next` is the output of hc_post in
@@ -794,6 +841,21 @@ class MegaModel(_BaseModel):
                 # shared-experts-only.
                 print(f"[setup.routed_experts] WARN: {exc}; skipping Lk-F")
 
+        with _phase("setup.moe_gate"):
+            # Hash-gate layers (layer_id < n_hash_layers) use a vocab→expert
+            # lookup table on input_ids instead of topk(scores). Lk-F doesn't
+            # support that path; for those layers we fall back to the legacy
+            # gate + _forward_device_routed_cached pipeline, which needs
+            # ffn.gate._device_gate populated.
+            self.offload_moe_gate(mesh)
+            # _forward_device_routed_cached pulls `ttnn` off
+            # ffn.shared_experts._ttnn (legacy uses DeviceSharedExpert there).
+            # Mega keeps the host-side Expert and runs shared in Lk-E, so
+            # plant the module on the host Expert for the hash-layer fallback.
+            for layer in self.transformer.layers:
+                if isinstance(layer.ffn, MoE):
+                    layer.ffn.shared_experts._ttnn = ttnn
+
         with _phase("setup.buffers"):
             self._step_buffers = StepBuffers(mesh, args)
 
@@ -836,11 +898,7 @@ class MegaModel(_BaseModel):
                 lk.lk_a(a_tt, lk.weights["wq_a"], sb.wq_a_out,
                         x_pre_norm_bf16_out=sb.x_pre_norm)
             with _phase("lk_a_bridge"):
-                _xn = ttnn.rms_norm(
-                    sb.x_pre_norm,
-                    weight=lk.weights["attn_norm_gamma"],
-                    epsilon=NORM_EPS,
-                )
+                _xn = lk.attn_norm.forward_device(sb.x_pre_norm, num_rows=1)
                 ttnn.copy(_xn, sb.x_post_norm)
         with _phase("x_post_norm_to_3d"):
             _row = ttnn.slice(sb.x_post_norm, [0, 0], [1, self.args.dim])
@@ -957,7 +1015,18 @@ class MegaModel(_BaseModel):
                     lk.weights["comp_cssn_out"],
                     self._comp_kv_normed_sink_tt,
                 )
-        topk_idxs_tt = self._win_idxs_tt
+        # Per-step window topk indices: row-pick start_pos from the precomputed
+        # [max_seq_len, win] bf16 table (-1 sentinels for unfilled cache slots),
+        # typecast back to int32 → [1, 1, win] for lk_dsparse. Without
+        # sentinels, attention mass spreads across zero-init cache slots.
+        win = self.args.window_size
+        with _phase("win_idxs"):
+            _win_bf16 = ttnn.embedding(
+                start_pos_tt, self._win_idxs_padded_tt,
+                layout=ttnn.TILE_LAYOUT,
+            )
+            _win_i32 = ttnn.typecast(_win_bf16, dtype=ttnn.int32)
+            topk_idxs_tt = ttnn.reshape(_win_i32, [1, 1, win])
         with _phase("lk_dsparse"):
             kv_cache_tt = self._kv_cache_tt[layer_idx]
             kv_slot_tt = self._kv_slot_tt[layer_idx]
@@ -977,33 +1046,80 @@ class MegaModel(_BaseModel):
                 lk.weights["w2_shared"],
                 lk.weights["w3_shared"],
                 sb.shared_partial, a_tt_next,
+                norm_slice_out=sb.norm_slice,
             )
 
-        if lk.lk_f is not None and "w13_routed" in lk.weights:
+        is_hash_layer = layer_idx < self.args.n_hash_layers
+        if is_hash_layer and isinstance(self.transformer.layers[layer_idx].ffn, MoE):
+            with _phase("lk_f_hash"):
+                # Hash-gate layers can't use Lk-F's topk-based gate; the
+                # indices come from a vocab→expert lookup on input_ids.
+                # Fall back to the legacy gate + cached-routed path, which
+                # internally all_reduces routed across the mesh and adds
+                # shared_out (we feed our Lk-E shared partial as that).
+                ffn = self.transformer.layers[layer_idx].ffn
+                gate_dev = ffn.gate._device_gate
+                weights_tt, indices_tt = gate_dev.forward_device(
+                    sb.norm_slice, input_ids_tt)
+                shared_2d = ttnn.reshape(
+                    sb.shared_partial, [1, self.args.dim])
+                combined_2d = ffn._forward_device_routed_cached(
+                    sb.norm_slice, weights_tt, indices_tt, shared_2d)
+                combined_3d = ttnn.reshape(
+                    combined_2d, [1, 1, self.args.dim])
+                ttnn.copy(combined_3d, sb.shared_partial)
+        elif lk.lk_f is not None and "w13_routed" in lk.weights:
             with _phase("lk_f"):
+                # Lk-F gate + routed FFN takes the SAME post-norm input as
+                # the shared FFN inside Lk-E, not the shared FFN's output.
                 routed_partial = lk.lk_f(
-                    sb.shared_partial,
+                    sb.norm_slice,
                     lk.weights["gate_w"], lk.weights["gate_bias"],
                     lk.weights["w13_routed"],
                     lk.weights["w2_routed"],
                     lk.weights["chip_ids_4d"],
                 )
-                ttnn.add(sb.shared_partial, routed_partial,
+                # Each chip holds PER_CHIP=8 of the 256 routed experts; sum
+                # across the full mesh to assemble the global routed output.
+                routed_full = ttnn.all_reduce(routed_partial)
+                routed_3d = ttnn.reshape(routed_full, [1, 1, self.args.dim])
+                ttnn.add(sb.shared_partial, routed_3d,
                          output_tensor=sb.shared_partial)
 
-        with _phase("residual_add"):
+        # hc_post_ffn bridge: legacy DeviceMHC. Lk-E only does hc_post_attn
+        # + hc_pre_ffn + shared expert; the FFN-side hc_post is not in any
+        # mega kernel. We re-run hc_pre_ffn to populate the stash (needed
+        # by hc_post_device) and apply the MHC-weighted combine here.
+        with _phase("hc_post_ffn"):
+            mhc_ffn = lk.mhc_ffn
+            num_tokens = 1
+            num_tokens_pad = _MHC_TILE
+            mhc = self.args.hc_mult
+            hidden = self.args.dim
+            # Stash population. Output of hc_pre_ffn is discarded — Lk-E
+            # already produced the same intermediate to feed its own
+            # ffn_norm + shared expert.
+            mhc_ffn.hc_pre_device(
+                num_tokens, num_tokens_pad, a_tt=a_tt_next)
+            # Build [TILE, DIM] fp32 x_tt for hc_post: broadcast the FFN
+            # partial across `mhc` head bins and pad to TILE rows.
             shared_4d = ttnn.reshape(
-                sb.shared_partial, [1, 1, self.args.dim])
+                sb.shared_partial, [num_tokens, 1, hidden])
             shared_repeated = ttnn.repeat(
-                shared_4d, ttnn.Shape([1, self.args.hc_mult, 1]))
-            shared_2d = ttnn.reshape(
-                shared_repeated,
-                [1, self.args.hc_mult * self.args.dim])
+                shared_4d, ttnn.Shape([1, mhc, 1]))
             shared_padded = ttnn.pad(
-                shared_2d,
-                padding=[(0, _MHC_TILE - 1), (0, 0)], value=0.0)
-            shared_fp32 = ttnn.typecast(shared_padded, dtype=ttnn.float32)
-            ttnn.add(a_tt_next, shared_fp32, output_tensor=a_tt_next)
+                shared_repeated,
+                padding=[(0, 0), (0, _MHC_TILE - mhc), (0, 0)],
+                value=0.0)
+            x_post_input = ttnn.reshape(
+                shared_padded, [num_tokens * _MHC_TILE, hidden])
+            ttnn.typecast(x_post_input, dtype=ttnn.float32,
+                          output_tensor=mhc_ffn._x_upload_tt)
+            ffn_post_out_tt = mhc_ffn.hc_post_device(num_tokens)
+            next_a_input_tt = _mhc_post_to_a_tt(
+                ttnn, ffn_post_out_tt, num_tokens, num_tokens_pad,
+                mhc, hidden)
+            ttnn.copy(next_a_input_tt, a_tt_next)
         return a_tt_next
 
     def _block_forward_mega_full(self, layer_idx: int, lk: LayerKernels,
@@ -1032,14 +1148,8 @@ class MegaModel(_BaseModel):
             with _phase("lk_a"):
                 lk.lk_a(a_tt, lk.weights["wq_a"], sb.wq_a_out,
                         x_pre_norm_bf16_out=sb.x_pre_norm)
-            # Bridge: rms_norm(x_pre_norm, gamma) -> x_post_norm. ttnn.rms_norm
-            # does not accept `output_tensor=`; capture and copy.
             with _phase("lk_a_bridge"):
-                _xn = ttnn.rms_norm(
-                    sb.x_pre_norm,
-                    weight=lk.weights["attn_norm_gamma"],
-                    epsilon=NORM_EPS,
-                )
+                _xn = lk.attn_norm.forward_device(sb.x_pre_norm, num_rows=1)
                 ttnn.copy(_xn, sb.x_post_norm)
         # Producers (Lk-A bridge / L0) emit [Mpad=32, DIM]; downstream
         # consumers (Lk-C, Lk-D-idx-cmp, Lk-D-comp, Lk-Dsparse) want
@@ -1182,9 +1292,18 @@ class MegaModel(_BaseModel):
                     lk.weights["comp_cssn_out"],
                     self._comp_kv_normed_sink_tt,
                 )
-        # Lk-Dsparse still consumes the window-ramp topk for now (K
-        # mismatch with Lk-D-topk's K_FIXED=64 output is tracked separately).
-        topk_idxs_tt = self._win_idxs_tt
+        # Per-step window topk indices: row-pick start_pos from the precomputed
+        # [max_seq_len, win] bf16 table (-1 sentinels for unfilled cache slots),
+        # typecast back to int32 → [1, 1, win] for lk_dsparse. (K mismatch with
+        # Lk-D-topk's K_FIXED=64 output is tracked separately.)
+        win = self.args.window_size
+        with _phase("win_idxs"):
+            _win_bf16 = ttnn.embedding(
+                start_pos_tt, self._win_idxs_padded_tt,
+                layout=ttnn.TILE_LAYOUT,
+            )
+            _win_i32 = ttnn.typecast(_win_bf16, dtype=ttnn.int32)
+            topk_idxs_tt = ttnn.reshape(_win_i32, [1, 1, win])
 
         # --- Lk-Dsparse: sparse attention → wo_a → wo_b ------------------
         with _phase("lk_dsparse"):
@@ -1210,6 +1329,7 @@ class MegaModel(_BaseModel):
                 lk.weights["w2_shared"],
                 lk.weights["w3_shared"],
                 sb.shared_partial, a_tt_next,
+                norm_slice_out=sb.norm_slice,
             )
 
         # --- Lk-F: gate post + routed experts (MoE layers only) ----------
@@ -1219,16 +1339,20 @@ class MegaModel(_BaseModel):
             # weights["chip_ids_4d"] are populated by the routed-expert
             # offload phase.
             with _phase("lk_f"):
+                # Lk-F gate + routed FFN takes the SAME post-norm input as
+                # the shared FFN inside Lk-E, not the shared FFN's output.
                 routed_partial = lk.lk_f(
-                    sb.shared_partial,  # x = post-ffn-norm input
+                    sb.norm_slice,
                     lk.weights["gate_w"], lk.weights["gate_bias"],
                     lk.weights["w13_routed"],
                     lk.weights["w2_routed"],
                     lk.weights["chip_ids_4d"],
                 )
-                # routed_partial: [1, 1, 1, DIM] (sum over PER_CHIP). Add
-                # to shared_partial and fold into next residual.
-                ttnn.add(sb.shared_partial, routed_partial,
+                # Each chip holds PER_CHIP=8 of the 256 routed experts; sum
+                # across the full mesh to assemble the global routed output.
+                routed_full = ttnn.all_reduce(routed_partial)
+                routed_3d = ttnn.reshape(routed_full, [1, 1, self.args.dim])
+                ttnn.add(sb.shared_partial, routed_3d,
                          output_tensor=sb.shared_partial)
 
         # Fold the shared+routed partial back into a_tt_next. Lk-E's
@@ -1564,11 +1688,31 @@ class MegaModel(_BaseModel):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
         )
-        # Window-position ramp for non-indexer layers (window_size topk).
+        # Window topk lookup table: [max_seq_len, win] bf16, replicated.
+        # Mirrors legacy DeviceAttention._win_idxs_padded_tt: each row is
+        # the window-topk index vector for a specific start_pos, with -1
+        # sentinels for slots that have not been filled yet (forward-pad
+        # at p < window_size, wraparound at p >= window_size). Without
+        # sentinels, attention drowns in zero-init cache slots → gibberish.
+        # Per-step pick: ttnn.embedding(start_pos_tt, table) → typecast int32.
         win = args.window_size
-        ramp = torch.arange(win, dtype=torch.int32).view(1, 1, win)
-        self._win_idxs_tt = ttnn.from_torch(
-            ramp, device=mesh, dtype=ttnn.int32,
+        if win > 256:
+            raise ValueError(
+                f"window_size {win} > 256: bf16 cannot represent all integer "
+                "index values exactly; switch the lookup table to int32 + a "
+                "different gather op when this fires."
+            )
+        full_table = _build_window_topk_table(win)
+        win_idxs_padded = full_table[
+            torch.tensor(
+                [_window_topk_row_for_pos(p, win)
+                 for p in range(args.max_seq_len)],
+                dtype=torch.long,
+            )
+        ].to(torch.bfloat16).contiguous()
+        self._win_idxs_padded_tt = ttnn.from_torch(
+            win_idxs_padded,
+            device=mesh, dtype=ttnn.bfloat16,
             layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
