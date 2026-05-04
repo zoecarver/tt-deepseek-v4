@@ -364,8 +364,20 @@ def _make_mhc_sinkhorn_kernel(num_slices: int, repeat: int, eps: float):
     return sinkhorn_kernel
 
 
-def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
-    total_work = num_tokens * h_tiles
+def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int,
+                                 *, h_block: int = 4):
+    """Per (token, h_tile): out[t, h] = reduce_sum(x[t, h] * mix[t]_bc, dim=0).
+
+    Batches h_block consecutive h-tiles per work unit. DFBs hold
+    shape=(1, h_block); the mix broadcast and elementwise + reduce all
+    span the BH-tile block. mix stays (1, 1) (per-token scalar).
+    """
+    if h_tiles % h_block:
+        raise ValueError(
+            f"h_tiles={h_tiles} not divisible by h_block={h_block}")
+    h_blocks = h_tiles // h_block
+    total_work = num_tokens * h_blocks
+    BH = h_block
 
     @ttl.operation(grid="auto")
     def apply_mix_h_kernel(x, mix, scaler, out):
@@ -373,13 +385,13 @@ def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
         total_cores = grid_rows * grid_cols
         work_per_core = -(-total_work // total_cores)
 
-        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
         mix_dfb = ttl.make_dataflow_buffer_like(mix, shape=(1, 1), block_count=2)
         sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
-        mix_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        prod_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        red_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, BH), block_count=2)
+        mix_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
+        prod_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
+        red_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, BH), block_count=2)
 
         @ttl.compute()
         def compute():
@@ -393,8 +405,8 @@ def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
                     mx = mix_bc_dfb.reserve()
                     mx.store(ttl.math.broadcast(mix_raw, mx, dims=[1]))
                     mix_bc = mix_bc_dfb.wait()
-                    x_tile = x_dfb.wait()
-                    prod_dfb.reserve().store(x_tile * mix_bc)
+                    x_blk = x_dfb.wait()
+                    prod_dfb.reserve().store(x_blk * mix_bc)
                     red_dfb.reserve().store(
                         ttl.math.reduce_sum(prod_dfb.wait(), sc, dims=[0])
                     )
@@ -408,10 +420,14 @@ def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
             for local_w in range(work_per_core):
                 global_w = core_idx * work_per_core + local_w
                 if global_w < total_work:
-                    global_t = global_w // h_tiles
-                    global_h = global_w % h_tiles
+                    global_t = global_w // h_blocks
+                    global_hb = global_w % h_blocks
+                    h_start = global_hb * BH
                     ttl.copy(mix[global_t, 0], mix_dfb.reserve()).wait()
-                    ttl.copy(x[global_t, global_h], x_dfb.reserve()).wait()
+                    ttl.copy(
+                        x[global_t:global_t + 1, h_start:h_start + BH],
+                        x_dfb.reserve(),
+                    ).wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -420,23 +436,35 @@ def _make_mhc_apply_mix_h_kernel(num_tokens: int, h_tiles: int):
             for local_w in range(work_per_core):
                 global_w = core_idx * work_per_core + local_w
                 if global_w < total_work:
-                    global_t = global_w // h_tiles
-                    global_h = global_w % h_tiles
-                    ttl.copy(out_dfb.wait(), out[global_t, global_h]).wait()
+                    global_t = global_w // h_blocks
+                    global_hb = global_w % h_blocks
+                    h_start = global_hb * BH
+                    ttl.copy(
+                        out_dfb.wait(),
+                        out[global_t:global_t + 1, h_start:h_start + BH],
+                    ).wait()
 
     return apply_mix_h_kernel
 
 
-def _make_mhc_post_kernel(num_tokens: int, h_tiles: int):
+def _make_mhc_post_kernel(num_tokens: int, h_tiles: int, *, h_block: int = 4):
     """Inlined from inference.py / tt-lang-kernels/post.py.
 
     Per-token, per-h-tile: out = x * post_mix_bc + comb^T @ residual.
 
-    Parallelizes over (token, h_tile) work units so num_tokens=1 still
-    fans out across the full grid. Each core re-loads post_mix[t] and
-    comb_T[t] per work unit (1 tile each, cheap vs. compute).
+    Parallelizes over (token, h_block) work units. Each work unit
+    processes h_block consecutive h-tiles in a single pass. DFBs hold
+    shape=(1, h_block) tile blocks so x/res/out and the broadcast
+    post_bc / matmul / post_term scratch buffers all amortize their
+    reserve/wait overhead across h_block tiles. post_mix and comb_T
+    stay (1, 1) (per-token scalars).
     """
-    total_work = num_tokens * h_tiles
+    if h_tiles % h_block:
+        raise ValueError(
+            f"h_tiles={h_tiles} not divisible by h_block={h_block}")
+    h_blocks = h_tiles // h_block
+    total_work = num_tokens * h_blocks
+    BH = h_block
 
     @ttl.operation(grid="auto")
     def post_kernel(x, residual, comb_T, post_mix, out):
@@ -444,14 +472,14 @@ def _make_mhc_post_kernel(num_tokens: int, h_tiles: int):
         total_cores = grid_rows * grid_cols
         work_per_core = -(-total_work // total_cores)
 
-        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        res_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, 1), block_count=2)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
+        res_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, BH), block_count=2)
         comb_dfb = ttl.make_dataflow_buffer_like(comb_T, shape=(1, 1), block_count=2)
         post_dfb = ttl.make_dataflow_buffer_like(post_mix, shape=(1, 1), block_count=2)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
-        post_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        post_term_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        matmul_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, BH), block_count=2)
+        post_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
+        post_term_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
+        matmul_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
 
         @ttl.compute()
         def compute():
@@ -465,10 +493,10 @@ def _make_mhc_post_kernel(num_tokens: int, h_tiles: int):
                     pbc = post_bc_dfb.reserve()
                     pbc.store(ttl.math.broadcast(post, pbc, dims=[1]))
                     post_bc = post_bc_dfb.wait()
-                    x_tile = x_dfb.wait()
-                    res_tile = res_dfb.wait()
-                    post_term_dfb.reserve().store(x_tile * post_bc)
-                    matmul_dfb.reserve().store(comb_t @ res_tile)
+                    x_blk = x_dfb.wait()
+                    res_blk = res_dfb.wait()
+                    post_term_dfb.reserve().store(x_blk * post_bc)
+                    matmul_dfb.reserve().store(comb_t @ res_blk)
                     out_dfb.reserve().store(
                         post_term_dfb.wait() + matmul_dfb.wait()
                     )
@@ -480,12 +508,19 @@ def _make_mhc_post_kernel(num_tokens: int, h_tiles: int):
             for local_w in range(work_per_core):
                 global_w = core_idx * work_per_core + local_w
                 if global_w < total_work:
-                    global_t = global_w // h_tiles
-                    global_h = global_w % h_tiles
+                    global_t = global_w // h_blocks
+                    global_hb = global_w % h_blocks
+                    h_start = global_hb * BH
                     ttl.copy(post_mix[global_t, 0], post_dfb.reserve()).wait()
                     ttl.copy(comb_T[global_t, 0], comb_dfb.reserve()).wait()
-                    ttl.copy(x[global_t, global_h], x_dfb.reserve()).wait()
-                    ttl.copy(residual[global_t, global_h], res_dfb.reserve()).wait()
+                    ttl.copy(
+                        x[global_t:global_t + 1, h_start:h_start + BH],
+                        x_dfb.reserve(),
+                    ).wait()
+                    ttl.copy(
+                        residual[global_t:global_t + 1, h_start:h_start + BH],
+                        res_dfb.reserve(),
+                    ).wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -494,15 +529,32 @@ def _make_mhc_post_kernel(num_tokens: int, h_tiles: int):
             for local_w in range(work_per_core):
                 global_w = core_idx * work_per_core + local_w
                 if global_w < total_work:
-                    global_t = global_w // h_tiles
-                    global_h = global_w % h_tiles
-                    ttl.copy(out_dfb.wait(), out[global_t, global_h]).wait()
+                    global_t = global_w // h_blocks
+                    global_hb = global_w % h_blocks
+                    h_start = global_hb * BH
+                    ttl.copy(
+                        out_dfb.wait(),
+                        out[global_t:global_t + 1, h_start:h_start + BH],
+                    ).wait()
 
     return post_kernel
 
 
 def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
-                         rms_eps: float, inv_D: float):
+                         rms_eps: float, inv_D: float,
+                         *, h_block: int = 4):
+    """Per row-tile rmsnorm. ssq accumulates across the row in BH-tile
+    chunks, then inv_rms scales the row in matching BH-tile chunks.
+
+    DFB shapes are (1, h_block); reduce_sum over dim=[1] collapses both
+    within-tile cols and across the BH tiles in one shot.
+    """
+    if h_tiles % h_block:
+        raise ValueError(
+            f"h_tiles={h_tiles} not divisible by h_block={h_block}")
+    h_blocks = h_tiles // h_block
+    BH = h_block
+
     @ttl.operation(
         grid="auto",
         options="--no-ttl-reduce-full-fp32",
@@ -513,14 +565,14 @@ def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
         total_cores = grid_rows * grid_cols
         tiles_per_core = -(-num_row_tiles // total_cores)
 
-        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        g_dfb = ttl.make_dataflow_buffer_like(gamma, shape=(1, 1), block_count=2)
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
+        g_dfb = ttl.make_dataflow_buffer_like(gamma, shape=(1, BH), block_count=2)
         sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
-        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        xsq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        red_step_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        inv_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, BH), block_count=2)
+        sq_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        xsq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, BH), block_count=2)
+        red_step_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        inv_bc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, BH), block_count=2)
 
         @ttl.compute()
         def compute():
@@ -535,7 +587,7 @@ def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
                     sq_dfb.reserve().store(
                         ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
                     )
-                    for _ in range(h_tiles - 1):
+                    for _ in range(h_blocks - 1):
                         xk = x_dfb.wait()
                         xsq_dfb.reserve().store(xk * xk)
                         red_step_dfb.reserve().store(
@@ -553,7 +605,7 @@ def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
                         inv_bc, dims=[1],
                     ))
                     inv = inv_bc_dfb.wait()
-                    for _ in range(h_tiles):
+                    for _ in range(h_blocks):
                         xk = x_dfb.wait()
                         gk = g_dfb.wait()
                         out_dfb.reserve().store(xk * gk * inv)
@@ -566,11 +618,22 @@ def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
             for local_t in range(tiles_per_core):
                 global_t = core_idx * tiles_per_core + local_t
                 if global_t < num_row_tiles:
-                    for h in range(h_tiles):
-                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
-                    for h in range(h_tiles):
-                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
-                        ttl.copy(gamma[0, h], g_dfb.reserve()).wait()
+                    for hb in range(h_blocks):
+                        h_start = hb * BH
+                        ttl.copy(
+                            x[global_t:global_t + 1, h_start:h_start + BH],
+                            x_dfb.reserve(),
+                        ).wait()
+                    for hb in range(h_blocks):
+                        h_start = hb * BH
+                        ttl.copy(
+                            x[global_t:global_t + 1, h_start:h_start + BH],
+                            x_dfb.reserve(),
+                        ).wait()
+                        ttl.copy(
+                            gamma[0:1, h_start:h_start + BH],
+                            g_dfb.reserve(),
+                        ).wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -579,8 +642,12 @@ def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
             for local_t in range(tiles_per_core):
                 global_t = core_idx * tiles_per_core + local_t
                 if global_t < num_row_tiles:
-                    for h in range(h_tiles):
-                        ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
+                    for hb in range(h_blocks):
+                        h_start = hb * BH
+                        ttl.copy(
+                            out_dfb.wait(),
+                            out[global_t:global_t + 1, h_start:h_start + BH],
+                        ).wait()
 
     return rmsnorm_kernel
 
