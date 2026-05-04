@@ -67,8 +67,10 @@ def _make_cssn_kernel(ratio: int, ratio_pad: int, d: int, rms_eps: float):
     """Inlined compressor_softmax_sum_norm kernel.
 
     Fuses slice+concat view + softmax + weighted-sum + RMSNorm for the
-    compressor emit branch (overlap=True). Single core; small work
-    (n_tiles = d // TILE) so dispatch overhead dominates.
+    compressor emit branch (overlap=True). One core per d-tile: each
+    core does the local softmax+kv_sum+ssq-partial for its tile, partials
+    are reduced to col 0 via PipeNet, root finalizes rsqrt and broadcasts
+    back, then every core multiplies by its gamma tile and writes.
 
     Math:
       score_view = mf*sc_front + mb*sc_back + mp*sc_front  # padding rows -inf
@@ -90,11 +92,25 @@ def _make_cssn_kernel(ratio: int, ratio_pad: int, d: int, rms_eps: float):
 
     n_tiles = d // _RMS_TILE
     inv_d = 1.0 / d
+    # Lay out cores in a 1D row that fits the device compute grid
+    # (sterling BH max X = 11). Each core handles TPC consecutive
+    # d-tiles. n_tiles=4 -> 4x1 (TPC=1), n_tiles=16 -> 8x1 (TPC=2).
+    COL = min(n_tiles, 8)
+    if n_tiles % COL:
+        raise ValueError(f"n_tiles={n_tiles} not divisible by COL={COL}")
+    TPC = n_tiles // COL
+    SSQ_RECV_BC = max(2, COL - 1)
 
-    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
+    @ttl.operation(grid=(COL, 1), fp32_dest_acc_en=True)
     def cssn_kernel(kv_front, kv_back, sc_front, sc_back,
                     mask_front, mask_back, mask_pad,
                     gamma, scaler, out):
+        ssq_reduce_pipes = [ttl.Pipe(src=(col, 0), dst=(0, 0))
+                            for col in range(1, COL)]
+        ssq_reduce_net = ttl.PipeNet(ssq_reduce_pipes)
+        rms_bcast_pipes = [ttl.Pipe(src=(0, 0), dst=(slice(0, COL), 0))]
+        rms_bcast_net = ttl.PipeNet(rms_bcast_pipes)
+
         kvf_dfb = ttl.make_dataflow_buffer_like(kv_front, shape=(1, 1), block_count=2)
         kvb_dfb = ttl.make_dataflow_buffer_like(kv_back, shape=(1, 1), block_count=2)
         scf_dfb = ttl.make_dataflow_buffer_like(sc_front, shape=(1, 1), block_count=2)
@@ -116,22 +132,27 @@ def _make_cssn_kernel(ratio: int, ratio_pad: int, d: int, rms_eps: float):
         invsum_bc_dfb = ttl.make_dataflow_buffer_like(sc_front, shape=(1, 1), block_count=2)
         sm_dfb = ttl.make_dataflow_buffer_like(sc_front, shape=(1, 1), block_count=2)
         weighted_dfb = ttl.make_dataflow_buffer_like(kv_front, shape=(1, 1), block_count=2)
-        kv_sum_partial_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
-        kv_sum_stash_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=n_tiles)
+        kv_sum_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        kv_sum_stash_dfb = ttl.make_dataflow_buffer_like(
+            scaler, shape=(1, 1), block_count=max(2, TPC))
         ks_sq_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
         ssq_step_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
-        ssq_acc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        ssq_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        ssq_recv_dfb = ttl.make_dataflow_buffer_like(
+            scaler, shape=(1, 1), block_count=SSQ_RECV_BC)
         rms_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        rms_recv_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
         rms_bc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
 
         @ttl.compute()
         def compute():
+            c, _ = ttl.node(dims=2)
             sc = sc_dfb.wait()
             mf = mf_dfb.wait()
             mb = mb_dfb.wait()
             mp = mp_dfb.wait()
 
-            for ct in range(n_tiles):
+            for t in range(TPC):
                 kvf = kvf_dfb.wait()
                 kvb = kvb_dfb.wait()
                 scf = scf_dfb.wait()
@@ -166,10 +187,10 @@ def _make_cssn_kernel(ratio: int, ratio_pad: int, d: int, rms_eps: float):
                 weighted_dfb.reserve().store(kvv * sm)
                 w = weighted_dfb.wait()
 
-                kv_sum_partial_dfb.reserve().store(
+                kv_sum_dfb.reserve().store(
                     ttl.math.reduce_sum(w, sc, dims=[0])
                 )
-                ks = kv_sum_partial_dfb.wait()
+                ks = kv_sum_dfb.wait()
                 kv_sum_stash_dfb.reserve().store(ks)
 
                 ks_sq_dfb.reserve().store(ks * ks)
@@ -177,48 +198,84 @@ def _make_cssn_kernel(ratio: int, ratio_pad: int, d: int, rms_eps: float):
                     ttl.math.reduce_sum(ks_sq_dfb.wait(), sc, dims=[0, 1])
                 )
                 step = ssq_step_dfb.wait()
-                if ct == 0:
-                    ssq_acc_dfb.reserve().store(step)
+                if t == 0:
+                    ssq_dfb.reserve().store(step)
                 else:
-                    prev = ssq_acc_dfb.wait()
-                    ssq_acc_dfb.reserve().store(prev + step)
+                    prev = ssq_dfb.wait()
+                    ssq_dfb.reserve().store(prev + step)
 
-            ssq = ssq_acc_dfb.wait()
-            rms_dfb.reserve().store(
-                ttl.math.rsqrt(
-                    ssq * ttl.math.fill(ssq, inv_d) + ttl.math.fill(ssq, rms_eps)
+            if c == 0:
+                for _ in range(COL - 1):
+                    prev = ssq_dfb.wait()
+                    r = ssq_recv_dfb.wait()
+                    ssq_dfb.reserve().store(prev + r)
+                ssq_total = ssq_dfb.wait()
+                rms_dfb.reserve().store(
+                    ttl.math.rsqrt(
+                        ssq_total * ttl.math.fill(ssq_total, inv_d)
+                        + ttl.math.fill(ssq_total, rms_eps)
+                    )
                 )
-            )
-            rms_scalar = rms_dfb.wait()
+
+            rms_scalar = rms_recv_dfb.wait()
             rms_bc = rms_bc_dfb.reserve()
             rms_bc.store(ttl.math.broadcast(rms_scalar, rms_bc, dims=[0, 1]))
             rms_full = rms_bc_dfb.wait()
 
-            for ct in range(n_tiles):
-                ks = kv_sum_stash_dfb.wait()
+            for t in range(TPC):
+                ks_stashed = kv_sum_stash_dfb.wait()
                 g = gamma_dfb.wait()
-                out_dfb.reserve().store(ks * g * rms_full)
+                out_dfb.reserve().store(ks_stashed * g * rms_full)
 
         @ttl.datamovement()
         def dm_read():
+            c, _ = ttl.node(dims=2)
             ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
             ttl.copy(mask_front[0, 0], mf_dfb.reserve()).wait()
             ttl.copy(mask_back[0, 0], mb_dfb.reserve()).wait()
             ttl.copy(mask_pad[0, 0], mp_dfb.reserve()).wait()
 
-            for ct in range(n_tiles):
-                ttl.copy(kv_front[0, ct], kvf_dfb.reserve()).wait()
-                ttl.copy(kv_back[0, ct], kvb_dfb.reserve()).wait()
-                ttl.copy(sc_front[0, ct], scf_dfb.reserve()).wait()
-                ttl.copy(sc_back[0, ct], scb_dfb.reserve()).wait()
+            for t in range(TPC):
+                ti = c * TPC + t
+                ttl.copy(kv_front[0, ti], kvf_dfb.reserve()).wait()
+                ttl.copy(kv_back[0, ti], kvb_dfb.reserve()).wait()
+                ttl.copy(sc_front[0, ti], scf_dfb.reserve()).wait()
+                ttl.copy(sc_back[0, ti], scb_dfb.reserve()).wait()
 
-            for ct in range(n_tiles):
-                ttl.copy(gamma[0, ct], gamma_dfb.reserve()).wait()
+            for t in range(TPC):
+                ti = c * TPC + t
+                ttl.copy(gamma[0, ti], gamma_dfb.reserve()).wait()
+
+            if c == 0:
+                def recv_ssq(pipe):
+                    blk = ssq_recv_dfb.reserve()
+                    ttl.copy(pipe, blk).wait()
+                ssq_reduce_net.if_dst(recv_ssq)
+            else:
+                ssq_local = ssq_dfb.wait()
+
+                def send_ssq(pipe):
+                    ttl.copy(ssq_local, pipe).wait()
+                ssq_reduce_net.if_src(send_ssq)
+
+            if c == 0:
+                rms_local = rms_dfb.wait()
+
+                def send_rms(pipe):
+                    ttl.copy(rms_local, pipe).wait()
+                rms_bcast_net.if_src(send_rms)
+
+            def recv_rms(pipe):
+                blk = rms_recv_dfb.reserve()
+                ttl.copy(pipe, blk).wait()
+            rms_bcast_net.if_dst(recv_rms)
 
         @ttl.datamovement()
         def dm_write():
-            for ct in range(n_tiles):
-                ttl.copy(out_dfb.wait(), out[0, ct]).wait()
+            c, _ = ttl.node(dims=2)
+            for t in range(TPC):
+                ti = c * TPC + t
+                ttl.copy(out_dfb.wait(), out[0, ti]).wait()
 
     return cssn_kernel
 
