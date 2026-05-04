@@ -133,49 +133,118 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
     return summa_matmul
 
 
-def _make_gate_post_kernel(num_h_tiles: int):
-    """Fused gate post-process: scores = sqrt(softplus(raw));
-    biased = scores + bias. One dispatch, both outputs written tile-by-tile."""
+def _make_matmul_gate_post_kernel(M: int, K: int, N: int,
+                                   block_cfg, part_cfg,
+                                   fp32_dest_acc_en: bool = True):
+    """SUMMA gate matmul fused with sqrt(softplus(raw)) + bias post-process.
 
-    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
-    def gate_post(raw, bias, scores_out, biased_out):
-        raw_dfb = ttl.make_dataflow_buffer_like(raw, shape=(1, 1), block_count=2)
-        b_dfb = ttl.make_dataflow_buffer_like(bias, shape=(1, 1), block_count=2)
-        # Scratch CB so the second store can read s back after the first store
-        # consumed it; mixing computed s with bias in one expression mis-compiles.
+    Each (m_p, n_p) core accumulates its output tile, then applies the post
+    in compute and writes both scores and biased outputs from dm_write.
+    """
+    bm, bn, bk = block_cfg
+    Mp, Np, Kp = part_cfg
+    if Kp != 1:
+        raise ValueError(f"K_parts must be 1, got {Kp}")
+    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
+    if Mt % bm or Nt % bn or Kt % bk:
+        raise ValueError(
+            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
+            f"block=(bm={bm}, bn={bn}, bk={bk})")
+    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
+    if Mb % Mp or Nb % Np:
+        raise ValueError(
+            f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
+    M_BPN = Mb // Mp
+    N_BPN = Nb // Np
+
+    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
+    def matmul_gate_post(a, w, bias, scores_out, biased_out):
+        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
+                   for m_p in range(Mp)]
+        mcast_a_net = ttl.PipeNet(a_pipes)
+        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
+                   for n_p in range(Np)]
+        mcast_b_net = ttl.PipeNet(b_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+        bias_cb = ttl.make_dataflow_buffer_like(
+            bias, shape=(bm, bn), block_count=2)
+        raw_cb = ttl.make_dataflow_buffer_like(
+            scores_out, shape=(bm, bn), block_count=2)
         s_scratch = ttl.make_dataflow_buffer_like(
-            scores_out, shape=(1, 1), block_count=2)
-        s_dfb = ttl.make_dataflow_buffer_like(
-            scores_out, shape=(1, 1), block_count=2)
-        biased_dfb = ttl.make_dataflow_buffer_like(
-            biased_out, shape=(1, 1), block_count=2)
+            scores_out, shape=(bm, bn), block_count=2)
+        scores_cb = ttl.make_dataflow_buffer_like(
+            scores_out, shape=(bm, bn), block_count=2)
+        biased_cb = ttl.make_dataflow_buffer_like(
+            biased_out, shape=(bm, bn), block_count=2)
 
         @ttl.compute()
         def compute():
-            for _ in range(num_h_tiles):
-                r = raw_dfb.wait()
-                b = b_dfb.wait()
-                s_scratch.reserve().store(
-                    ttl.math.sqrt(
-                        ttl.math.log(
-                            ttl.math.exp(r) + ttl.math.fill(r, 1.0))))
-                s = s_scratch.wait()
-                s_dfb.reserve().store(s)
-                biased_dfb.reserve().store(s + b)
+            for _ in range(M_BPN):
+                for _ in range(N_BPN):
+                    p = raw_cb.reserve()
+                    for _ in range(Kb):
+                        a_blk = a_cb.wait()
+                        b_blk = b_cb.wait()
+                        p += a_blk @ b_blk
+                    r = raw_cb.wait()
+                    b = bias_cb.wait()
+                    s_scratch.reserve().store(
+                        ttl.math.sqrt(
+                            ttl.math.log(
+                                ttl.math.exp(r) + ttl.math.fill(r, 1.0))))
+                    s = s_scratch.wait()
+                    scores_cb.reserve().store(s)
+                    biased_cb.reserve().store(s + b)
 
         @ttl.datamovement()
         def dm_read():
-            for h in range(num_h_tiles):
-                ttl.copy(raw[0, h], raw_dfb.reserve()).wait()
-                ttl.copy(bias[0, h], b_dfb.reserve()).wait()
+            _, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for _ in range(N_BPN):
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        a_blk = a_cb.reserve()
+
+                        def read_a(pipe):
+                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
+                            ttl.copy(a_blk, pipe).wait()
+
+                        mcast_a_net.if_src(read_a)
+                        mcast_a_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
 
         @ttl.datamovement()
         def dm_write():
-            for h in range(num_h_tiles):
-                ttl.copy(s_dfb.wait(), scores_out[0, h]).wait()
-                ttl.copy(biased_dfb.wait(), biased_out[0, h]).wait()
+            col_c, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for local_nb in range(N_BPN):
+                    nb = col_c * N_BPN + local_nb
+                    nc = nb * bn
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        b_blk = b_cb.reserve()
 
-    return gate_post
+                        def read_b(pipe):
+                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                            ttl.copy(b_blk, pipe).wait()
+
+                        mcast_b_net.if_src(read_b)
+                        mcast_b_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
+                    ttl.copy(bias[mr:mr + bm, nc:nc + bn],
+                             bias_cb.reserve()).wait()
+                    ttl.copy(scores_cb.wait(),
+                             scores_out[mr:mr + bm, nc:nc + bn]).wait()
+                    ttl.copy(biased_cb.wait(),
+                             biased_out[mr:mr + bm, nc:nc + bn]).wait()
+
+    return matmul_gate_post
 
 
 def make_lk_f_kernel(mesh, gate_bias_cpu):
@@ -185,9 +254,9 @@ def make_lk_f_kernel(mesh, gate_bias_cpu):
     per-expert (matmul w1 + matmul w3 + ttnn SwiGLU + matmul w2).
     Final mask multiply + sum across experts in ttnn (TODO mega).
     """
-    # SUMMA: gate matmul. M=TILE, K=DIM=4096, N=N_ROUTED=256.
+    # Fused gate matmul + sqrt(softplus) + bias.  M=TILE, K=DIM=4096, N=N_ROUTED=256.
     # Mt=1, Kt=128, Nt=8. block=(1,1,4) part=(1,8,1) -> 8 cores, N_BPN=1, Kb=32.
-    matmul_gate = _make_summa_matmul_kernel(
+    matmul_gate_post = _make_matmul_gate_post_kernel(
         M=TILE, K=DIM, N=N_ROUTED,
         block_cfg=(1, 1, 4), part_cfg=(1, 8, 1))
 
@@ -205,10 +274,6 @@ def make_lk_f_kernel(mesh, gate_bias_cpu):
         M=TILE, K=INTER_DIM, N=DIM,
         block_cfg=(1, 16, 4), part_cfg=(1, 8, 1))
 
-    # One fused tt-lang kernel: scores=sqrt(softplus(raw)); biased=scores+bias.
-    h_tiles_gate = N_ROUTED // TILE
-    gate_post = _make_gate_post_kernel(num_h_tiles=h_tiles_gate)
-
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
@@ -225,9 +290,6 @@ def make_lk_f_kernel(mesh, gate_bias_cpu):
     def lk_f_kernel(x_tt, gate_w_tt, gate_bias_tt,
                     w1_tt, w2_tt, w3_tt, chip_ids_4d_tt):
         if "init" not in state:
-            state["raw_padded"] = ttnn.from_torch(
-                torch.zeros(TILE, N_ROUTED, dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
             state["scores_padded"] = ttnn.from_torch(
                 torch.zeros(TILE, N_ROUTED, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
@@ -242,13 +304,9 @@ def make_lk_f_kernel(mesh, gate_bias_cpu):
         x_padded = ttnn.pad(x_2d, padding=[(0, TILE - B), (0, 0)],
                             value=0.0)
 
-        # 2. Gate matmul: [TILE, DIM] @ [DIM, N_ROUTED] -> [TILE, N_ROUTED].
-        matmul_gate(x_padded, gate_w_tt, state["raw_padded"])
-
-        # 3. Fused tt-lang kernel: scores = sqrt(softplus(raw));
-        # biased = scores + bias. One dispatch.
-        gate_post(state["raw_padded"], state["bias_padded"],
-                  state["scores_padded"], state["biased_padded"])
+        # 2. Fused gate matmul + sqrt(softplus) + bias post-process.
+        matmul_gate_post(x_padded, gate_w_tt, state["bias_padded"],
+                         state["scores_padded"], state["biased_padded"])
         scores_2d = ttnn.slice(state["scores_padded"], [0, 0], [B, N_ROUTED])
         biased_2d = ttnn.slice(state["biased_padded"], [0, 0], [B, N_ROUTED])
         scores = ttnn.reshape(scores_2d, [1, B, N_ROUTED])
