@@ -20,7 +20,8 @@ Math equivalence for the post-process:
   kernel: out [TILE, T] = w_padded [TILE, H] @ relu(score [H, T])
           (only row 0 of out is valid)
 
-ttnn glue (TODO: mega): ttnn.transpose(kv_cache, -2, -1) for kv_T. The
+ttnn glue: none on the score path - kv_T transpose is folded into the
+score matmul via transpose_b=True (per-block ttl.transpose). The
 `ttnn.multiply(w, scale)` is folded by pre-scaling wproj on the host.
 """
 from __future__ import annotations
@@ -42,14 +43,7 @@ B = 1
 TILE = 32
 
 
-# TODO: mega fusion blocked: ttnn used for transpose(kv_cache, -2, -1).
-# Lowering needs a tt-lang within-tile transpose primitive (or storing
-# kv_cache in transposed layout from the upstream Lk-D-idx-emit write).
-
-
-def _make_summa_matmul_kernel(M: int, K: int, N: int,
-                              block_cfg, part_cfg,
-                              fp32_dest_acc_en: bool = True):
+def _summa_dims(M: int, K: int, N: int, block_cfg, part_cfg):
     bm, bn, bk = block_cfg
     Mp, Np, Kp = part_cfg
     if Kp != 1:
@@ -63,8 +57,14 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
     if Mb % Mp or Nb % Np:
         raise ValueError(
             f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
-    M_BPN = Mb // Mp
-    N_BPN = Nb // Np
+    return bm, bn, bk, Mp, Np, Mb // Mp, Nb // Np, Kb
+
+
+def _make_summa_matmul_kernel(M: int, K: int, N: int,
+                              block_cfg, part_cfg,
+                              fp32_dest_acc_en: bool = True):
+    bm, bn, bk, Mp, Np, M_BPN, N_BPN, Kb = _summa_dims(
+        M, K, N, block_cfg, part_cfg)
 
     @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
     def summa_matmul(a, w, out):
@@ -132,6 +132,89 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
                     ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
 
     return summa_matmul
+
+
+def _make_summa_matmul_b_t_kernel(M: int, K: int, N: int,
+                                  block_cfg, part_cfg,
+                                  fp32_dest_acc_en: bool = True):
+    """SUMMA matmul out = a @ b.T. b is stored as [N, K] (not [K, N]).
+
+    Folds an external ttnn.transpose(b, -2, -1) into the matmul: each
+    block of b is read transposed (read [N, K] tiles at [nc, kc]) and
+    transposed inside the compute thread before the inner matmul.
+    """
+    bm, bn, bk, Mp, Np, M_BPN, N_BPN, Kb = _summa_dims(
+        M, K, N, block_cfg, part_cfg)
+
+    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
+    def summa_matmul_b_t(a, w, out):
+        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
+                   for m_p in range(Mp)]
+        mcast_a_net = ttl.PipeNet(a_pipes)
+        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
+                   for n_p in range(Np)]
+        mcast_b_net = ttl.PipeNet(b_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bn, bk), block_count=2)
+        bt_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+        out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for _ in range(M_BPN):
+                for _ in range(N_BPN):
+                    p = out_cb.reserve()
+                    for _ in range(Kb):
+                        a_blk = a_cb.wait()
+                        b_blk = b_cb.wait()
+                        with bt_cb.reserve() as bt:
+                            bt.store(ttl.transpose(b_blk))
+                        p += a_blk @ bt_cb.wait()
+
+        @ttl.datamovement()
+        def dm_read():
+            _, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for _ in range(N_BPN):
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        a_blk = a_cb.reserve()
+
+                        def read_a(pipe):
+                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
+                            ttl.copy(a_blk, pipe).wait()
+
+                        mcast_a_net.if_src(read_a)
+                        mcast_a_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for local_nb in range(N_BPN):
+                    nb = col_c * N_BPN + local_nb
+                    nc = nb * bn
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        b_blk = b_cb.reserve()
+
+                        def read_b(pipe):
+                            ttl.copy(w[nc:nc + bn, kc:kc + bk], b_blk).wait()
+                            ttl.copy(b_blk, pipe).wait()
+
+                        mcast_b_net.if_src(read_b)
+                        mcast_b_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
+                    o = out_cb.wait()
+                    ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
+
+    return summa_matmul_b_t
 
 
 def _make_summa_matmul_relu_b_kernel(M: int, K: int, N: int,
@@ -236,8 +319,7 @@ def make_lk_d_idx_score_kernel(mesh):
     Pipeline:
       x_2d [1, 4096] -> pad to [TILE, 4096]
       SUMMA wproj_scaled: x_padded @ wproj_scaled -> w_padded [TILE, H]
-      ttnn.transpose(kv_cache) -> kv_T  (TODO: mega)
-      SUMMA qkv_T: q_idx_2d [H, d] @ kv_T_2d [d, T_pad] -> score [H, T_pad]
+      SUMMA qkv_T (B-transpose fused): q_idx [H, d] @ kv [T, d].T -> score [H, T_pad]
       SUMMA relu_b reduce: w_padded @ relu(score) -> out_padded [TILE, T_pad]
       slice/reshape -> [B, 1, T_pad]
     """
@@ -253,7 +335,8 @@ def make_lk_d_idx_score_kernel(mesh):
 
     # SUMMA2: M=H=64, K=d=128, N=T=128. Mt=2, Kt=4, Nt=4.
     # block=(1, 1, 4) part=(2, 4, 1) -> 8 cores (Mb=2, Nb=4, M_BPN=N_BPN=1, Kb=1).
-    matmul_score_kernel = _make_summa_matmul_kernel(
+    # B-transpose variant: folds kv_T transpose into the matmul.
+    matmul_score_kernel = _make_summa_matmul_b_t_kernel(
         M=H, K=d, N=T,
         block_cfg=(1, 1, 4), part_cfg=(2, 4, 1))
 
@@ -289,13 +372,12 @@ def make_lk_d_idx_score_kernel(mesh):
         # SUMMA: x_padded @ wproj_scaled -> w_padded [TILE, H] (row 0 valid).
         matmul_wproj_kernel(x_padded, wproj_scaled_tt, state["w_padded"])
 
-        # Transpose kv_cache (TODO: mega).
-        kv_T = ttnn.transpose(kv_cache_tt, -2, -1)
-        kv_T_2d = ttnn.reshape(kv_T, [d, T])
+        # SUMMA with transpose_b=True: q_idx @ kv.T -> score [H, T]. The
+        # transpose folds into the matmul (per-block ttl.transpose); kv is
+        # passed in its natural [T, d] layout, no ttnn.transpose dispatch.
+        kv_2d = ttnn.reshape(kv_cache_tt, [T, d])
         q_idx_2d = ttnn.reshape(q_idx_tt, [H, d])
-
-        # SUMMA: q_idx @ kv_T -> score [H, T].
-        matmul_score_kernel(q_idx_2d, kv_T_2d, state["score_padded"])
+        matmul_score_kernel(q_idx_2d, kv_2d, state["score_padded"])
 
         # SUMMA with fused relu(B): w_padded @ relu(score) -> out [TILE, T].
         matmul_relu_reduce_kernel(state["w_padded"], state["score_padded"],

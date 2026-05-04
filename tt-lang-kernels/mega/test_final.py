@@ -32,7 +32,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 
 DIM = 4096
@@ -44,6 +44,7 @@ HC_EPS = 1e-6
 NUM_TOKENS = 1
 NUM_TOKENS_PAD = 32
 TILE = 32
+ARGMAX_K = 32  # tile-cols streamed per argmax iter (sweet spot per argmax_2pass.py)
 
 
 def _make_hc_combiner_kernel(num_out_tiles: int, K_tiles: int,
@@ -339,6 +340,193 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
     return summa_matmul
 
 
+def _make_argmax_input_pad_kernel(num_valid_tiles: int, num_total_tiles: int):
+    """fp32 logits [TILE, num_valid_tiles*TILE] + fp32 row_mask [TILE, TILE]
+    -> fp32 values [TILE, num_total_tiles*TILE] with row 0 = logits, rows
+    1..31 = -1e9, padding tile-cols (>= num_valid_tiles) = -1e9.
+
+    All operands are fp32 because tt-lang requires store-dtype to match the
+    tile's element type (bf16+bf16 -> bf16 cannot store into an fp32 dfb).
+    Argmax also wants fp32 to avoid bf16 ties between equal max values.
+    row_mask is the constant tile (row 0 = 0, rows 1..31 = -1e9) used to
+    blank rows 1..31 in valid tile-cols.
+    """
+    NEG_INF = -1.0e9
+
+    @ttl.operation(grid="auto", fp32_dest_acc_en=True)
+    def pad_kernel(logits, row_mask, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        tiles_per_core = -(-num_total_tiles // total_cores)
+
+        l_dfb = ttl.make_dataflow_buffer_like(logits, shape=(1, 1), block_count=2)
+        m_dfb = ttl.make_dataflow_buffer_like(row_mask, shape=(1, 1), block_count=1)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            m = m_dfb.wait()
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_total_tiles:
+                    if global_t < num_valid_tiles:
+                        l = l_dfb.wait()
+                        out_dfb.reserve().store(l + m)
+                    else:
+                        with out_dfb.reserve() as o:
+                            o.store(ttl.math.fill(o, NEG_INF))
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            ttl.copy(row_mask[0, 0], m_dfb.reserve()).wait()
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_valid_tiles:
+                    ttl.copy(logits[0, global_t], l_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_t in range(tiles_per_core):
+                global_t = core_idx * tiles_per_core + local_t
+                if global_t < num_total_tiles:
+                    ttl.copy(out_dfb.wait(), out[0, global_t]).wait()
+
+    return pad_kernel
+
+
+def _make_argmax_2pass_kernel(num_total_tiles: int, K_block: int):
+    """Two-pass streaming argmax. See argmax_2pass.py for the algorithm.
+
+    Inputs are fp32 throughout to avoid bf16 ties on equal max values
+    (ttnn.topk's tie-break would diverge from this kernel's reduce_max).
+
+    Inputs:
+      values:    [TILE, num_total_tiles*TILE] fp32, padding lanes = -1e9.
+      indices:   [TILE, num_total_tiles*TILE] fp32, row 0 = arange.
+      scaler:    [TILE, TILE] fp32, ones.
+      out_value: [TILE, TILE] fp32, valid at [0, 0].
+      out_index: [TILE, TILE] fp32, valid at [0, 0].
+    """
+    if num_total_tiles % K_block != 0:
+        raise ValueError(
+            f"num_total_tiles={num_total_tiles} not divisible by K_block={K_block}")
+    NUM_ITERS = num_total_tiles // K_block
+    BIG = 1.0e6
+
+    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
+    def argmax_2pass(values, indices, scaler, out_value, out_index):
+        v1_dfb = ttl.make_dataflow_buffer_like(
+            values, shape=(1, K_block), block_count=2)
+        s_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        tile_max_dfb = ttl.make_dataflow_buffer_like(
+            out_value, shape=(1, 1), block_count=2)
+        run_max_dfb = ttl.make_dataflow_buffer_like(
+            out_value, shape=(1, 1), block_count=2)
+
+        max_global_dfb = ttl.make_dataflow_buffer_like(
+            out_value, shape=(1, 1), block_count=2)
+        max_bc_dfb = ttl.make_dataflow_buffer_like(
+            values, shape=(1, K_block), block_count=2)
+
+        v2_dfb = ttl.make_dataflow_buffer_like(
+            values, shape=(1, K_block), block_count=2)
+        i_dfb = ttl.make_dataflow_buffer_like(
+            indices, shape=(1, K_block), block_count=2)
+        i_filt_dfb = ttl.make_dataflow_buffer_like(
+            indices, shape=(1, K_block), block_count=2)
+        tile_argmax_dfb = ttl.make_dataflow_buffer_like(
+            out_index, shape=(1, 1), block_count=2)
+        run_argmax_dfb = ttl.make_dataflow_buffer_like(
+            out_index, shape=(1, 1), block_count=2)
+
+        ov_dfb = ttl.make_dataflow_buffer_like(out_value, shape=(1, 1), block_count=2)
+        oi_dfb = ttl.make_dataflow_buffer_like(out_index, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            s = s_dfb.wait()
+
+            with run_max_dfb.reserve() as init_rm:
+                init_rm.store(ttl.math.fill(init_rm, -1.0e9))
+
+            for _ in range(NUM_ITERS):
+                v = v1_dfb.wait()
+                rm = run_max_dfb.wait()
+                tm = tile_max_dfb.reserve()
+                tm.store(ttl.math.reduce_max(v, s, dims=[0, 1]))
+                tm_blk = tile_max_dfb.wait()
+                new_rm = run_max_dfb.reserve()
+                new_rm.store(ttl.math.max(rm, tm_blk))
+
+            final_rm = run_max_dfb.wait()
+            mg = max_global_dfb.reserve()
+            mg.store(ttl.math.max(final_rm, final_rm))
+            mg_blk = max_global_dfb.wait()
+
+            mgbc = max_bc_dfb.reserve()
+            mgbc.store(ttl.math.broadcast(mg_blk, mgbc, dims=[0, 1]))
+            mgbc_blk = max_bc_dfb.wait()
+
+            ov = ov_dfb.reserve()
+            ov.store(ttl.math.max(mg_blk, mg_blk))
+
+            with run_argmax_dfb.reserve() as init_ra:
+                init_ra.store(ttl.math.fill(init_ra, -1.0e9))
+
+            for _ in range(NUM_ITERS):
+                v = v2_dfb.wait()
+                i = i_dfb.wait()
+                ra = run_argmax_dfb.wait()
+                with i_filt_dfb.reserve() as ifilt:
+                    ifilt.store(
+                        ttl.add(
+                            i,
+                            ttl.mul(
+                                ttl.math.sign(ttl.sub(v, mgbc_blk)),
+                                ttl.math.fill(ifilt, BIG),
+                            ),
+                        )
+                    )
+                ifilt_blk = i_filt_dfb.wait()
+                ta = tile_argmax_dfb.reserve()
+                ta.store(ttl.math.reduce_max(ifilt_blk, s, dims=[0, 1]))
+                ta_blk = tile_argmax_dfb.wait()
+                new_ra = run_argmax_dfb.reserve()
+                new_ra.store(ttl.math.max(ra, ta_blk))
+
+            final_ra = run_argmax_dfb.wait()
+            oi = oi_dfb.reserve()
+            oi.store(ttl.math.max(final_ra, final_ra))
+
+        @ttl.datamovement()
+        def dm_read():
+            blk = s_dfb.reserve()
+            ttl.copy(scaler[0, 0], blk).wait()
+            for it in range(NUM_ITERS):
+                blk = v1_dfb.reserve()
+                ttl.copy(values[0:1, it * K_block:(it + 1) * K_block], blk).wait()
+            for it in range(NUM_ITERS):
+                blk = v2_dfb.reserve()
+                ttl.copy(values[0:1, it * K_block:(it + 1) * K_block], blk).wait()
+                blk = i_dfb.reserve()
+                ttl.copy(indices[0:1, it * K_block:(it + 1) * K_block], blk).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            blk = ov_dfb.wait()
+            ttl.copy(blk, out_value[0, 0]).wait()
+            blk = oi_dfb.wait()
+            ttl.copy(blk, out_index[0, 0]).wait()
+
+    return argmax_2pass
+
+
 def _pack_hc_base_tile(hc_base: torch.Tensor) -> torch.Tensor:
     """[1, mhc] fp32 -> [TILE, TILE] fp32 with cols 0..mhc-1 broadcast across
     all rows and cols mhc..TILE-1 = 0. Cols 4..31 of pre/mixes are unused
@@ -389,6 +577,13 @@ def make_final_kernel(mesh, debug_state=None):
     lmhead_summa = _make_summa_matmul_kernel(
         M=TILE, K=DIM, N=VOCAB,
         block_cfg=(1, 8, 4), part_cfg=(1, 5, 1))
+
+    # Argmax over full padded vocab. Multi-core ttnn.argmax (variant B from
+    # argmax_2pass.py) + ttnn.max replaces ttnn.topk(k=1). The tt-lang
+    # 2-pass kernel works at NUM_ITERS=4 (per-chip slice) but loses
+    # within-tile resolution at NUM_ITERS=127 (full vocab on one chip).
+    n_valid_tiles = VOCAB // TILE                          # 4040
+    n_total_tiles = n_valid_tiles  # no extra padding needed for ttnn.argmax
 
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -444,18 +639,21 @@ def make_final_kernel(mesh, debug_state=None):
         lmhead_summa(state["y_normed_padded"], w_lmhead_tt,
                      state["logits_padded"])
 
-        # 5. Slice down + topk(k=1).
-        # TODO: mega fusion blocked: ttnn used for topk (no tt-lang topk).
-        logits = ttnn.slice(state["logits_padded"], [0, 0], [1, VOCAB])
-        logits_3d = ttnn.reshape(logits, [1, 1, VOCAB])
-        vals_tt, idxs_tt = ttnn.topk(
-            logits_3d, k=1, dim=-1, largest=True, sorted=True)
+        # 5. Argmax over [TILE, VOCAB]: layout-flip to ROW_MAJOR, run
+        #    multi-core argmax for the index, ttnn.max in TILE for the
+        #    value. ~7.5x faster than naive single-core argmax (variant B
+        #    from argmax_2pass.py docstring).
+        logits_rm = ttnn.to_layout(state["logits_padded"],
+                                   layout=ttnn.ROW_MAJOR_LAYOUT)
+        top_idx = ttnn.argmax(logits_rm, dim=-1, keepdim=True,
+                              use_multicore=True)
+        top_val = ttnn.max(state["logits_padded"], dim=-1, keepdim=True)
 
         debug_state["pre_tile"] = state["pre_tile"]
         debug_state["y_padded"] = state["y_padded"]
         debug_state["y_normed_padded"] = state["y_normed_padded"]
         debug_state["logits_padded"] = state["logits_padded"]
-        return vals_tt, idxs_tt
+        return top_val, top_idx
 
     return final_kernel
 
@@ -598,6 +796,17 @@ def main():
         print(f"[Final/top_val] {status_v} ref={ref_v:.6f} kernel={k_v:.6f} "
               f"abs_diff={val_diff:.4e}")
         print(f"[Final/top_idx] {status_i} ref={ref_i} kernel={k_i}")
+
+        benchmark("Final ref",
+                  lambda: reference(mesh, a_tt, hc_fn_t_tt, hc_scale_ref,
+                                    hc_base_ref, norm_gamma_tt, w_lmhead_tt),
+                  mesh)
+        benchmark("Final ttl",
+                  lambda: kernel(a_tt, hc_fn_t_scaled_tt, scaler_fp32_tt,
+                                 hc_base_tile_tt, norm_gamma_packed_tt,
+                                 scaler_bf16_tt, w_lmhead_tt),
+                  mesh)
+
         sys.exit(0 if (ok_v and ok_i) else 1)
     finally:
         close_mesh(mesh)

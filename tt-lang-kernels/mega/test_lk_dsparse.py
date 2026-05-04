@@ -24,7 +24,6 @@ ttnn glue (TODO: mega):
     typecast int32->uint32 + to_layout (no tt-lang int compares /
     layout converts)
   - embedding gather (no tt-lang gather)
-  - transpose(kv_gather, -2, -1) for the score matmul B operand
   - softmax_scale multiply (could fold into pre-scaled kv on host but
     kv changes per step)
   - concat sink, softmax, slice (no tt-lang softmax)
@@ -332,14 +331,14 @@ def _make_summa_matmul_scale_mask_kernel(M: int, K_dim: int, N: int,
                                           block_cfg, part_cfg,
                                           scale: float, mask_amp: float,
                                           fp32_dest_acc_en: bool = True):
-    """SUMMA matmul fused with scale + sign-trick mask.
+    """SUMMA matmul out = a @ b.T fused with scale + sign-trick mask.
 
-      masked[m, n] = (a @ w)[m, n] * scale +
+      masked[m, n] = (a @ w.T)[m, n] * scale +
                      (sign(idx[0, n] + 0.5) - 1) * (mask_amp / 2)
 
-    Each (m_p, n_p) core accumulates its (bm, bn) tile, then applies the
-    scale and additive mask in compute and writes masked from dm_write.
-    idx tile depends only on n; mcast across Mp like B.
+    B operand is stored as [N, K_dim] (not [K_dim, N]); each block of b
+    is read transposed and ttl.transpose'd before the inner matmul. This
+    folds an external ttnn.transpose(b, -2, -1) on the score path.
     """
     half_amp = mask_amp / 2.0
     bm, bn, bk = block_cfg
@@ -371,7 +370,8 @@ def _make_summa_matmul_scale_mask_kernel(M: int, K_dim: int, N: int,
         mcast_idx_net = ttl.PipeNet(idx_pipes)
 
         a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
-        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bn, bk), block_count=2)
+        bt_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
         idx_cb = ttl.make_dataflow_buffer_like(
             idx, shape=(1, bn), block_count=2)
         raw_cb = ttl.make_dataflow_buffer_like(
@@ -389,7 +389,9 @@ def _make_summa_matmul_scale_mask_kernel(M: int, K_dim: int, N: int,
                     for _ in range(Kb):
                         a_blk = a_cb.wait()
                         b_blk = b_cb.wait()
-                        p += a_blk @ b_blk
+                        with bt_cb.reserve() as bt:
+                            bt.store(ttl.transpose(b_blk))
+                        p += a_blk @ bt_cb.wait()
                     r = raw_cb.wait()
                     i = idx_cb.wait()
                     mask_scratch.reserve().store(
@@ -433,7 +435,7 @@ def _make_summa_matmul_scale_mask_kernel(M: int, K_dim: int, N: int,
                         b_blk = b_cb.reserve()
 
                         def read_b(pipe):
-                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                            ttl.copy(w[nc:nc + bn, kc:kc + bk], b_blk).wait()
                             ttl.copy(b_blk, pipe).wait()
 
                         mcast_b_net.if_src(read_b)
@@ -795,17 +797,15 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         kv_gather = ttnn.embedding(idxs_tt, kv_full_tt, layout=ttnn.TILE_LAYOUT)
         kv_gather_4d = ttnn.reshape(kv_gather, [B, S, K, D])
 
-        # 4. Transpose for score matmul B operand.
-        # TODO: mega fusion blocked: ttnn used for transpose(kv_gather, -2, -1).
-        # Lowering needs a tt-lang within-tile transpose (or store kv_cache
-        # transposed upstream).
-        kv_gather_t_4d = ttnn.transpose(kv_gather_4d, -2, -1)
-        kv_gather_t_2d = ttnn.reshape(kv_gather_t_4d, [D, K])
+        # 4. (Removed ttnn.transpose - folded into score matmul as B-transpose.)
 
         # 5. SUMMA score fused with scale + sign-trick mask.
-        # masked = (q @ kv_gather_t) * softmax_scale + sign_mask(idx).
+        # masked = (q @ kv_gather.T) * softmax_scale + sign_mask(idx).
+        # The score matmul is built with B-transpose: kv_gather is passed
+        # in its natural [K, D] layout, transposed per-block in compute.
+        kv_gather_2d = ttnn.reshape(kv_gather_4d, [K, D])
         q_2d = ttnn.reshape(q_tt, [H, D])
-        matmul_score_scale_mask(q_2d, kv_gather_t_2d, topk_padded_in,
+        matmul_score_scale_mask(q_2d, kv_gather_2d, topk_padded_in,
                                 state["scores_masked_padded"])
 
         # 7. Fused softmax over [scores | sink] with sink dropped. Replaces
@@ -815,7 +815,7 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
             state["probs"])
 
         # 8. SUMMA output: probs [H, K] @ kv_gather [K, D] -> o [H, D].
-        kv_gather_2d = ttnn.reshape(kv_gather_4d, [K, D])
+        # Reuses kv_gather_2d from step 5.
         matmul_output(state["probs"], kv_gather_2d, state["o_padded"])
 
         # 9. Inverse rotary on o[..., -rd:] via swap-SUMMA + rotary-combine.
