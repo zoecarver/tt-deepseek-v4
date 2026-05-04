@@ -259,10 +259,10 @@ def make_lk_b_kernel(mesh, gamma_cpu, wq_b_cpu):
     state: dict = {}
     M_PAD = TILE
     # KSPLIT: M=32, K=1024, N=32768. Mt=1, Kt=32, Nt=1024.
-    # block=(1, 8, 4) part=(1, 8, 8) -> Nb=128, N_BPN=16, Kb=8 K_BPN=1 (64 cores).
+    # block=(1, 16, 4) part=(1, 8, 8) -> Nb=64, N_BPN=8, Kb=8 K_BPN=1 (64 cores).
     fused_kernel = _make_fused_rms_ksplit_kernel(
         M=M_PAD, K=Q_LORA_RANK, N=N,
-        block_cfg=(1, 8, 4), part_cfg=(1, 8, 8),
+        block_cfg=(1, 16, 4), part_cfg=(1, 8, 8),
         rms_eps=NORM_EPS,
     )
 
