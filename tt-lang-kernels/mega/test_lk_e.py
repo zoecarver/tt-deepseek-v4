@@ -53,7 +53,15 @@ NORM_FN_KP = 8
 
 def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
                                     rms_eps: float, inv_D: float,
-                                    *, grid_cols: int = 8):
+                                    *, grid_cols: int = 8,
+                                    bk: int = 2):
+    """K-split rmsnorm + matmul: a (1, K_tiles) @ b (K_tiles, 1) -> out (1, 1).
+
+    Each core handles K_BPN=K_tiles/Kp K-tiles, batched in BK=bk-tile
+    chunks. a_cb shape=(1, BK), b_cb shape=(BK, 1) -> a @ b is one
+    SUMMA accumulation per BK block. xsq is (1, BK), reduce_sum
+    dim=[1] collapses both within-tile cols AND across BK tile-cols.
+    """
     if Kp < 2:
         raise ValueError(f"ksplit kernel requires Kp >= 2, got {Kp}")
     if K_tiles % Kp:
@@ -64,6 +72,9 @@ def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
         raise ValueError(f"Kp={Kp} not divisible by grid_cols={grid_cols}")
 
     K_BPN = K_tiles // Kp
+    if K_BPN % bk:
+        raise ValueError(f"K_BPN={K_BPN} not divisible by bk={bk}")
+    K_NB = K_BPN // bk
     COL = grid_cols
     ROW = Kp // grid_cols
 
@@ -88,14 +99,14 @@ def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
         ]
         sq_reduce_net = ttl.PipeNet(sq_reduce_pipes)
 
-        a_cb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
-        b_cb = ttl.make_dataflow_buffer_like(b, shape=(1, 1), block_count=2)
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(1, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(b, shape=(bk, 1), block_count=2)
         sc_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
         out_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
         c_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
         sq_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
         inv_bc_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
-        asq_cb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), block_count=2)
+        asq_cb = ttl.make_dataflow_buffer_like(a, shape=(1, bk), block_count=2)
         red_step_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
         recv_c_cb = ttl.make_dataflow_buffer_like(
             out, shape=(1, 1), block_count=max(2, Kp - 1))
@@ -113,11 +124,11 @@ def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
             sq_cb.reserve().store(
                 ttl.math.reduce_sum(asq_cb.wait(), sc, dims=[1])
             )
-            for _ in range(K_BPN - 1):
+            for _ in range(K_NB - 1):
                 ak = a_cb.wait()
-                bk = b_cb.wait()
+                bk_blk = b_cb.wait()
                 prev_c = c_cb.wait()
-                c_cb.reserve().store(prev_c + ak @ bk)
+                c_cb.reserve().store(prev_c + ak @ bk_blk)
                 asq_cb.reserve().store(ak * ak)
                 red_step_cb.reserve().store(
                     ttl.math.reduce_sum(asq_cb.wait(), sc, dims=[1])
@@ -152,10 +163,10 @@ def _make_mhc_norm_fn_ksplit_kernel(K_tiles: int, Kp: int,
             col_c, row_c = ttl.node(dims=2)
             k_p = row_c * COL + col_c
             ttl.copy(scaler[0, 0], sc_cb.reserve()).wait()
-            for kb_local in range(K_BPN):
-                kc = k_p * K_BPN + kb_local
-                ttl.copy(a[0, kc], a_cb.reserve()).wait()
-                ttl.copy(b[kc, 0], b_cb.reserve()).wait()
+            for kb_local in range(K_NB):
+                kc = (k_p * K_NB + kb_local) * bk
+                ttl.copy(a[0:1, kc:kc + bk], a_cb.reserve()).wait()
+                ttl.copy(b[kc:kc + bk, 0:1], b_cb.reserve()).wait()
             is_root = (col_c == 0 and row_c == 0)
             if is_root:
                 def recv_c(pipe):
