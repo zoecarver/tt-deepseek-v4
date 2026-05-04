@@ -246,10 +246,10 @@ def make_lk_d_idx_score_kernel(mesh):
     T = T_PAD
 
     # SUMMA1: M=TILE, K=4096, N=H=64. Mt=1, Kt=128, Nt=2.
-    # block=(1, 1, 4) part=(1, 2, 1) -> 2 cores (Nb=2, M_BPN=N_BPN=1, Kb=32).
+    # block=(1, 1, 8) part=(1, 2, 1) -> 2 cores (Nb=2, M_BPN=N_BPN=1, Kb=16).
     matmul_wproj_kernel = _make_summa_matmul_kernel(
         M=TILE, K=DIM, N=H,
-        block_cfg=(1, 1, 4), part_cfg=(1, 2, 1))
+        block_cfg=(1, 1, 8), part_cfg=(1, 2, 1))
 
     # SUMMA2: M=H=64, K=d=128, N=T=128. Mt=2, Kt=4, Nt=4.
     # block=(1, 2, 4) part=(2, 2, 1) -> 4 cores (Mb=2, Nb=2, M_BPN=N_BPN=1, Kb=1).
