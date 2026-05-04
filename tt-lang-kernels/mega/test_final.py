@@ -164,110 +164,25 @@ def _make_hc_combiner_kernel(num_out_tiles: int, K_tiles: int,
     return hc_combiner_kernel
 
 
-def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
-                         rms_eps: float, inv_D: float):
-    """Inlined from inference._compile_rmsnorm_kernel."""
+def _make_fused_rms_ksplit_kernel(M: int, K: int, N: int,
+                                  block_cfg, part_cfg,
+                                  rms_eps: float,
+                                  fp32_dest_acc_en: bool = True):
+    """Fused rmsnorm(x, gamma) @ Wg as a single ttl.operation.
 
-    @ttl.operation(
-        grid="auto",
-        options="--no-ttl-reduce-full-fp32",
-        fp32_dest_acc_en=True,
-    )
-    def rmsnorm_kernel(x, gamma, scaler, out):
-        grid_cols, grid_rows = ttl.grid_size(dims=2)
-        total_cores = grid_rows * grid_cols
-        tiles_per_core = -(-num_row_tiles // total_cores)
+    Same lowering as test_lk_b's fused kernel. Wg = gamma[:, None] * W is
+    pre-baked on host. Each (n_p, k_p) core accumulates its K_BPN matmul
+    partial AND its K_BPN ssq partial. The ssq is reduced across k_p via a
+    parallel PipeNet; only k_p=0 finalizes inv = rsqrt(ssq/D + eps), applies
+    it to the reduced matmul output, and writes. Mp = 1.
 
-        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        g_dfb = ttl.make_dataflow_buffer_like(gamma, shape=(1, 1), block_count=2)
-        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
-
-        sq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        xsq_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        red_step_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        inv_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-
-        @ttl.compute()
-        def compute():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            sc = sc_dfb.wait()
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_row_tiles:
-                    x0 = x_dfb.wait()
-                    xsq_dfb.reserve().store(x0 * x0)
-                    sq_dfb.reserve().store(
-                        ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
-                    )
-                    for _ in range(h_tiles - 1):
-                        xk = x_dfb.wait()
-                        xsq_dfb.reserve().store(xk * xk)
-                        red_step_dfb.reserve().store(
-                            ttl.math.reduce_sum(xsq_dfb.wait(), sc, dims=[1])
-                        )
-                        prev = sq_dfb.wait()
-                        sq_dfb.reserve().store(prev + red_step_dfb.wait())
-
-                    sq = sq_dfb.wait()
-                    inv_bc = inv_bc_dfb.reserve()
-                    inv_bc.store(ttl.math.broadcast(
-                        ttl.math.rsqrt(
-                            sq * ttl.math.fill(sq, inv_D)
-                            + ttl.math.fill(sq, rms_eps)
-                        ),
-                        inv_bc, dims=[1],
-                    ))
-                    inv = inv_bc_dfb.wait()
-
-                    for _ in range(h_tiles):
-                        xk = x_dfb.wait()
-                        gk = g_dfb.wait()
-                        out_dfb.reserve().store(xk * gk * inv)
-
-        @ttl.datamovement()
-        def dm_read():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_row_tiles:
-                    for h in range(h_tiles):
-                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
-                    for h in range(h_tiles):
-                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
-                        ttl.copy(gamma[0, h], g_dfb.reserve()).wait()
-
-        @ttl.datamovement()
-        def dm_write():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_row_tiles:
-                    for h in range(h_tiles):
-                        ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
-
-    return rmsnorm_kernel
-
-
-def _make_ksplit_matmul_kernel(M: int, K: int, N: int,
-                               block_cfg, part_cfg,
-                               fp32_dest_acc_en: bool = True):
-    """SUMMA matmul with K-split on the row axis. grid=(Np, Kp), Mp=1.
-
-    K is split across Kp row cores; each core accumulates its K-slice partial
-    sum, then non-root rows (k_p > 0) ship partials to root (k_p == 0) for
-    summation and write-out. M is fixed at one bm-block (Mp implicit = 1).
-    Mirrors tt-lang/benchmarks/matmul/ksplit_kernel.py with the row axis
-    repurposed for Kp (since this matmul has Mt=1, Mp must be 1).
+    Constrained to K_BPN = 1 here because the only known-good test_lk_b
+    config is K_BPN=1; K_BPN > 1 cases hung at dispatch when tried.
     """
     bm, bn, bk = block_cfg
     Mp, Np, Kp = part_cfg
     if Mp != 1:
-        raise ValueError(f"ksplit kernel here assumes Mp=1, got {Mp}")
+        raise ValueError(f"fused ksplit assumes Mp=1, got {Mp}")
     if Kp < 2:
         raise ValueError(f"K_parts must be >= 2, got {Kp}")
     Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
@@ -281,76 +196,147 @@ def _make_ksplit_matmul_kernel(M: int, K: int, N: int,
             f"block/part mismatch: Mb={Mb} Nb={Nb} Kb={Kb} Np={Np} Kp={Kp}")
     N_BPN = Nb // Np
     K_BPN = Kb // Kp
+    if K_BPN != 1:
+        raise ValueError(
+            f"fused rms+ksplit only supports K_BPN=1 (got {K_BPN}); pick "
+            f"bk so Kt/bk == Kp")
+    inv_D = 1.0 / float(K)
 
-    @ttl.operation(grid=(Np, Kp), fp32_dest_acc_en=fp32_dest_acc_en)
-    def ksplit_matmul(a, w, out):
-        # A mcast within a row: col 0 of each row sources its K-slice and
-        # mcasts across that row's Np cols. Each row has a different K-slice.
+    @ttl.operation(
+        grid=(Np, Kp),
+        fp32_dest_acc_en=fp32_dest_acc_en,
+        options="--no-ttl-reduce-full-fp32",
+    )
+    def fused_kernel(a, w_g, scaler, out):
         a_pipes = [ttl.Pipe(src=(0, k_p), dst=(slice(0, Np), k_p))
                    for k_p in range(Kp)]
         mcast_a_net = ttl.PipeNet(a_pipes)
-        # B is unicast (each (n_p, k_p) reads its own kc-slice). No mcast.
-        # Reduction: non-root rows (k_p>=1) send partials to root (k_p=0).
         reduce_pipes = [ttl.Pipe(src=(n_p, k_p), dst=(n_p, 0))
                         for n_p in range(Np) for k_p in range(1, Kp)]
         reduce_net = ttl.PipeNet(reduce_pipes)
+        ssq_reduce_pipes = [ttl.Pipe(src=(n_p, k_p), dst=(n_p, 0))
+                            for n_p in range(Np) for k_p in range(1, Kp)]
+        ssq_reduce_net = ttl.PipeNet(ssq_reduce_pipes)
 
         a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
-        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(w_g, shape=(bk, bn), block_count=2)
         partial_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
         recv_cb = ttl.make_dataflow_buffer_like(
             out, shape=(bm, bn), block_count=max(2, Kp - 1))
         out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
 
+        sc_cb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        xsq_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
+        ssq_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, 1), block_count=2)
+        ssq_recv_cb = ttl.make_dataflow_buffer_like(
+            a, shape=(bm, 1), block_count=max(2, Kp - 1))
+        inv_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, 1), block_count=2)
+        inv_bc_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
+
         @ttl.compute()
         def compute():
             _, row_c = ttl.node(dims=2)
-            for _ in range(N_BPN):
-                p = partial_cb.reserve()
-                for _ in range(K_BPN):
-                    a_blk = a_cb.wait()
-                    b_blk = b_cb.wait()
-                    p += a_blk @ b_blk
+            sc = sc_cb.wait()
 
-                if row_c == 0:
+            # First N output block: matmul partial + ssq partial fused.
+            a0 = a_cb.wait()
+            b0 = b_cb.wait()
+            partial_cb.reserve().store(a0 @ b0)
+            xsq_cb.reserve().store(a0 * a0)
+            ssq_cb.reserve().store(
+                ttl.math.reduce_sum(xsq_cb.wait(), sc, dims=[1])
+            )
+
+            if row_c == 0:
+                # Cross-row reduce of acc partials.
+                for _ in range(Kp - 1):
+                    prev = partial_cb.wait()
+                    r = recv_cb.wait()
+                    partial_cb.reserve().store(prev + r)
+                # Cross-row reduce of ssq partials.
+                for _ in range(Kp - 1):
+                    prev_ssq = ssq_cb.wait()
+                    r_ssq = ssq_recv_cb.wait()
+                    ssq_cb.reserve().store(prev_ssq + r_ssq)
+                # Finalize inv_rms.
+                sq = ssq_cb.wait()
+                inv_t = inv_cb.reserve()
+                inv_t.store(ttl.math.broadcast(
+                    ttl.math.rsqrt(
+                        sq * ttl.math.fill(sq, inv_D)
+                        + ttl.math.fill(sq, rms_eps)
+                    ),
+                    inv_t, dims=[1],
+                ))
+                inv_bc_t = inv_bc_cb.reserve()
+                inv_bc_t.store(ttl.math.broadcast(
+                    inv_cb.wait(), inv_bc_t, dims=[1]
+                ))
+                inv = inv_bc_cb.wait()  # held across the N loop below.
+
+                acc_done = partial_cb.wait()
+                out_cb.reserve().store(acc_done * inv)
+
+                # Subsequent N blocks: matmul + reduce + apply inv.
+                for _ in range(N_BPN - 1):
+                    a0n = a_cb.wait()
+                    b0n = b_cb.wait()
+                    partial_cb.reserve().store(a0n @ b0n)
                     for _ in range(Kp - 1):
                         prev = partial_cb.wait()
                         r = recv_cb.wait()
-                        new = partial_cb.reserve()
-                        new.store(prev + r)
-                    final = partial_cb.wait()
-                    o = out_cb.reserve()
-                    o.store(final)
+                        partial_cb.reserve().store(prev + r)
+                    acc_n = partial_cb.wait()
+                    out_cb.reserve().store(acc_n * inv)
+            else:
+                # Non-root: produce remaining N_BPN-1 partial matmuls; the
+                # first was already produced above and dm_read sends each.
+                for _ in range(N_BPN - 1):
+                    a0n = a_cb.wait()
+                    b0n = b_cb.wait()
+                    partial_cb.reserve().store(a0n @ b0n)
 
         @ttl.datamovement()
         def dm_read():
+            ttl.copy(scaler[0, 0], sc_cb.reserve()).wait()
             _, row_c = ttl.node(dims=2)
-            for _ in range(N_BPN):
-                for kb_local in range(K_BPN):
-                    kc = (row_c * K_BPN + kb_local) * bk
-                    a_blk = a_cb.reserve()
 
-                    def read_a(pipe):
-                        ttl.copy(a[0:bm, kc:kc + bk], a_blk).wait()
-                        ttl.copy(a_blk, pipe).wait()
+            for n_idx in range(N_BPN):
+                kc = row_c * bk
+                a_blk = a_cb.reserve()
 
-                    mcast_a_net.if_src(read_a)
-                    mcast_a_net.if_dst(
-                        lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+                def read_a(pipe):
+                    ttl.copy(a[0:bm, kc:kc + bk], a_blk).wait()
+                    ttl.copy(a_blk, pipe).wait()
+
+                mcast_a_net.if_src(read_a)
+                mcast_a_net.if_dst(
+                    lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
 
                 if row_c == 0:
-                    def recv(pipe):
+                    def recv_acc(pipe):
                         r = recv_cb.reserve()
                         ttl.copy(pipe, r).wait()
-
-                    reduce_net.if_dst(recv)
+                    reduce_net.if_dst(recv_acc)
                 else:
                     p = partial_cb.wait()
 
-                    def send(pipe):
+                    def send_acc(pipe):
                         ttl.copy(p, pipe).wait()
+                    reduce_net.if_src(send_acc)
 
-                    reduce_net.if_src(send)
+                if n_idx == 0:
+                    if row_c == 0:
+                        def recv_ssq(pipe):
+                            r = ssq_recv_cb.reserve()
+                            ttl.copy(pipe, r).wait()
+                        ssq_reduce_net.if_dst(recv_ssq)
+                    else:
+                        ssq = ssq_cb.wait()
+
+                        def send_ssq(pipe):
+                            ttl.copy(ssq, pipe).wait()
+                        ssq_reduce_net.if_src(send_ssq)
 
         @ttl.datamovement()
         def dm_write():
@@ -358,15 +344,14 @@ def _make_ksplit_matmul_kernel(M: int, K: int, N: int,
             for local_nb in range(N_BPN):
                 nb = col_c * N_BPN + local_nb
                 nc = nb * bn
-                for kb_local in range(K_BPN):
-                    kc = (row_c * K_BPN + kb_local) * bk
-                    b_blk = b_cb.reserve()
-                    ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                kc = row_c * bk
+                b_blk = b_cb.reserve()
+                ttl.copy(w_g[kc:kc + bk, nc:nc + bn], b_blk).wait()
                 if row_c == 0:
                     o = out_cb.wait()
                     ttl.copy(o, out[0:bm, nc:nc + bn]).wait()
 
-    return ksplit_matmul
+    return fused_kernel
 
 
 def _pack_hc_base_tile(hc_base: torch.Tensor) -> torch.Tensor:
@@ -398,27 +383,25 @@ def _pack_hc_fn_t_scaled(hc_fn: torch.Tensor, hc_scale: torch.Tensor) -> torch.T
 
 
 def make_final_kernel(mesh, debug_state=None):
-    """Mega kernel for Final = hc_combiner + final RMSNorm + lm_head + topk(k=1).
+    """Mega kernel for Final = hc_combiner + fused(RMSNorm + lm_head) + topk(k=1).
 
-    Three tt-lang dispatches (hc_combiner + rmsnorm + SUMMA) + ttnn glue
+    Two tt-lang dispatches (hc_combiner + fused-rms-ksplit) + ttnn glue
     for the sub-tile reshape/typecast/topk steps.
     """
     inv_D_combiner = 1.0 / float(D)        # mhc*hidden = 16384
-    inv_D_norm = 1.0 / float(DIM)          # hidden     = 4096
     K_tiles_combiner = D // TILE           # 512
-    h_tiles_norm = DIM // TILE             # 128
 
     hc_combiner = _make_hc_combiner_kernel(
         num_out_tiles=1, K_tiles=K_tiles_combiner,
         rms_eps=NORM_EPS, inv_D=inv_D_combiner, hc_eps=HC_EPS)
-    rmsnorm = _make_rmsnorm_kernel(
-        num_row_tiles=1, h_tiles=h_tiles_norm,
-        rms_eps=NORM_EPS, inv_D=inv_D_norm)
-    # KSPLIT lm_head: M=TILE, K=4096, N=129280. Mt=1, Kt=128, Nt=4040.
-    # block=(1, 4, 4) part=(1, 10, 8) -> Nb=1010, Kb=32, K_BPN=4 (80 cores).
-    lmhead_summa = _make_ksplit_matmul_kernel(
+    # Fused rmsnorm + KSPLIT lm_head. M=TILE, K=4096, N=129280.
+    # Mt=1, Kt=128, Nt=4040. block=(1, 4, 16) part=(1, 10, 8) -> Nb=1010,
+    # Kb=8, K_BPN=1 (80 cores). Wg = gamma[:, None] * W_lmhead pre-baked
+    # on host. K_BPN=1 is required (see factory docstring).
+    fused_rms_ksplit = _make_fused_rms_ksplit_kernel(
         M=TILE, K=DIM, N=VOCAB,
-        block_cfg=(1, 4, 4), part_cfg=(1, 10, 8))
+        block_cfg=(1, 4, 16), part_cfg=(1, 10, 8),
+        rms_eps=NORM_EPS)
 
     # Argmax over full padded vocab. Multi-core ttnn.argmax (variant B from
     # argmax_2pass.py) + ttnn.max replaces ttnn.topk(k=1).
@@ -439,15 +422,12 @@ def make_final_kernel(mesh, debug_state=None):
         debug_state = {}
 
     def final_kernel(a_bf16_tt, hc_fn_t_scaled_tt, hc_base_tile_tt,
-                     norm_gamma_packed_tt, scaler_bf16_tt, w_lmhead_tt):
+                     scaler_bf16_tt, w_baked_tt):
         if "init" not in state:
             state["pre_tile"] = ttnn.from_torch(
                 torch.zeros(TILE, TILE, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
             state["y_padded"] = ttnn.from_torch(
-                torch.zeros(TILE, DIM, dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
-            state["y_normed_padded"] = ttnn.from_torch(
                 torch.zeros(TILE, DIM, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
             state["logits_padded"] = ttnn.from_torch(
@@ -478,15 +458,13 @@ def make_final_kernel(mesh, debug_state=None):
                                value=0.0)
         ttnn.copy(y_padded_in, state["y_padded"])
 
-        # 3. RMSNorm on padded [TILE, hidden] bf16 (only row 0 carries data).
-        rmsnorm(state["y_padded"], norm_gamma_packed_tt, scaler_bf16_tt,
-                state["y_normed_padded"])
+        # 3. Fused RMSNorm + KSPLIT lm_head: gamma is pre-baked into
+        #    w_baked, and the kernel emits logits [TILE, vocab] directly
+        #    (row 0 valid).
+        fused_rms_ksplit(state["y_padded"], w_baked_tt, scaler_bf16_tt,
+                         state["logits_padded"])
 
-        # 4. SUMMA lm_head matmul -> logits [TILE, vocab] (row 0 valid).
-        lmhead_summa(state["y_normed_padded"], w_lmhead_tt,
-                     state["logits_padded"])
-
-        # 5. Argmax over [TILE, VOCAB]: layout-flip to ROW_MAJOR, run
+        # 4. Argmax over [TILE, VOCAB]: layout-flip to ROW_MAJOR, run
         #    multi-core argmax for the index, ttnn.max in TILE for the
         #    value. ~7.5x faster than naive single-core argmax (variant B
         #    from argmax_2pass.py docstring).
@@ -498,7 +476,6 @@ def make_final_kernel(mesh, debug_state=None):
 
         debug_state["pre_tile"] = state["pre_tile"]
         debug_state["y_padded"] = state["y_padded"]
-        debug_state["y_normed_padded"] = state["y_normed_padded"]
         debug_state["logits_padded"] = state["logits_padded"]
         return top_val, top_idx
 
@@ -543,7 +520,9 @@ def reference(mesh, a_tt, hc_fn_t_tt, hc_scale_tt, hc_base_tt,
 
 def main():
     torch.manual_seed(0)
-    mesh = open_mesh()
+    # Larger kernel_config_extra_bytes: the fused rms+ksplit program
+    # exceeds the default ~70KB kernel-config buffer (see test_lk_b).
+    mesh = open_mesh(kernel_config_extra_bytes=128 * 1024)
     mesh_shape = tuple(mesh.shape)
     try:
         a = torch.randn(NUM_TOKENS_PAD, D, dtype=torch.float32) * 0.1
@@ -583,11 +562,14 @@ def main():
         # Kernel inputs: hc_fn_t pre-scaled by hc_scale (folded into b).
         # bf16 across the board: a_tt demoted at offload so the combiner
         # reads bf16 and the prologue matmul output stays bf16 (no typecast).
+        # Pre-bake norm_gamma into w_lmhead so the fused rms+ksplit kernel
+        # treats gamma as part of the weight (Wg[k,n] = gamma[k]*W[k,n]).
         a_bf16 = a.to(torch.bfloat16)
         hc_fn_t_scaled = _pack_hc_fn_t_scaled(hc_fn, hc_scale)
         hc_base_tile = _pack_hc_base_tile(hc_base)
-        norm_gamma_packed = norm_gamma.unsqueeze(0).expand(TILE, -1).contiguous()
         scaler_bf16 = torch.ones(TILE, TILE, dtype=torch.bfloat16)
+        w_baked = (norm_gamma.float()[:, None] * w_lmhead.float()) \
+            .to(torch.bfloat16).contiguous()
 
         a_bf16_tt = ttnn.as_tensor(
             a_bf16.contiguous(), dtype=ttnn.bfloat16, **rep)
@@ -595,36 +577,33 @@ def main():
             hc_fn_t_scaled.contiguous(), dtype=ttnn.bfloat16, **rep)
         hc_base_tile_tt = ttnn.as_tensor(
             hc_base_tile.contiguous(), dtype=ttnn.bfloat16, **rep)
-        norm_gamma_packed_tt = ttnn.as_tensor(
-            norm_gamma_packed.contiguous(), dtype=ttnn.bfloat16, **rep)
         scaler_bf16_tt = ttnn.as_tensor(
             scaler_bf16.contiguous(), dtype=ttnn.bfloat16, **rep)
+        w_baked_tt = ttnn.as_tensor(
+            w_baked, dtype=ttnn.bfloat16, **rep)
 
         kernel_debug = {}
         kernel = make_final_kernel(mesh, debug_state=kernel_debug)
         top_val_out_tt, top_idx_out_tt = kernel(
             a_bf16_tt, hc_fn_t_scaled_tt, hc_base_tile_tt,
-            norm_gamma_packed_tt, scaler_bf16_tt, w_lmhead_tt)
+            scaler_bf16_tt, w_baked_tt)
         kernel_vals_host = download_chip0(mesh, mesh_shape, top_val_out_tt)
         kernel_idxs_host = download_chip0(mesh, mesh_shape, top_idx_out_tt)
         k_pre_tile = download_chip0(mesh, mesh_shape, kernel_debug["pre_tile"])
         k_y_padded = download_chip0(mesh, mesh_shape, kernel_debug["y_padded"])
-        k_yn_padded = download_chip0(mesh, mesh_shape, kernel_debug["y_normed_padded"])
         k_logits_padded = download_chip0(mesh, mesh_shape, kernel_debug["logits_padded"])
 
-        # Compare each stage.
+        # Compare each stage. y_normed is no longer materialized (fused into
+        # the lmhead matmul) so stage3 is dropped.
         # ref_pre_host shape [1, MHC]; kernel pre_tile shape [TILE, TILE].
         k_pre = k_pre_tile[0:1, 0:MHC]
         report_pcc("stage1/pre", ref_pre_host.float(), k_pre.float())
         # ref_y_host shape [1, 1, hidden]; kernel y_padded shape [TILE, hidden] row 0.
         k_y = k_y_padded[0:1, :].reshape(1, 1, DIM)
         report_pcc("stage2/y_bf16", ref_y_host.float(), k_y.float())
-        # ref_yn_host shape [1, 1, hidden]; kernel y_normed_padded row 0.
-        k_yn = k_yn_padded[0:1, :].reshape(1, 1, DIM)
-        report_pcc("stage3/y_normed", ref_yn_host.float(), k_yn.float())
         # ref_logits_host shape [1, 1, vocab]; kernel logits_padded row 0.
         k_logits = k_logits_padded[0:1, :].reshape(1, 1, VOCAB)
-        report_pcc("stage4/logits", ref_logits_host.float(), k_logits.float())
+        report_pcc("stage3/logits", ref_logits_host.float(), k_logits.float())
         # Per-tensor abs argmax sanity.
         ref_argmax = int(ref_logits_host.flatten().argmax().item())
         k_argmax = int(k_logits.flatten().argmax().item())
@@ -652,8 +631,8 @@ def main():
                   mesh)
         benchmark("Final ttl",
                   lambda: kernel(a_bf16_tt, hc_fn_t_scaled_tt,
-                                 hc_base_tile_tt, norm_gamma_packed_tt,
-                                 scaler_bf16_tt, w_lmhead_tt),
+                                 hc_base_tile_tt,
+                                 scaler_bf16_tt, w_baked_tt),
                   mesh)
 
         sys.exit(0 if (ok_v and ok_i) else 1)
