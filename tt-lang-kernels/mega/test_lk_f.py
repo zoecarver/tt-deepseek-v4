@@ -255,10 +255,10 @@ def make_lk_f_kernel(mesh, gate_bias_cpu):
     Final mask multiply + sum across experts in ttnn (TODO mega).
     """
     # Fused gate matmul + sqrt(softplus) + bias.  M=TILE, K=DIM=4096, N=N_ROUTED=256.
-    # Mt=1, Kt=128, Nt=8. block=(1,1,4) part=(1,8,1) -> 8 cores, N_BPN=1, Kb=32.
+    # Mt=1, Kt=128, Nt=8. block=(1,1,8) part=(1,8,1) -> 8 cores, N_BPN=1, Kb=16.
     matmul_gate_post = _make_matmul_gate_post_kernel(
         M=TILE, K=DIM, N=N_ROUTED,
-        block_cfg=(1, 1, 4), part_cfg=(1, 8, 1))
+        block_cfg=(1, 1, 8), part_cfg=(1, 8, 1))
 
     # SUMMA: w1 / w3. M=TILE, K=DIM=4096, N=INTER_DIM=2048.
     # Mt=1, Kt=128, Nt=64. block=(1,8,4) part=(1,8,1) -> 8 cores, N_BPN=1, Kb=32.
