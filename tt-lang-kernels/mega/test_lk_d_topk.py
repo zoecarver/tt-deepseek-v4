@@ -58,8 +58,12 @@ def _make_mask_build_kernel(num_h_tiles: int):
     """
     half_amp = MASK_AMP / 2.0
 
-    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
+    @ttl.operation(grid="auto", fp32_dest_acc_en=True)
     def mask_build(score, ramp, t_active, masked_out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        work_per_core = -(-num_h_tiles // total_cores)
+
         score_dfb = ttl.make_dataflow_buffer_like(
             score, shape=(1, 1), block_count=2)
         ramp_dfb = ttl.make_dataflow_buffer_like(
@@ -76,28 +80,40 @@ def _make_mask_build_kernel(num_h_tiles: int):
 
         @ttl.compute()
         def compute():
-            for _ in range(num_h_tiles):
-                sc = score_dfb.wait()
-                rp = ramp_dfb.wait()
-                ta = ta_dfb.wait()
-                mask_dfb.reserve().store(
-                    (ttl.math.sign(ta - rp - ttl.math.fill(rp, 0.5))
-                     - ttl.math.fill(ta, 1.0))
-                    * ttl.math.fill(rp, half_amp))
-                m = mask_dfb.wait()
-                out_dfb.reserve().store(sc + m)
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < num_h_tiles:
+                    sc = score_dfb.wait()
+                    rp = ramp_dfb.wait()
+                    ta = ta_dfb.wait()
+                    mask_dfb.reserve().store(
+                        (ttl.math.sign(ta - rp - ttl.math.fill(rp, 0.5))
+                         - ttl.math.fill(ta, 1.0))
+                        * ttl.math.fill(rp, half_amp))
+                    m = mask_dfb.wait()
+                    out_dfb.reserve().store(sc + m)
 
         @ttl.datamovement()
         def dm_read():
-            for h in range(num_h_tiles):
-                ttl.copy(score[0, h], score_dfb.reserve()).wait()
-                ttl.copy(ramp[0, h], ramp_dfb.reserve()).wait()
-                ttl.copy(t_active[0, h], ta_dfb.reserve()).wait()
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < num_h_tiles:
+                    ttl.copy(score[0, global_w], score_dfb.reserve()).wait()
+                    ttl.copy(ramp[0, global_w], ramp_dfb.reserve()).wait()
+                    ttl.copy(t_active[0, global_w], ta_dfb.reserve()).wait()
 
         @ttl.datamovement()
         def dm_write():
-            for h in range(num_h_tiles):
-                ttl.copy(out_dfb.wait(), masked_out[0, h]).wait()
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < num_h_tiles:
+                    ttl.copy(out_dfb.wait(), masked_out[0, global_w]).wait()
 
     return mask_build
 
