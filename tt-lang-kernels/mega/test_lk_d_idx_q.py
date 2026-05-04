@@ -140,66 +140,116 @@ def _make_summa_matmul_kernel(M: int, K: int, N: int,
     return summa_matmul
 
 
-def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
-    """out = x * cos + x_swap * sin (elementwise).
-
-    cos/sin tiles already carry the same data on every TILE row (the
-    host pre-replicates the table along the row axis).
+def _make_swap_combine_kernel(M: int, K_dim: int, N: int,
+                              block_cfg, part_cfg,
+                              fp32_dest_acc_en: bool = True):
+    """SUMMA matmul fused with rotary combine.
+      out[m, n] = x[m, n] * cos[0, n] + (x @ P)[m, n] * sin[0, n]
+    cos, sin shape: [TILE, N] (only row 0 is consumed; downstream broadcasts).
+    P shape: [K_dim, N] swap-pairs constant.
     """
+    bm, bn, bk = block_cfg
+    Mp, Np, Kp = part_cfg
+    if Kp != 1:
+        raise ValueError(f"K_parts must be 1, got {Kp}")
+    Mt, Nt, Kt = M // TILE, N // TILE, K_dim // TILE
+    if Mt % bm or Nt % bn or Kt % bk:
+        raise ValueError(
+            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
+            f"block=(bm={bm}, bn={bn}, bk={bk})")
+    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
+    if Mb % Mp or Nb % Np:
+        raise ValueError(
+            f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
+    M_BPN = Mb // Mp
+    N_BPN = Nb // Np
 
-    total_work = num_row_tiles * num_h_tiles
+    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
+    def swap_combine(x, P, cos, sin, out):
+        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
+                   for m_p in range(Mp)]
+        mcast_a_net = ttl.PipeNet(a_pipes)
+        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
+                   for n_p in range(Np)]
+        mcast_b_net = ttl.PipeNet(b_pipes)
 
-    @ttl.operation(grid="auto", fp32_dest_acc_en=True)
-    def rotary_combine(x, x_swap, cos, sin, out):
-        grid_cols, grid_rows = ttl.grid_size(dims=2)
-        total_cores = grid_rows * grid_cols
-        work_per_core = -(-total_work // total_cores)
-
-        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
-        xs_dfb = ttl.make_dataflow_buffer_like(x_swap, shape=(1, 1), block_count=2)
-        c_dfb = ttl.make_dataflow_buffer_like(cos, shape=(1, 1), block_count=2)
-        s_dfb = ttl.make_dataflow_buffer_like(sin, shape=(1, 1), block_count=2)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        a_cb = ttl.make_dataflow_buffer_like(x, shape=(bm, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(P, shape=(bk, bn), block_count=2)
+        x_diag_cb = ttl.make_dataflow_buffer_like(
+            x, shape=(bm, bn), block_count=2)
+        cos_cb = ttl.make_dataflow_buffer_like(
+            cos, shape=(1, bn), block_count=2)
+        sin_cb = ttl.make_dataflow_buffer_like(
+            sin, shape=(1, bn), block_count=2)
+        swap_cb = ttl.make_dataflow_buffer_like(
+            out, shape=(bm, bn), block_count=2)
+        out_cb = ttl.make_dataflow_buffer_like(
+            out, shape=(bm, bn), block_count=2)
 
         @ttl.compute()
         def compute():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            for local_w in range(work_per_core):
-                global_w = core_idx * work_per_core + local_w
-                if global_w < total_work:
-                    xt = x_dfb.wait()
-                    xst = xs_dfb.wait()
-                    ct = c_dfb.wait()
-                    st = s_dfb.wait()
-                    out_dfb.reserve().store(xt * ct + xst * st)
+            for _ in range(M_BPN):
+                for _ in range(N_BPN):
+                    p = swap_cb.reserve()
+                    for _ in range(Kb):
+                        a_blk = a_cb.wait()
+                        b_blk = b_cb.wait()
+                        p += a_blk @ b_blk
+                    s = swap_cb.wait()
+                    xd = x_diag_cb.wait()
+                    c = cos_cb.wait()
+                    si = sin_cb.wait()
+                    out_cb.reserve().store(xd * c + s * si)
 
         @ttl.datamovement()
         def dm_read():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            for local_w in range(work_per_core):
-                global_w = core_idx * work_per_core + local_w
-                if global_w < total_work:
-                    t = global_w // num_h_tiles
-                    h = global_w % num_h_tiles
-                    ttl.copy(x[t, h], x_dfb.reserve()).wait()
-                    ttl.copy(x_swap[t, h], xs_dfb.reserve()).wait()
-                    ttl.copy(cos[0, h], c_dfb.reserve()).wait()
-                    ttl.copy(sin[0, h], s_dfb.reserve()).wait()
+            _, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for _ in range(N_BPN):
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        a_blk = a_cb.reserve()
+
+                        def read_a(pipe):
+                            ttl.copy(x[mr:mr + bm, kc:kc + bk], a_blk).wait()
+                            ttl.copy(a_blk, pipe).wait()
+
+                        mcast_a_net.if_src(read_a)
+                        mcast_a_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
 
         @ttl.datamovement()
         def dm_write():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            for local_w in range(work_per_core):
-                global_w = core_idx * work_per_core + local_w
-                if global_w < total_work:
-                    t = global_w // num_h_tiles
-                    h = global_w % num_h_tiles
-                    ttl.copy(out_dfb.wait(), out[t, h]).wait()
+            col_c, row_c = ttl.node(dims=2)
+            for local_mb in range(M_BPN):
+                mb = row_c * M_BPN + local_mb
+                mr = mb * bm
+                for local_nb in range(N_BPN):
+                    nb = col_c * N_BPN + local_nb
+                    nc = nb * bn
+                    for kb in range(Kb):
+                        kc = kb * bk
+                        b_blk = b_cb.reserve()
 
-    return rotary_combine
+                        def read_b(pipe):
+                            ttl.copy(P[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                            ttl.copy(b_blk, pipe).wait()
+
+                        mcast_b_net.if_src(read_b)
+                        mcast_b_net.if_dst(
+                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
+                    ttl.copy(x[mr:mr + bm, nc:nc + bn],
+                             x_diag_cb.reserve()).wait()
+                    ttl.copy(cos[0:1, nc:nc + bn],
+                             cos_cb.reserve()).wait()
+                    ttl.copy(sin[0:1, nc:nc + bn],
+                             sin_cb.reserve()).wait()
+                    ttl.copy(out_cb.wait(),
+                             out[mr:mr + bm, nc:nc + bn]).wait()
+
+    return swap_combine
 
 
 def _build_rotary_tables(cos_full_cpu: torch.Tensor, sin_full_cpu: torch.Tensor,
@@ -270,14 +320,11 @@ def make_lk_d_idx_q_kernel(mesh, cos_full_cpu, sin_full_cpu):
         M=H, K=D, N=D,
         block_cfg=(1, 4, 4), part_cfg=(2, 1, 1))
 
-    # Swap SUMMA: M=H=64, K=N=rd=64. Mt=Kt=Nt=2. block=(1,1,2),
-    # part=(2,2,1) -> 4 cores.
-    swap_kernel = _make_summa_matmul_kernel(
-        M=H, K=rd, N=rd,
+    # Fused swap SUMMA + rotary combine: M=H=64, K=N=rd=64.
+    # Mt=Kt=Nt=2. block=(1,1,2), part=(2,2,1) -> 4 cores.
+    swap_combine_kernel = _make_swap_combine_kernel(
+        M=H, K_dim=rd, N=rd,
         block_cfg=(1, 1, 2), part_cfg=(2, 2, 1))
-    rotary_combine_kernel = _make_rotary_combine_kernel(
-        num_row_tiles=H // TILE,           # 64 / 32 = 2
-        num_h_tiles=rd // TILE)            # 64 / 32 = 2
 
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -296,14 +343,8 @@ def make_lk_d_idx_q_kernel(mesh, cos_full_cpu, sin_full_cpu):
             state["q_padded_tt"] = ttnn.from_torch(
                 torch.zeros((M_PAD, N_WQB), dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
-            state["q_h_d_tt"] = ttnn.from_torch(
-                torch.zeros((H, D), dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
             state["q_rotated_tt"] = ttnn.from_torch(
                 torch.zeros((H, D), dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
-            state["q_rope_swap_tt"] = ttnn.from_torch(
-                torch.zeros((H, rd), dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
             state["q_rope_rot_tt"] = ttnn.from_torch(
                 torch.zeros((H, rd), dtype=torch.bfloat16),
@@ -334,19 +375,16 @@ def make_lk_d_idx_q_kernel(mesh, cos_full_cpu, sin_full_cpu):
         q_nope = ttnn.slice(q_4d, [0, 0, 0, 0], [B, 1, H, D - rd])
         q_rope = ttnn.slice(q_4d, [0, 0, 0, D - rd], [B, 1, H, D])
         q_rope_2d = ttnn.reshape(q_rope, [H, rd])
-        swap_kernel(q_rope_2d, P_tt, state["q_rope_swap_tt"])
-        rotary_combine_kernel(
-            q_rope_2d, state["q_rope_swap_tt"], cos_b, sin_b,
-            state["q_rope_rot_tt"])
+        swap_combine_kernel(
+            q_rope_2d, P_tt, cos_b, sin_b, state["q_rope_rot_tt"])
         q_rope_rot_4d = ttnn.reshape(state["q_rope_rot_tt"], [B, S, H, rd])
         q_full = ttnn.concat([q_nope, q_rope_rot_4d], dim=-1)
 
         # 5. Reshape [1, 1, H, D] -> [H, D] for SUMMA #2.
         q_2d = ttnn.reshape(q_full, [H, D])
-        ttnn.copy(q_2d, state["q_h_d_tt"])
 
         # 6. SUMMA #2: Walsh-Hadamard matmul -> [H, D].
-        matmul_hada_kernel(state["q_h_d_tt"], H_tt, state["q_rotated_tt"])
+        matmul_hada_kernel(q_2d, H_tt, state["q_rotated_tt"])
 
         # 7. Reshape back [1, 1, H, D] and copy to test-provided out.
         q_out_4d = ttnn.reshape(state["q_rotated_tt"], [B, S, H, D])
