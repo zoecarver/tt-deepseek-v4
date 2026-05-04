@@ -227,9 +227,14 @@ def _make_slot_shift_kernel(num_buffers: int, ratio_pad: int, d: int):
     N_tiles = d // _RMS_TILE
     total_work = M_tiles * N_tiles
 
-    @ttl.operation(grid="auto")
+    # Grid sized to total_work (one tile per core; P is broadcast). For
+    # d=512, num_buffers=1 this is grid=(8, 2) = 16 cores, exactly one
+    # tile per core. For larger workloads grid_rows scales up.
+    grid_cols = min(total_work, 8)
+    grid_rows = -(-total_work // grid_cols)
+
+    @ttl.operation(grid=(grid_cols, grid_rows))
     def slot_shift_kernel(buf, P, out):
-        grid_cols, grid_rows = ttl.grid_size(dims=2)
         total_cores = grid_rows * grid_cols
         work_per_core = -(-total_work // total_cores)
 
