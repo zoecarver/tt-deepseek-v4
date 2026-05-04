@@ -527,6 +527,121 @@ def _make_scale_sign_mask_kernel(num_row_tiles: int, num_k_tiles: int,
     return scale_sign_mask
 
 
+def _make_softmax_with_sink_kernel(H: int, K_dim: int):
+    """Softmax over [H, K_dim + sink] with the sink column dropped from output.
+
+    Inputs:
+      x: [H, K_dim] bf16. Per-row scores.
+      sink_padded: [H, TILE] bf16. Column 0 = per-head sink, columns 1..TILE-1
+        = -1e9 sentinel (so they have no effect on max/sum).
+      scaler: [TILE, TILE] bf16 ones (reduce_max/reduce_sum scratch).
+      out: [H, K_dim] bf16. softmax probs over [scores | sink], sink dropped.
+
+    Per H-slice we run three streaming passes over the K-tiles + 1 sink-tile:
+      1) running max via reduce_max(dims=[1]) + ttl.math.max combine
+      2) running sum of exp(x - max_bc) via reduce_sum(dims=[1]) + add
+      3) write exp(x - max_bc) * recip(sum)_bc for K-tiles only
+
+    Single-core. K is small (4 tiles for Lk-Dsparse) so re-streaming x 3x is
+    cheaper than scratching the exp results.
+    """
+    Ht = H // TILE
+    Kt = K_dim // TILE
+
+    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
+    def softmax_with_sink(x, sink_padded, scaler, out):
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        sink_dfb = ttl.make_dataflow_buffer_like(sink_padded, shape=(1, 1), block_count=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=1)
+        rmax_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        run_max_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        max_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        rsum_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        run_sum_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
+        rinv_bc_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            sc = sc_dfb.wait()
+            for _ in range(Ht):
+                # Pass 1: running max across K-tiles + sink-tile.
+                init_rm = run_max_dfb.reserve()
+                init_rm.store(ttl.math.fill(init_rm, -1.0e9))
+                for _ in range(Kt):
+                    v = x_dfb.wait()
+                    rm = run_max_dfb.wait()
+                    rmax_dfb.reserve().store(
+                        ttl.math.reduce_max(v, sc, dims=[1]))
+                    tm_blk = rmax_dfb.wait()
+                    run_max_dfb.reserve().store(ttl.math.max(rm, tm_blk))
+                vs = sink_dfb.wait()
+                rm = run_max_dfb.wait()
+                rmax_dfb.reserve().store(
+                    ttl.math.reduce_max(vs, sc, dims=[1]))
+                tm_blk = rmax_dfb.wait()
+                run_max_dfb.reserve().store(ttl.math.max(rm, tm_blk))
+                final_rm = run_max_dfb.wait()
+                mb = max_bc_dfb.reserve()
+                mb.store(ttl.math.broadcast(final_rm, mb, dims=[1]))
+                mb_blk = max_bc_dfb.wait()
+
+                # Pass 2: running sum of exp(x - max_bc) across K-tiles + sink.
+                init_rs = run_sum_dfb.reserve()
+                init_rs.store(ttl.math.fill(init_rs, 0.0))
+                for _ in range(Kt):
+                    v2 = x_dfb.wait()
+                    rs = run_sum_dfb.wait()
+                    rsum_dfb.reserve().store(
+                        ttl.math.reduce_sum(
+                            ttl.math.exp(v2 - mb_blk), sc, dims=[1]))
+                    ts_blk = rsum_dfb.wait()
+                    run_sum_dfb.reserve().store(rs + ts_blk)
+                vs2 = sink_dfb.wait()
+                rs = run_sum_dfb.wait()
+                rsum_dfb.reserve().store(
+                    ttl.math.reduce_sum(
+                        ttl.math.exp(vs2 - mb_blk), sc, dims=[1]))
+                ts_blk = rsum_dfb.wait()
+                run_sum_dfb.reserve().store(rs + ts_blk)
+
+                final_rs = run_sum_dfb.wait()
+                rinv = rinv_bc_dfb.reserve()
+                rinv.store(ttl.math.broadcast(
+                    ttl.math.recip(final_rs), rinv, dims=[1]))
+                rinv_blk = rinv_bc_dfb.wait()
+
+                # Pass 3: write exp(x - max_bc) * rinv_bc, skip sink.
+                for _ in range(Kt):
+                    v3 = x_dfb.wait()
+                    out_dfb.reserve().store(
+                        ttl.math.exp(v3 - mb_blk) * rinv_blk)
+
+        @ttl.datamovement()
+        def dm_read():
+            ttl.copy(scaler[0, 0], sc_dfb.reserve()).wait()
+            for h in range(Ht):
+                # Pass 1: stream x and sink for max.
+                for kt in range(Kt):
+                    ttl.copy(x[h, kt], x_dfb.reserve()).wait()
+                ttl.copy(sink_padded[h, 0], sink_dfb.reserve()).wait()
+                # Pass 2: stream x and sink for exp/sum.
+                for kt in range(Kt):
+                    ttl.copy(x[h, kt], x_dfb.reserve()).wait()
+                ttl.copy(sink_padded[h, 0], sink_dfb.reserve()).wait()
+                # Pass 3: stream x for output.
+                for kt in range(Kt):
+                    ttl.copy(x[h, kt], x_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            for h in range(Ht):
+                for kt in range(Kt):
+                    ttl.copy(out_dfb.wait(), out[h, kt]).wait()
+
+    return softmax_with_sink
+
+
 def _build_rotary_tables(cos_full_cpu: torch.Tensor, sin_full_cpu: torch.Tensor,
                          inverse: bool):
     max_seq_len, rd_half = cos_full_cpu.shape
@@ -612,6 +727,10 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         M=H, K_dim=rd, N=rd,
         block_cfg=(1, 1, 2), part_cfg=(2, 2, 1))
 
+    # Fused softmax over [scores | sink], drop-sink. Replaces ttnn concat +
+    # softmax + slice. Single-core, three-pass over Ht=2 H-slices.
+    softmax_with_sink_kernel = _make_softmax_with_sink_kernel(H=H, K_dim=K)
+
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
@@ -626,7 +745,8 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
     state: dict = {}
 
     def lk_dsparse_kernel(q_tt, kv_tt, kv_cache_tt, kv_slot_tt, topk_idxs_tt,
-                          sink_4d_tt, cos_full_tt, sin_full_tt, start_pos_tt,
+                          sink_padded_tt, sm_scaler_tt, cos_full_tt,
+                          sin_full_tt, start_pos_tt,
                           wo_a_w_tt, wo_b_w_tt, out):
         if "init" not in state:
             state["o_padded"] = ttnn.from_torch(
@@ -639,6 +759,9 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
                 torch.zeros(H, ROPE_HEAD_DIM, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
             state["scores_masked_padded"] = ttnn.from_torch(
+                torch.zeros(H, K, dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16, **rep)
+            state["probs"] = ttnn.from_torch(
                 torch.zeros(H, K, dtype=torch.bfloat16),
                 dtype=ttnn.bfloat16, **rep)
             state["init"] = True
@@ -684,19 +807,16 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         q_2d = ttnn.reshape(q_tt, [H, D])
         matmul_score_scale_mask(q_2d, kv_gather_t_2d, topk_padded_in,
                                 state["scores_masked_padded"])
-        scores_masked = ttnn.reshape(state["scores_masked_padded"], [B, S, H, K])
 
-        # 7. Concat sink, softmax, drop sink.
-        # TODO: mega fusion blocked: ttnn used for concat/softmax/slice. No
-        # tt-lang softmax with arbitrary trailing-dim partitioning.
-        full = ttnn.concat([scores_masked, sink_4d_tt], dim=-1)
-        probs_full = ttnn.softmax(full, dim=-1)
-        probs = ttnn.slice(probs_full, [0, 0, 0, 0], [B, S, H, K])
+        # 7. Fused softmax over [scores | sink] with sink dropped. Replaces
+        # ttnn.concat + ttnn.softmax + ttnn.slice with one tt-lang kernel.
+        softmax_with_sink_kernel(
+            state["scores_masked_padded"], sink_padded_tt, sm_scaler_tt,
+            state["probs"])
 
         # 8. SUMMA output: probs [H, K] @ kv_gather [K, D] -> o [H, D].
-        probs_2d = ttnn.reshape(probs, [H, K])
         kv_gather_2d = ttnn.reshape(kv_gather_4d, [K, D])
-        matmul_output(probs_2d, kv_gather_2d, state["o_padded"])
+        matmul_output(state["probs"], kv_gather_2d, state["o_padded"])
 
         # 9. Inverse rotary on o[..., -rd:] via swap-SUMMA + rotary-combine.
         # Operates on the 2D [H, D] layout and slices the rope tail directly.
@@ -853,9 +973,21 @@ def main():
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
 
         # Sink replicated [1, 1, n_heads, 1] (same shape as DeviceSparseAttn
-        # uses internally).
+        # uses internally) for the reference path.
         sink_4d = attn_sink.to(torch.bfloat16).view(1, 1, N_HEADS, 1).contiguous()
         sink_4d_tt = ttnn.as_tensor(sink_4d, dtype=ttnn.bfloat16, **rep)
+
+        # Padded sink for the fused softmax-with-sink kernel: [H, TILE] where
+        # col 0 = sink_per_head, cols 1..TILE-1 = -1e9 (sentinel so they have
+        # no effect on max/sum). Plus an all-ones scaler tile for reduce.
+        sink_padded = torch.full(
+            (N_HEADS, TILE), -1.0e9, dtype=torch.bfloat16)
+        sink_padded[:, 0] = attn_sink.to(torch.bfloat16)
+        sink_padded_tt = ttnn.as_tensor(
+            sink_padded.contiguous(), dtype=ttnn.bfloat16, **rep)
+        sm_scaler = torch.ones((TILE, TILE), dtype=torch.bfloat16)
+        sm_scaler_tt = ttnn.as_tensor(
+            sm_scaler.contiguous(), dtype=ttnn.bfloat16, **rep)
 
         sharded_memcfg = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
@@ -880,8 +1012,8 @@ def main():
             torch.zeros(1, 1, DIM, dtype=torch.bfloat16),
             dtype=ttnn.bfloat16, **rep)
         kernel(q_tt, kv_tt, kv_cache_kernel_tt, kv_slot_tt, topk_idxs_tt,
-               sink_4d_tt, cos_full_tt, sin_full_tt, start_pos_tt,
-               wo_a_w_tt, wo_b_w_tt, out_tt)
+               sink_padded_tt, sm_scaler_tt, cos_full_tt, sin_full_tt,
+               start_pos_tt, wo_a_w_tt, wo_b_w_tt, out_tt)
         kernel_host = download_chip0(mesh, mesh_shape, out_tt)
 
         ok = report_pcc("Lk-Dsparse", ref_host, kernel_host)
@@ -896,8 +1028,9 @@ def main():
         benchmark("Lk-Dsparse ttl",
                   lambda: kernel(
                       q_tt, kv_tt, kv_cache_kernel_tt, kv_slot_tt,
-                      topk_idxs_tt, sink_4d_tt, cos_full_tt, sin_full_tt,
-                      start_pos_tt, wo_a_w_tt, wo_b_w_tt, out_tt),
+                      topk_idxs_tt, sink_padded_tt, sm_scaler_tt,
+                      cos_full_tt, sin_full_tt, start_pos_tt,
+                      wo_a_w_tt, wo_b_w_tt, out_tt),
                   mesh)
 
         sys.exit(0 if ok else 1)
