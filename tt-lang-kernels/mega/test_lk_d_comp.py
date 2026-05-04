@@ -32,7 +32,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 from inference import (
     _device_apply_rotary_interleaved,
@@ -887,6 +887,33 @@ def main():
         kernel_host = download_chip0(mesh, mesh_shape, kv_normed_out_tt)
 
         ok = report_pcc("Lk-D-comp", ref_host, kernel_host)
+
+        benchmark("Lk-D-comp ref",
+                  lambda: reference(
+                      mesh, x_tt, wkv_w_tt, wgate_w_tt, ape_padded_tt,
+                      cos_compressor_tt, sin_compressor_tt, start_pos_tt,
+                      state_slot_tt, emit_slot_tt,
+                      kv_sf_2d, kv_sb_2d, sc_sf_2d, sc_sb_2d,
+                      kv_sf_4d, kv_sb_4d, sc_sf_4d, sc_sb_4d,
+                      mf_tt, mb_tt, mp_tt, gamma_tt, scaler_tt,
+                      kv_cache_tt, shift_P_tt,
+                      cssn_out_tt,
+                      kv_sf_scratch, kv_sb_scratch, sc_sf_scratch, sc_sb_scratch,
+                      sharded_memcfg),
+                  mesh)
+        benchmark("Lk-D-comp ttl",
+                  lambda: kernel(
+                      x_tt, wkv_w_tt, wgate_w_tt, ape_padded_tt,
+                      cos_compressor_tt, sin_compressor_tt, start_pos_tt,
+                      state_slot_tt, emit_slot_tt,
+                      kv_sf_2d2, kv_sb_2d2, sc_sf_2d2, sc_sb_2d2,
+                      kv_sf_4d2, kv_sb_4d2, sc_sf_4d2, sc_sb_4d2,
+                      mf_tt, mb_tt, mp_tt, gamma_tt, scaler_tt,
+                      kv_cache_tt2, shift_P_tt,
+                      kv_sf_scratch2, kv_sb_scratch2, sc_sf_scratch2, sc_sb_scratch2,
+                      cssn_out_tt2, kv_normed_out_tt),
+                  mesh)
+
         sys.exit(0 if ok else 1)
     finally:
         close_mesh(mesh)

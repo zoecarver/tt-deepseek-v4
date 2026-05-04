@@ -26,7 +26,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 
 DIM = 4096
@@ -338,6 +338,22 @@ def main():
 
         ok_kv = report_pcc("Lk-D-idx-cmp/kv", ref_kv_host, kernel_kv_host)
         ok_sc = report_pcc("Lk-D-idx-cmp/score", ref_score_host, kernel_score_host)
+
+        benchmark("Lk-D-idx-cmp ref",
+                  lambda: reference(mesh, x_tt, wkv_w_tt, wgate_w_tt,
+                                    ape_padded_tt, start_pos_tt, state_slot_tt,
+                                    kv_state_front_tt, kv_state_back_tt,
+                                    score_state_front_tt, score_state_back_tt,
+                                    sharded_memcfg),
+                  mesh)
+        benchmark("Lk-D-idx-cmp ttl",
+                  lambda: kernel(x_tt, wkv_w_tt, wgate_w_tt, ape_padded_tt,
+                                 start_pos_tt, state_slot_tt,
+                                 kv_state_front_tt, kv_state_back_tt,
+                                 score_state_front_tt, score_state_back_tt,
+                                 kv_out_tt, score_out_tt),
+                  mesh)
+
         sys.exit(0 if (ok_kv and ok_sc) else 1)
     finally:
         close_mesh(mesh)

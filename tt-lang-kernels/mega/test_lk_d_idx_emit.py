@@ -31,7 +31,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 from inference import (
     _device_apply_rotary_interleaved,
@@ -831,6 +831,31 @@ def main():
         kernel_host = download_chip0(mesh, mesh_shape, kv_normed_out_tt)
 
         ok = report_pcc("Lk-D-idx-emit", ref_host, kernel_host)
+
+        benchmark("Lk-D-idx-emit ref",
+                  lambda: reference(
+                      mesh,
+                      kv_sf_tt, kv_sb_tt, sc_sf_tt, sc_sb_tt,
+                      mf_tt, mb_tt, mp_tt,
+                      gamma_tt, scaler_tt,
+                      cos_tt, sin_tt, start_pos_tt,
+                      H_tt, kv_cache_tt, emit_slot_tt, shift_P_tt,
+                      cssn_out_tt,
+                      kv_sf_scratch, kv_sb_scratch, sc_sf_scratch, sc_sb_scratch,
+                      sharded_memcfg),
+                  mesh)
+        benchmark("Lk-D-idx-emit ttl",
+                  lambda: kernel(
+                      kv_sf_tt2, kv_sb_tt2, sc_sf_tt2, sc_sb_tt2,
+                      mf_tt, mb_tt, mp_tt,
+                      gamma_tt, scaler_tt,
+                      cos_tt, sin_tt, start_pos_tt,
+                      H_tt, kv_cache_tt2, emit_slot_tt, shift_P_tt,
+                      kv_sf_scratch2, kv_sb_scratch2,
+                      sc_sf_scratch2, sc_sb_scratch2,
+                      kv_normed_out_tt),
+                  mesh)
+
         sys.exit(0 if ok else 1)
     finally:
         close_mesh(mesh)
