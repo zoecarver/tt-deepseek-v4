@@ -36,7 +36,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 
 T_PAD = 128
@@ -258,6 +258,15 @@ def main():
         status = "PASS" if ok else "FAIL"
         print(f"[Lk-D-topk] {status} max_diff={max_diff} n_mismatch={n_mismatch} "
               f"of {ref_host.numel()}")
+
+        benchmark("Lk-D-topk ref",
+                  lambda: reference(mesh, score_in_tt, ramp_int_tt, t_active_tt),
+                  mesh)
+        benchmark("Lk-D-topk ttl",
+                  lambda: kernel(score_in_tt, ramp_int_tt, t_active_tt,
+                                 cmp_idxs_out_tt),
+                  mesh)
+
         sys.exit(0 if ok else 1)
     finally:
         close_mesh(mesh)

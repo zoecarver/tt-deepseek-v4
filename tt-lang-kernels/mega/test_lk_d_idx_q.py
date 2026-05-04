@@ -31,7 +31,7 @@ import ttnn
 import ttl
 
 import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0
+from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
 
 from inference import (
     _device_apply_rotary_interleaved,
@@ -419,6 +419,16 @@ def main():
         kernel_host = download_chip0(mesh, mesh_shape, out_tt)
 
         ok = report_pcc("Lk-D-idx-q", ref_host, kernel_host)
+
+        benchmark("Lk-D-idx-q ref",
+                  lambda: reference(mesh, qr_tt, cos_full_tt, sin_full_tt,
+                                    start_pos_tt, wq_b_tt, H_tt),
+                  mesh)
+        benchmark("Lk-D-idx-q ttl",
+                  lambda: kernel(qr_tt, cos_full_tt, sin_full_tt,
+                                 start_pos_tt, wq_b_tt, H_tt, out_tt),
+                  mesh)
+
         sys.exit(0 if ok else 1)
     finally:
         close_mesh(mesh)
