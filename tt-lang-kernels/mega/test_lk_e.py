@@ -422,13 +422,18 @@ def _make_mhc_post_kernel(num_tokens: int, h_tiles: int):
     """Inlined from inference.py / tt-lang-kernels/post.py.
 
     Per-token, per-h-tile: out = x * post_mix_bc + comb^T @ residual.
+
+    Parallelizes over (token, h_tile) work units so num_tokens=1 still
+    fans out across the full grid. Each core re-loads post_mix[t] and
+    comb_T[t] per work unit (1 tile each, cheap vs. compute).
     """
+    total_work = num_tokens * h_tiles
 
     @ttl.operation(grid="auto")
     def post_kernel(x, residual, comb_T, post_mix, out):
         grid_cols, grid_rows = ttl.grid_size(dims=2)
         total_cores = grid_rows * grid_cols
-        tokens_per_core = -(-num_tokens // total_cores)
+        work_per_core = -(-total_work // total_cores)
 
         x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
         res_dfb = ttl.make_dataflow_buffer_like(residual, shape=(1, 1), block_count=2)
@@ -443,45 +448,46 @@ def _make_mhc_post_kernel(num_tokens: int, h_tiles: int):
         def compute():
             core_col, core_row = ttl.node(dims=2)
             core_idx = core_row * grid_cols + core_col
-            for local_t in range(tokens_per_core):
-                global_t = core_idx * tokens_per_core + local_t
-                if global_t < num_tokens:
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
                     post = post_dfb.wait()
                     comb_t = comb_dfb.wait()
                     pbc = post_bc_dfb.reserve()
                     pbc.store(ttl.math.broadcast(post, pbc, dims=[1]))
                     post_bc = post_bc_dfb.wait()
-                    for _ in range(h_tiles):
-                        x_tile = x_dfb.wait()
-                        res_tile = res_dfb.wait()
-                        post_term_dfb.reserve().store(x_tile * post_bc)
-                        matmul_dfb.reserve().store(comb_t @ res_tile)
-                        out_dfb.reserve().store(
-                            post_term_dfb.wait() + matmul_dfb.wait()
-                        )
+                    x_tile = x_dfb.wait()
+                    res_tile = res_dfb.wait()
+                    post_term_dfb.reserve().store(x_tile * post_bc)
+                    matmul_dfb.reserve().store(comb_t @ res_tile)
+                    out_dfb.reserve().store(
+                        post_term_dfb.wait() + matmul_dfb.wait()
+                    )
 
         @ttl.datamovement()
         def dm_read():
             core_col, core_row = ttl.node(dims=2)
             core_idx = core_row * grid_cols + core_col
-            for local_t in range(tokens_per_core):
-                global_t = core_idx * tokens_per_core + local_t
-                if global_t < num_tokens:
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    global_t = global_w // h_tiles
+                    global_h = global_w % h_tiles
                     ttl.copy(post_mix[global_t, 0], post_dfb.reserve()).wait()
                     ttl.copy(comb_T[global_t, 0], comb_dfb.reserve()).wait()
-                    for h in range(h_tiles):
-                        ttl.copy(x[global_t, h], x_dfb.reserve()).wait()
-                        ttl.copy(residual[global_t, h], res_dfb.reserve()).wait()
+                    ttl.copy(x[global_t, global_h], x_dfb.reserve()).wait()
+                    ttl.copy(residual[global_t, global_h], res_dfb.reserve()).wait()
 
         @ttl.datamovement()
         def dm_write():
             core_col, core_row = ttl.node(dims=2)
             core_idx = core_row * grid_cols + core_col
-            for local_t in range(tokens_per_core):
-                global_t = core_idx * tokens_per_core + local_t
-                if global_t < num_tokens:
-                    for h in range(h_tiles):
-                        ttl.copy(out_dfb.wait(), out[global_t, h]).wait()
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    global_t = global_w // h_tiles
+                    global_h = global_w % h_tiles
+                    ttl.copy(out_dfb.wait(), out[global_t, global_h]).wait()
 
     return post_kernel
 
