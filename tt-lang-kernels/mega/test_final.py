@@ -10,7 +10,7 @@ Pipeline (3 inlined tt-lang kernels + ttnn glue):
   hc_combiner_kernel: a [TILE, D] fp32, hc_fn_t_scaled [D, TILE] fp32 ->
       pre [TILE, TILE] fp32 (cols 0..3 = sigmoid(mixes*rsqrt+hc_base)+hc_eps).
   rmsnorm_kernel: y [TILE, hidden] bf16, gamma -> y_normed [TILE, hidden] bf16.
-  summa_matmul: y_normed [TILE, hidden] bf16 @ w_lmhead [hidden, vocab] bf16 ->
+  ksplit_matmul: y_normed [TILE, hidden] bf16 @ w_lmhead [hidden, vocab] bf16 ->
       logits [TILE, vocab] bf16 (only row 0 valid).
 
 Math fold: hc_scale (scalar) is pre-multiplied into hc_fn_t on host so the
@@ -44,7 +44,6 @@ HC_EPS = 1e-6
 NUM_TOKENS = 1
 NUM_TOKENS_PAD = 32
 TILE = 32
-ARGMAX_K = 32  # tile-cols streamed per argmax iter (sweet spot per argmax_2pass.py)
 
 
 def _make_hc_combiner_kernel(num_out_tiles: int, K_tiles: int,
@@ -251,95 +250,6 @@ def _make_rmsnorm_kernel(num_row_tiles: int, h_tiles: int,
     return rmsnorm_kernel
 
 
-def _make_summa_matmul_kernel(M: int, K: int, N: int,
-                              block_cfg, part_cfg,
-                              fp32_dest_acc_en: bool = True):
-    """Inlined SUMMA matmul. A is row-mcast across Np cores, B is column-mcast
-    across Mp cores. Each core owns an M_BPN x N_BPN output sub-grid."""
-    bm, bn, bk = block_cfg
-    Mp, Np, Kp = part_cfg
-    if Kp != 1:
-        raise ValueError(f"K_parts must be 1, got {Kp}")
-    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
-    if Mt % bm or Nt % bn or Kt % bk:
-        raise ValueError(
-            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
-            f"block=(bm={bm}, bn={bn}, bk={bk})")
-    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
-    if Mb % Mp or Nb % Np:
-        raise ValueError(
-            f"block/part mismatch: Mb={Mb} Nb={Nb} Mp={Mp} Np={Np}")
-    M_BPN = Mb // Mp
-    N_BPN = Nb // Np
-
-    @ttl.operation(grid=(Np, Mp), fp32_dest_acc_en=fp32_dest_acc_en)
-    def summa_matmul(a, w, out):
-        a_pipes = [ttl.Pipe(src=(0, m_p), dst=(slice(0, Np), m_p))
-                   for m_p in range(Mp)]
-        mcast_a_net = ttl.PipeNet(a_pipes)
-        b_pipes = [ttl.Pipe(src=(n_p, 0), dst=(n_p, slice(0, Mp)))
-                   for n_p in range(Np)]
-        mcast_b_net = ttl.PipeNet(b_pipes)
-
-        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
-        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
-        out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
-
-        @ttl.compute()
-        def compute():
-            for _ in range(M_BPN):
-                for _ in range(N_BPN):
-                    p = out_cb.reserve()
-                    for _ in range(Kb):
-                        a_blk = a_cb.wait()
-                        b_blk = b_cb.wait()
-                        p += a_blk @ b_blk
-
-        @ttl.datamovement()
-        def dm_read():
-            _, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for _ in range(N_BPN):
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        a_blk = a_cb.reserve()
-
-                        def read_a(pipe):
-                            ttl.copy(a[mr:mr + bm, kc:kc + bk], a_blk).wait()
-                            ttl.copy(a_blk, pipe).wait()
-
-                        mcast_a_net.if_src(read_a)
-                        mcast_a_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
-
-        @ttl.datamovement()
-        def dm_write():
-            col_c, row_c = ttl.node(dims=2)
-            for local_mb in range(M_BPN):
-                mb = row_c * M_BPN + local_mb
-                mr = mb * bm
-                for local_nb in range(N_BPN):
-                    nb = col_c * N_BPN + local_nb
-                    nc = nb * bn
-                    for kb in range(Kb):
-                        kc = kb * bk
-                        b_blk = b_cb.reserve()
-
-                        def read_b(pipe):
-                            ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
-                            ttl.copy(b_blk, pipe).wait()
-
-                        mcast_b_net.if_src(read_b)
-                        mcast_b_net.if_dst(
-                            lambda pipe: (ttl.copy(pipe, b_blk).wait(),))
-                    o = out_cb.wait()
-                    ttl.copy(o, out[mr:mr + bm, nc:nc + bn]).wait()
-
-    return summa_matmul
-
-
 def _make_ksplit_matmul_kernel(M: int, K: int, N: int,
                                block_cfg, part_cfg,
                                fp32_dest_acc_en: bool = True):
@@ -356,7 +266,7 @@ def _make_ksplit_matmul_kernel(M: int, K: int, N: int,
     if Mp != 1:
         raise ValueError(f"ksplit kernel here assumes Mp=1, got {Mp}")
     if Kp < 2:
-        raise ValueError(f"K_parts must be >= 2, got {Kp}; use _make_summa_matmul_kernel")
+        raise ValueError(f"K_parts must be >= 2, got {Kp}")
     Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
     if Mt % bm or Nt % bn or Kt % bk:
         raise ValueError(
@@ -454,193 +364,6 @@ def _make_ksplit_matmul_kernel(M: int, K: int, N: int,
                     ttl.copy(o, out[0:bm, nc:nc + bn]).wait()
 
     return ksplit_matmul
-
-
-def _make_argmax_input_pad_kernel(num_valid_tiles: int, num_total_tiles: int):
-    """fp32 logits [TILE, num_valid_tiles*TILE] + fp32 row_mask [TILE, TILE]
-    -> fp32 values [TILE, num_total_tiles*TILE] with row 0 = logits, rows
-    1..31 = -1e9, padding tile-cols (>= num_valid_tiles) = -1e9.
-
-    All operands are fp32 because tt-lang requires store-dtype to match the
-    tile's element type (bf16+bf16 -> bf16 cannot store into an fp32 dfb).
-    Argmax also wants fp32 to avoid bf16 ties between equal max values.
-    row_mask is the constant tile (row 0 = 0, rows 1..31 = -1e9) used to
-    blank rows 1..31 in valid tile-cols.
-    """
-    NEG_INF = -1.0e9
-
-    @ttl.operation(grid="auto", fp32_dest_acc_en=True)
-    def pad_kernel(logits, row_mask, out):
-        grid_cols, grid_rows = ttl.grid_size(dims=2)
-        total_cores = grid_rows * grid_cols
-        tiles_per_core = -(-num_total_tiles // total_cores)
-
-        l_dfb = ttl.make_dataflow_buffer_like(logits, shape=(1, 1), block_count=2)
-        m_dfb = ttl.make_dataflow_buffer_like(row_mask, shape=(1, 1), block_count=1)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
-
-        @ttl.compute()
-        def compute():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            m = m_dfb.wait()
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_total_tiles:
-                    if global_t < num_valid_tiles:
-                        l = l_dfb.wait()
-                        out_dfb.reserve().store(l + m)
-                    else:
-                        with out_dfb.reserve() as o:
-                            o.store(ttl.math.fill(o, NEG_INF))
-
-        @ttl.datamovement()
-        def dm_read():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            ttl.copy(row_mask[0, 0], m_dfb.reserve()).wait()
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_valid_tiles:
-                    ttl.copy(logits[0, global_t], l_dfb.reserve()).wait()
-
-        @ttl.datamovement()
-        def dm_write():
-            core_col, core_row = ttl.node(dims=2)
-            core_idx = core_row * grid_cols + core_col
-            for local_t in range(tiles_per_core):
-                global_t = core_idx * tiles_per_core + local_t
-                if global_t < num_total_tiles:
-                    ttl.copy(out_dfb.wait(), out[0, global_t]).wait()
-
-    return pad_kernel
-
-
-def _make_argmax_2pass_kernel(num_total_tiles: int, K_block: int):
-    """Two-pass streaming argmax. See argmax_2pass.py for the algorithm.
-
-    Inputs are fp32 throughout to avoid bf16 ties on equal max values
-    (ttnn.topk's tie-break would diverge from this kernel's reduce_max).
-
-    Inputs:
-      values:    [TILE, num_total_tiles*TILE] fp32, padding lanes = -1e9.
-      indices:   [TILE, num_total_tiles*TILE] fp32, row 0 = arange.
-      scaler:    [TILE, TILE] fp32, ones.
-      out_value: [TILE, TILE] fp32, valid at [0, 0].
-      out_index: [TILE, TILE] fp32, valid at [0, 0].
-    """
-    if num_total_tiles % K_block != 0:
-        raise ValueError(
-            f"num_total_tiles={num_total_tiles} not divisible by K_block={K_block}")
-    NUM_ITERS = num_total_tiles // K_block
-    BIG = 1.0e6
-
-    @ttl.operation(grid=(1, 1), fp32_dest_acc_en=True)
-    def argmax_2pass(values, indices, scaler, out_value, out_index):
-        v1_dfb = ttl.make_dataflow_buffer_like(
-            values, shape=(1, K_block), block_count=2)
-        s_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), block_count=2)
-        tile_max_dfb = ttl.make_dataflow_buffer_like(
-            out_value, shape=(1, 1), block_count=2)
-        run_max_dfb = ttl.make_dataflow_buffer_like(
-            out_value, shape=(1, 1), block_count=2)
-
-        max_global_dfb = ttl.make_dataflow_buffer_like(
-            out_value, shape=(1, 1), block_count=2)
-        max_bc_dfb = ttl.make_dataflow_buffer_like(
-            values, shape=(1, K_block), block_count=2)
-
-        v2_dfb = ttl.make_dataflow_buffer_like(
-            values, shape=(1, K_block), block_count=2)
-        i_dfb = ttl.make_dataflow_buffer_like(
-            indices, shape=(1, K_block), block_count=2)
-        i_filt_dfb = ttl.make_dataflow_buffer_like(
-            indices, shape=(1, K_block), block_count=2)
-        tile_argmax_dfb = ttl.make_dataflow_buffer_like(
-            out_index, shape=(1, 1), block_count=2)
-        run_argmax_dfb = ttl.make_dataflow_buffer_like(
-            out_index, shape=(1, 1), block_count=2)
-
-        ov_dfb = ttl.make_dataflow_buffer_like(out_value, shape=(1, 1), block_count=2)
-        oi_dfb = ttl.make_dataflow_buffer_like(out_index, shape=(1, 1), block_count=2)
-
-        @ttl.compute()
-        def compute():
-            s = s_dfb.wait()
-
-            with run_max_dfb.reserve() as init_rm:
-                init_rm.store(ttl.math.fill(init_rm, -1.0e9))
-
-            for _ in range(NUM_ITERS):
-                v = v1_dfb.wait()
-                rm = run_max_dfb.wait()
-                tm = tile_max_dfb.reserve()
-                tm.store(ttl.math.reduce_max(v, s, dims=[0, 1]))
-                tm_blk = tile_max_dfb.wait()
-                new_rm = run_max_dfb.reserve()
-                new_rm.store(ttl.math.max(rm, tm_blk))
-
-            final_rm = run_max_dfb.wait()
-            mg = max_global_dfb.reserve()
-            mg.store(ttl.math.max(final_rm, final_rm))
-            mg_blk = max_global_dfb.wait()
-
-            mgbc = max_bc_dfb.reserve()
-            mgbc.store(ttl.math.broadcast(mg_blk, mgbc, dims=[0, 1]))
-            mgbc_blk = max_bc_dfb.wait()
-
-            ov = ov_dfb.reserve()
-            ov.store(ttl.math.max(mg_blk, mg_blk))
-
-            with run_argmax_dfb.reserve() as init_ra:
-                init_ra.store(ttl.math.fill(init_ra, -1.0e9))
-
-            for _ in range(NUM_ITERS):
-                v = v2_dfb.wait()
-                i = i_dfb.wait()
-                ra = run_argmax_dfb.wait()
-                with i_filt_dfb.reserve() as ifilt:
-                    ifilt.store(
-                        ttl.add(
-                            i,
-                            ttl.mul(
-                                ttl.math.sign(ttl.sub(v, mgbc_blk)),
-                                ttl.math.fill(ifilt, BIG),
-                            ),
-                        )
-                    )
-                ifilt_blk = i_filt_dfb.wait()
-                ta = tile_argmax_dfb.reserve()
-                ta.store(ttl.math.reduce_max(ifilt_blk, s, dims=[0, 1]))
-                ta_blk = tile_argmax_dfb.wait()
-                new_ra = run_argmax_dfb.reserve()
-                new_ra.store(ttl.math.max(ra, ta_blk))
-
-            final_ra = run_argmax_dfb.wait()
-            oi = oi_dfb.reserve()
-            oi.store(ttl.math.max(final_ra, final_ra))
-
-        @ttl.datamovement()
-        def dm_read():
-            blk = s_dfb.reserve()
-            ttl.copy(scaler[0, 0], blk).wait()
-            for it in range(NUM_ITERS):
-                blk = v1_dfb.reserve()
-                ttl.copy(values[0:1, it * K_block:(it + 1) * K_block], blk).wait()
-            for it in range(NUM_ITERS):
-                blk = v2_dfb.reserve()
-                ttl.copy(values[0:1, it * K_block:(it + 1) * K_block], blk).wait()
-                blk = i_dfb.reserve()
-                ttl.copy(indices[0:1, it * K_block:(it + 1) * K_block], blk).wait()
-
-        @ttl.datamovement()
-        def dm_write():
-            blk = ov_dfb.wait()
-            ttl.copy(blk, out_value[0, 0]).wait()
-            blk = oi_dfb.wait()
-            ttl.copy(blk, out_index[0, 0]).wait()
-
-    return argmax_2pass
 
 
 def _pack_hc_base_tile(hc_base: torch.Tensor) -> torch.Tensor:
