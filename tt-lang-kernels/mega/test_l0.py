@@ -698,7 +698,8 @@ def make_l0_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
 
-    def l0_kernel(embed_tt, wq_a_w_tt, a_next_out, wq_a_out):
+    def l0_kernel(embed_tt, wq_a_w_tt, a_next_out, wq_a_out,
+                  x_post_norm_bf16_out=None):
         if "scratch" not in state:
             state["mixes_tt"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
             state["pre_tt"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
@@ -809,6 +810,14 @@ def make_l0_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
                            [NUM_TOKENS, Q_LORA_RANK])
         y_3d = ttnn.reshape(y_row, [1, 1, Q_LORA_RANK])
         ttnn.copy(y_3d, wq_a_out)
+
+        # Optionally publish the post-attn-norm bf16 [TILE, DIM] tile so the
+        # mega orchestrator can feed Lk-C's wkv input without re-running
+        # rms_norm. Layer 0 path uses this; layer 1+ uses Lk-A's
+        # x_pre_norm + a separate device rms_norm (Lk-A fuses gamma into
+        # wq_a so its post-norm tile isn't materialized).
+        if x_post_norm_bf16_out is not None:
+            ttnn.copy(state["rms_out_tt"], x_post_norm_bf16_out)
 
     return l0_kernel
 
