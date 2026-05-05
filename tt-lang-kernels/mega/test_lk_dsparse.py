@@ -371,6 +371,67 @@ def _make_swap_combine_kernel(M: int, K_dim: int, N: int,
     return swap_combine
 
 
+def _make_rotary_combine_kernel(num_row_tiles: int, num_h_tiles: int):
+    """out = x * cos + x_swap * sin; cos/sin tile-replicated.
+
+    Distributes (row_tile, h_tile) pairs across an auto grid for better
+    parallelism: H=64, rd=64 -> 2*2=4 tiles distributed over 4 cores.
+    """
+    total_work = num_row_tiles * num_h_tiles
+
+    @ttl.operation(grid="auto", fp32_dest_acc_en=True)
+    def rotary_combine(x, x_swap, cos, sin, out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        work_per_core = -(-total_work // total_cores)
+
+        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), block_count=2)
+        xs_dfb = ttl.make_dataflow_buffer_like(x_swap, shape=(1, 1), block_count=2)
+        c_dfb = ttl.make_dataflow_buffer_like(cos, shape=(1, 1), block_count=2)
+        s_dfb = ttl.make_dataflow_buffer_like(sin, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    xt = x_dfb.wait()
+                    xst = xs_dfb.wait()
+                    ct = c_dfb.wait()
+                    st = s_dfb.wait()
+                    out_dfb.reserve().store(xt * ct + xst * st)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    t = global_w // num_h_tiles
+                    h = global_w % num_h_tiles
+                    ttl.copy(x[t, h], x_dfb.reserve()).wait()
+                    ttl.copy(x_swap[t, h], xs_dfb.reserve()).wait()
+                    ttl.copy(cos[0, h], c_dfb.reserve()).wait()
+                    ttl.copy(sin[0, h], s_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    t = global_w // num_h_tiles
+                    h = global_w % num_h_tiles
+                    ttl.copy(out_dfb.wait(), out[t, h]).wait()
+
+    return rotary_combine
+
+
 def _make_summa_matmul_scale_mask_kernel(M: int, K_dim: int, N: int,
                                           block_cfg, part_cfg,
                                           scale: float, mask_amp: float,
@@ -498,6 +559,79 @@ def _make_summa_matmul_scale_mask_kernel(M: int, K_dim: int, N: int,
                              masked_out[mr:mr + bm, nc:nc + bn]).wait()
 
     return matmul_scale_mask
+
+
+def _make_scale_sign_mask_kernel(num_row_tiles: int, num_k_tiles: int,
+                                  scale: float, mask_amp: float):
+    """Fused scale + sign-trick mask:
+
+        masked[mt, kt] = scores[mt, kt] * softmax_scale +
+                         (sign(idx[0, kt] + 0.5) - 1) * (mask_amp / 2)
+
+    Replaces (ttnn.lt int<0 + where(-inf, 0)) + multiply(scale) + add(mask):
+      idx >= 0 -> mask = 0
+      idx < 0  -> mask = -mask_amp  (functionally -inf for softmax)
+    idx is broadcast across the H (row) tiles. Tiles are distributed across
+    an auto grid, one (mt, kt) pair per core when possible.
+    """
+    half_amp = mask_amp / 2.0
+    total_work = num_row_tiles * num_k_tiles
+
+    @ttl.operation(grid="auto", fp32_dest_acc_en=True)
+    def scale_sign_mask(scores, idxs_bf16, masked_out):
+        grid_cols, grid_rows = ttl.grid_size(dims=2)
+        total_cores = grid_rows * grid_cols
+        work_per_core = -(-total_work // total_cores)
+
+        scores_dfb = ttl.make_dataflow_buffer_like(
+            scores, shape=(1, 1), block_count=2)
+        idxs_dfb = ttl.make_dataflow_buffer_like(
+            idxs_bf16, shape=(1, 1), block_count=2)
+        mask_dfb = ttl.make_dataflow_buffer_like(
+            masked_out, shape=(1, 1), block_count=2)
+        out_dfb = ttl.make_dataflow_buffer_like(
+            masked_out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    s = scores_dfb.wait()
+                    i = idxs_dfb.wait()
+                    mask_dfb.reserve().store(
+                        (ttl.math.sign(i + ttl.math.fill(i, 0.5))
+                         - ttl.math.fill(i, 1.0))
+                        * ttl.math.fill(i, half_amp))
+                    m = mask_dfb.wait()
+                    out_dfb.reserve().store(s * ttl.math.fill(s, scale) + m)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    kt = global_w // num_row_tiles
+                    mt = global_w % num_row_tiles
+                    ttl.copy(scores[mt, kt], scores_dfb.reserve()).wait()
+                    ttl.copy(idxs_bf16[0, kt], idxs_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            core_idx = core_row * grid_cols + core_col
+            for local_w in range(work_per_core):
+                global_w = core_idx * work_per_core + local_w
+                if global_w < total_work:
+                    kt = global_w // num_row_tiles
+                    mt = global_w % num_row_tiles
+                    ttl.copy(out_dfb.wait(), masked_out[mt, kt]).wait()
+
+    return scale_sign_mask
 
 
 def _make_softmax_with_sink_kernel(H: int, K_dim: int):
@@ -752,8 +886,8 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
             kv_cache_tt, kv_4d_sharded, update_idxs_tensor=kv_slot_tt)
 
         # 2. Build idxs_uint32_rm + bf16 topk idxs for the fused mask kernel.
-        # Mask construction (lt + where(-inf, 0)) is folded into
-        # matmul_score_scale_mask via the bf16 sign trick.
+        # Mask construction (lt + where(-inf, 0)) is folded into the tt-lang
+        # scale_sign_mask kernel below via the bf16 sign trick.
         # TODO: mega fusion blocked: ttnn used for clamp/typecast/to_layout.
         # Lowering needs tt-lang int->uint32 cast + tile<->row-major converter.
         topk_idxs_bf16 = ttnn.typecast(topk_idxs_tt, dtype=ttnn.bfloat16)
