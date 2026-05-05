@@ -3489,8 +3489,16 @@ class DeviceMHC(nn.Module):
             a_tt = self._a_upload_tt
         mixes_tt = self._mixes_tt
 
-        self._norm_fn_kernel(num_tokens_pad // _MHC_TILE)(
-            a_tt, self.fn_tt, self.scaler_tt, mixes_tt)
+        # ttnn op chain replacing the mhc_norm_fn tt-lang kernel: both
+        # ksplit and non-ksplit variants started hanging at device
+        # dispatch (compile succeeds; execution deadlocks). Math:
+        #   mixes[t, :] = (a[t, :] @ fn[:, :]) * rsqrt(mean(a[t]^2) + eps).
+        ttnn.matmul(a_tt, self.fn_tt, optional_output_tensor=mixes_tt)
+        sq = ttnn.multiply(a_tt, a_tt)
+        sq_mean = ttnn.mean(sq, dim=-1, keepdim=True)
+        sq_mean_eps = ttnn.add(sq_mean, self.norm_eps)
+        inv_rms = ttnn.rsqrt(sq_mean_eps)
+        ttnn.multiply(mixes_tt, inv_rms, output_tensor=mixes_tt)
 
         pre_tt = self._pre_tt
         post_tt = self._post_tt
