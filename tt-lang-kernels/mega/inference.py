@@ -1801,8 +1801,17 @@ class MegaModel(_BaseModel):
                 x_post_norm_bf16_out=sb.x_post_norm,
             )
 
+        # Optional layer-bisect: env DEBUG_NUM_LAYERS=N runs only the
+        # first N transformer blocks (N=0 skips all blocks). Useful for
+        # finding the first broken layer during bringup.
+        _debug_env = os.environ.get("DEBUG_NUM_LAYERS")
+        _debug_layers = (
+            self._layer_kernels[:int(_debug_env)]
+            if _debug_env is not None and _debug_env != ""
+            else self._layer_kernels)
+
         # 3. Block loop.
-        for layer_idx, lk in enumerate(self._layer_kernels):
+        for layer_idx, lk in enumerate(_debug_layers):
             a_tt, a_tt_next = (
                 self._block_forward_mega(
                     layer_idx, lk, a_tt, a_tt_next,
@@ -1872,20 +1881,29 @@ class MegaModel(_BaseModel):
 
     def _argmax_pull(self, top_val, top_idx) -> int:
         """Read per-chip top-1 device tensors and return the global argmax.
-        For this codebase the lm_head is N-sharded across 8 cols × 4 rows;
-        the reduction picks the highest val across all chips."""
+
+        Mega replicates the lm_head across the full mesh: every chip holds
+        the full [DIM, VOCAB] head and `ttnn.argmax` returns a global vocab
+        index. Logits agree across chips up to bf16 accumulation noise,
+        which is enough to flip near-tied argmaxes (we've seen the live
+        token indexed at 65802 on most chips and at 26075/42691 on others).
+        Pick the chip whose top-1 has the highest value — its logit at
+        that index dominates whatever the dissenting chips picked."""
         vals = ttnn.to_torch(top_val, mesh_composer=ttnn.ConcatMesh2dToTensor(
             self._mesh, tuple(self._mesh.shape), dims=(0, 1)))
         idxs = ttnn.to_torch(top_idx, mesh_composer=ttnn.ConcatMesh2dToTensor(
             self._mesh, tuple(self._mesh.shape), dims=(0, 1)))
-        # Each chip holds VOCAB / n_chips columns; the local idx needs to
-        # be globalized by adding (chip_id × per_chip_vocab).
-        n_chips = vals.numel()
-        per_chip = self.args.vocab_size // n_chips
         flat_vals = vals.flatten().float()
         flat_idxs = idxs.flatten().long()
+        if os.environ.get("DEBUG_LOGITS"):
+            print(f"[debug] top vals (per chip): "
+                  f"min={float(flat_vals.min()):.3f} "
+                  f"max={float(flat_vals.max()):.3f} "
+                  f"mean={float(flat_vals.mean()):.3f}")
+            print(f"[debug] top idxs (per chip first 8): "
+                  f"{flat_idxs[:8].tolist()}")
         winning_chip = int(flat_vals.argmax().item())
-        return winning_chip * per_chip + int(flat_idxs[winning_chip].item())
+        return int(flat_idxs[winning_chip].item())
 
     @torch.inference_mode()
     def prefill(self, tokens: list[int]) -> int:
