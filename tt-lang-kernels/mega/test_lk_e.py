@@ -888,7 +888,9 @@ def make_lk_e_kernel(mesh, hc_attn_fn_cpu, hc_attn_scale_cpu, hc_attn_base_cpu,
 
     def lk_e_kernel(attn_out_tt, prev_a_tt, w1_tt, w2_tt, w3_tt,
                     shared_partial_out, next_a_out,
-                    norm_slice_out=None):
+                    norm_slice_out=None,
+                    external_post_attn_tt=None,
+                    external_comb_sk_attn_tt=None):
         if "scratch" not in state:
             # attn-side hc_pre scratch
             state["mixes_a"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
@@ -921,12 +923,20 @@ def make_lk_e_kernel(mesh, hc_attn_fn_cpu, hc_attn_scale_cpu, hc_attn_base_cpu,
 
         # TODO: claude: I don't see any reason this whole thing cannot be a single fused kernel, you should have all the primtives you need for reshape, slice, etc in datamovement and you can use element_read/write if needed. If you need to do some ttnn ceremony before or after the kernel that's OK.
         # 1. hc_pre_attn on prev_a -> populates post_a, comb_sk_out_a stash.
-        post_attn_tt, comb_sk_attn_tt, _ = _run_hc_pre(
-            attn_consts, prev_a_tt,
-            state["mixes_a"], state["pre_a"], state["post_a"], state["comb_a"],
-            state["comb_sk_out_a"], state["apply_mix_out_a"],
-            state["a_sliced_scratch_a"],
-        )
+        # If the caller already ran hc_pre_attn (via Lk-A/L0 with the new
+        # post_tt_out / comb_sk_out_tt_out parameters), reuse those buffers
+        # directly and skip the recomputation entirely.
+        if (external_post_attn_tt is not None
+                and external_comb_sk_attn_tt is not None):
+            post_attn_tt = external_post_attn_tt
+            comb_sk_attn_tt = external_comb_sk_attn_tt
+        else:
+            post_attn_tt, comb_sk_attn_tt, _ = _run_hc_pre(
+                attn_consts, prev_a_tt,
+                state["mixes_a"], state["pre_a"], state["post_a"], state["comb_a"],
+                state["comb_sk_out_a"], state["apply_mix_out_a"],
+                state["a_sliced_scratch_a"],
+            )
 
         # 2. ttnn glue: prep attn_out -> x_post_tt fp32 [num_tokens*TILE, hidden].
         x_3d = ttnn.reshape(attn_out_tt, [NUM_TOKENS, 1, DIM])

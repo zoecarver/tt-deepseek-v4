@@ -699,7 +699,8 @@ def make_l0_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
 
     def l0_kernel(embed_tt, wq_a_w_tt, a_next_out, wq_a_out,
-                  x_post_norm_bf16_out=None):
+                  x_post_norm_bf16_out=None,
+                  post_tt_out=None, comb_sk_out_tt_out=None):
         if "scratch" not in state:
             state["mixes_tt"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
             state["pre_tt"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
@@ -728,9 +729,14 @@ def make_l0_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
 
         mixes_tt = state["mixes_tt"]
         pre_tt = state["pre_tt"]
-        post_tt = state["post_tt"]
+        # post_tt and comb_sk_out_tt are pure side-outputs of hc_pre,
+        # consumed by Lk-E's hc_post. Allow caller to supply external
+        # buffers so the stash can be wired across the CCL boundary.
+        post_tt = post_tt_out if post_tt_out is not None else state["post_tt"]
         comb_tt = state["comb_tt"]
-        comb_sk_out_tt = state["comb_sk_out_tt"]
+        comb_sk_out_tt = (comb_sk_out_tt_out
+                          if comb_sk_out_tt_out is not None
+                          else state["comb_sk_out_tt"])
         apply_mix_out_tt = state["apply_mix_out_tt"]
         a_sliced_scratch_tt = state["a_sliced_scratch_tt"]
         
