@@ -92,6 +92,18 @@ def _get_lk_b_fused_kernel(M: int, K: int, N: int):
     return _MEGA_KERNEL_CACHE[key]
 
 
+def _get_lk_f_gate_post_kernel(M: int, K: int, N: int):
+    """SUMMA matmul fused with sqrt(softplus) + bias add. Replaces the
+    ttnn.matmul + sqrt + softplus + add chain inside DeviceMoEGate."""
+    key = ("lk_f_matmul_gate_post", M, K, N)
+    if key not in _MEGA_KERNEL_CACHE:
+        lk_f_mod = _import_mega_kernel("test_lk_f")
+        _MEGA_KERNEL_CACHE[key] = lk_f_mod._make_matmul_gate_post_kernel(
+            M=M, K=K, N=N,
+            block_cfg=(1, 1, 8), part_cfg=(1, 8, 1))
+    return _MEGA_KERNEL_CACHE[key]
+
+
 # Cross-pipeline seam dump (PCC triage). No-op unless enabled in seam_dump.py.
 try:
     import seam_dump as _seam
@@ -1512,6 +1524,7 @@ class DeviceMoEGate(nn.Module):
         self.w_tt = ttnn.as_tensor(w_kn, **common_rep)
         self.bias_tt = ttnn.as_tensor(b_row, **common_rep)
         self._alloc_decode_tensors()
+        self._setup_lk_f_gate_post(cpu_bias)
 
     def _alloc_decode_tensors(self):
         """Pre-allocate per-step input/output buffers (M=1). The traced
@@ -1531,14 +1544,44 @@ class DeviceMoEGate(nn.Module):
             torch.zeros(1, self.n_experts, dtype=torch.bfloat16), **common_rep)
         self._upload_mapper = ttnn.ReplicateTensorToMesh(self.mesh)
 
+    def _setup_lk_f_gate_post(self, cpu_bias: torch.Tensor):
+        """Cache the fused gate matmul + sqrt(softplus) + bias kernel and
+        per-layer scratch. Kernel program is shape-only (M, K, N) so it's
+        shared across all MoE layers via _MEGA_KERNEL_CACHE."""
+        ttnn = self._ttnn
+        TILE = 32
+        self._lk_f_kernel = _get_lk_f_gate_post_kernel(
+            M=TILE, K=self.dim, N=self.n_experts)
+        rep = dict(device=self.mesh, dtype=ttnn.bfloat16,
+                   layout=ttnn.TILE_LAYOUT,
+                   memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                   mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh))
+        bias_padded_cpu = torch.zeros(TILE, self.n_experts, dtype=torch.bfloat16)
+        bias_padded_cpu[0, :] = cpu_bias.view(self.n_experts).to(torch.bfloat16)
+        self._lk_f_bias_padded_tt = ttnn.from_torch(bias_padded_cpu, **rep)
+        self._lk_f_x_padded_tt = ttnn.from_torch(
+            torch.zeros(TILE, self.dim, dtype=torch.bfloat16), **rep)
+        self._lk_f_scores_padded_tt = ttnn.from_torch(
+            torch.zeros(TILE, self.n_experts, dtype=torch.bfloat16), **rep)
+        self._lk_f_biased_padded_tt = ttnn.from_torch(
+            torch.zeros(TILE, self.n_experts, dtype=torch.bfloat16), **rep)
+
     def forward_device(self, x_tt):
         """Pure-device gate body: x_tt [M=1, dim] bf16 device tensor in.
         Returns (weights_tt, indices_tt) device tensors. No host transfers."""
         ttnn = self._ttnn
-        ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    optional_output_tensor=self._raw_tt)
-        scores_tt = ttnn.sqrt(ttnn.softplus(self._raw_tt))
-        biased_tt = ttnn.add(scores_tt, self.bias_tt)
+        TILE = 32
+        x_padded = ttnn.pad(x_tt, padding=[(0, TILE - 1), (0, 0)], value=0.0)
+        ttnn.copy(x_padded, self._lk_f_x_padded_tt)
+        # SWAP-Lk-F-gate-post: fused matmul + sqrt(softplus) + bias.
+        self._lk_f_kernel(self._lk_f_x_padded_tt, self.w_tt,
+                          self._lk_f_bias_padded_tt,
+                          self._lk_f_scores_padded_tt,
+                          self._lk_f_biased_padded_tt)
+        scores_tt = ttnn.slice(
+            self._lk_f_scores_padded_tt, [0, 0], [1, self.n_experts])
+        biased_tt = ttnn.slice(
+            self._lk_f_biased_padded_tt, [0, 0], [1, self.n_experts])
         _, indices_tt = ttnn.topk(biased_tt, k=self.topk, dim=-1, largest=True, sorted=True)
         gathered_tt = ttnn.gather(scores_tt, dim=-1, index=indices_tt)
         wsum_tt = ttnn.sum(gathered_tt, dim=-1, keepdim=True)
