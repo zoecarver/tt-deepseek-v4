@@ -849,7 +849,7 @@ USE_GALAXY_MESH = True            # (4,8) vs (1,4)
 USE_L1_QKV = True                 # q/kv in L1 vs DRAM
 USE_SPARSE_CACHE = True           # first NUM_VALID slots random, rest zero
 USE_SENTINEL_IDXS = True          # idx >= NUM_VALID -> -1 sentinel
-NUM_VALID = 5                     # how many kv_cache slots are filled
+NUM_VALID = 1                     # how many kv_cache slots are filled
 SLOT = NUM_VALID - 1              # paged_update_cache write slot
 
 MESH_SHAPE = (4, 8) if USE_GALAXY_MESH else (1, 4)

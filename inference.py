@@ -733,9 +733,12 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
     num_tokens = B * S
     num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
 
+    _dump_layer = layer.layer_id
+    _dump_pos = getattr(_block_forward, "_dump_pos", 0)
     with _phase("block.hc_pre"):
         hc_out_fp32 = mhc_attn.hc_pre_device(
             num_tokens, num_tokens_pad, a_tt=x)
+    _seam.dump("hc_pre_attn_out", _dump_layer, _dump_pos, hc_out_fp32)
     with _phase("block.norm"):
         # DeviceRMSNorm.forward_device reads its x_tt arg directly and writes
         # _out_tt; _x_upload_tt is only used by the host-upload wrapper. Reuse
@@ -745,6 +748,7 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
                       output_tensor=attn_norm_dn._x_upload_tt)
         norm_out_tt = attn_norm_dn.forward_device(
             attn_norm_dn._x_upload_tt, num_tokens)
+    _seam.dump("x_post_norm", _dump_layer, _dump_pos, norm_out_tt)
     with _phase("block.attn"):
         ttnn.slice(norm_out_tt, [0, 0], [num_tokens, hidden],
                    output_tensor=mhc_attn._norm_slice_tt)
@@ -753,6 +757,7 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
         # layers BEFORE the block loop, so the body here is pure device
         # work (no host->device uploads inside what will be the trace).
         attn_out_tt = attn_dev.forward_device(bridge_tt, start_pos, start_pos_tt)
+    _seam.dump("attn_out", _dump_layer, _dump_pos, attn_out_tt)
     with _phase("block.hc_post"):
         x_2d = ttnn.reshape(attn_out_tt, [num_tokens, 1, hidden])
         x_repeated = ttnn.repeat(x_2d, ttnn.Shape([1, mhc, 1]))
@@ -766,10 +771,10 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
         ttnn.typecast(x_post_input, dtype=ttnn.float32,
                       output_tensor=mhc_attn._x_upload_tt)
         post_out_tt = mhc_attn.hc_post_device(num_tokens)
-
     with _phase("block.hc_pre"):
         a_input_tt = _mhc_post_to_a_tt(
             ttnn, post_out_tt, num_tokens, num_tokens_pad, mhc, hidden)
+        _seam.dump("post_attn_resid", _dump_layer, _dump_pos, a_input_tt)
         ffn_hc_out_fp32 = mhc_ffn.hc_pre_device(
             num_tokens, num_tokens_pad, a_tt=a_input_tt)
     with _phase("block.norm"):
@@ -780,8 +785,11 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
     with _phase("block.ffn"):
         ttnn.slice(ffn_norm_out_tt, [0, 0], [num_tokens, hidden],
                    output_tensor=mhc_ffn._norm_slice_tt)
+        _seam.dump("ffn_norm_out", _dump_layer, _dump_pos,
+                   mhc_ffn._norm_slice_tt)
         moe_out_tt = layer.ffn.forward_device(
             mhc_ffn._norm_slice_tt, input_ids_tt)
+    _seam.dump("ffn_out", _dump_layer, _dump_pos, moe_out_tt)
     with _phase("block.hc_post"):
         x_2d = ttnn.reshape(moe_out_tt, [num_tokens, 1, hidden])
         x_repeated = ttnn.repeat(x_2d, ttnn.Shape([1, mhc, 1]))
@@ -917,6 +925,7 @@ class Transformer(nn.Module):
                 value=0.0,
             )
         _seam.dump("embed_out", -1, _dump_pos, embed_tt)
+        _block_forward._dump_pos = _dump_pos
         with _phase("blocks"):
             for layer_idx, layer in enumerate(self.layers):
                 _seam.dump("a_tt_in", layer_idx, _dump_pos, a_tt)
@@ -5125,15 +5134,19 @@ class DeviceAttention(nn.Module):
         # pre_stage_decode (called by the orchestrator before forward_device,
         # outside any future trace region). Body below is pure device work.
 
+        _dump_layer = attn.layer_id
+        _dump_pos = getattr(_block_forward, "_dump_pos", 0)
         # Q path: wq_a -> q_norm -> wq_b -> per-head rsqrt-norm -> rotary.
         with _phase("attn.q"):
             q_lora_tt = attn.wq_a.forward_device(x_tt)            # [B, S, q_lora_rank]
+            _seam.dump("wq_a_partial", _dump_layer, _dump_pos, q_lora_tt)
             # q_norm: needs a [Mpad, hidden] device tensor. Reshape and pad-on-device.
             q_lora_2d = ttnn.reshape(q_lora_tt, [B * S, self.q_lora_rank])
             qr_2d = self._rmsnorm_device(self.q_norm_dev, q_lora_2d, B * S)
             qr_tt = ttnn.reshape(qr_2d, [B, S, self.q_lora_rank])
 
             q_full_tt = attn.wq_b.forward_device(qr_tt)           # [B, S, H*D]
+            _seam.dump("q_full", _dump_layer, _dump_pos, q_full_tt)
             q_tt = ttnn.reshape(q_full_tt, [B, S, H, D])
             q_tt = _device_q_rsqrt_norm(ttnn, q_tt, self.eps)
 
@@ -5146,10 +5159,12 @@ class DeviceAttention(nn.Module):
             q_rope = _device_apply_rotary_interleaved(
                 ttnn, self._q_rope_scratch_tt, cos_q, sin_q, inverse=False)
             q_tt = ttnn.concat([self._q_nope_scratch_tt, q_rope], dim=-1)
+            _seam.dump("q_rotated", _dump_layer, _dump_pos, q_tt)
 
         # KV path: wkv -> kv_norm -> rotary.
         with _phase("attn.kv"):
             kv_tt = attn.wkv.forward_device(x_tt)                 # [B, S, D]
+            _seam.dump("kv_partial", _dump_layer, _dump_pos, kv_tt)
             kv_2d = ttnn.reshape(kv_tt, [B * S, D])
             kv_2d = self._rmsnorm_device(self.kv_norm_dev, kv_2d, B * S)
             kv_tt = ttnn.reshape(kv_2d, [B, S, D])
@@ -5187,6 +5202,7 @@ class DeviceAttention(nn.Module):
             )
             kv_rope_only = ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D])
             kv_tt = ttnn.concat([kv_nope_q, kv_rope_only], dim=-1)
+            _seam.dump("kv_rotated", _dump_layer, _dump_pos, kv_tt)
 
         # Build the topk index tensor entirely on device.
         # Window slot indices are sliced from the precomputed
@@ -5270,6 +5286,7 @@ class DeviceAttention(nn.Module):
                 q_tt, kv_full_tt, idxs_tt, valid_tt, S, K
             )
             # o_tt: [B, S, H, D].
+            _seam.dump("dsp_o_post_attn", _dump_layer, _dump_pos, o_tt)
 
         with _phase("attn.o"):
             # Inverse rotary on o[..., -rd:].
@@ -5281,6 +5298,7 @@ class DeviceAttention(nn.Module):
             o_rope = _device_apply_rotary_interleaved(
                 ttnn, self._o_rope_scratch_tt, cos_o, sin_o, inverse=True)
             o_tt = ttnn.concat([self._o_nope_scratch_tt, o_rope], dim=-1)
+            _seam.dump("dsp_o_post_rotary", _dump_layer, _dump_pos, o_tt)
 
             # Group reshape: [B, S, H, D] -> [G, B*S, H*D/G] for batched matmul.
             per_group = (H * D) // self.n_groups
@@ -5299,6 +5317,7 @@ class DeviceAttention(nn.Module):
             o_wo_a = ttnn.permute(o_wo_a_rs, [1, 2, 0, 3])  # [B, S, G, R]
             R = self.o_lora_rank
             o_flat = ttnn.reshape(o_wo_a, [B, S, self.n_groups * R])
+            _seam.dump("dsp_o_post_wo_a", _dump_layer, _dump_pos, o_flat)
             out_tt = attn.wo_b.forward_device(o_flat)             # [B, S, dim]
         return out_tt
 

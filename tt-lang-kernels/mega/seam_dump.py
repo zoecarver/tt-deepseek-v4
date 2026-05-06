@@ -23,10 +23,10 @@ from pathlib import Path
 import torch
 
 
-_ENABLED = False
+_ENABLED = True
 _BASE = "/home/ubuntu/zcarver/seam_dumps"
 _TOKENS: set[int] | None = {0}        # set to None for all
-_LAYERS: set[int] | None = None        # set to None for all (or e.g. {0, 1, 2})
+_LAYERS: set[int] | None = {0}        # set to None for all (or e.g. {0, 1, 2})
 
 _DIR: Path | None = None
 _PIPELINE: str | None = None
@@ -48,12 +48,14 @@ def enabled() -> bool:
     return _ENABLED and _DIR is not None
 
 
-def dump(name: str, layer: int, tok: int, t) -> None:
+def dump(name: str, layer: int, tok: int, t, composer=None) -> None:
     """Save one tensor at a named seam.
 
     `t` may be a torch.Tensor, a ttnn.Tensor, or None. None is skipped.
-    ttnn tensors are downloaded with `to_torch` on chip 0 (caller should
-    only dump tensors that are replicated, or a chip-0 shard view).
+    For ttnn tensors, an optional `composer` (e.g. ConcatMesh2dToTensor)
+    can be passed for sharded tensors. If absent, replicated tensors
+    download via chip-0 view; sharded tensors that can't be resolved are
+    skipped with a printed warning so the rest of the dump survives.
     """
     if not _ENABLED or _DIR is None or t is None:
         return
@@ -61,24 +63,35 @@ def dump(name: str, layer: int, tok: int, t) -> None:
         return
     if _LAYERS is not None and layer != -1 and layer not in _LAYERS:
         return
-    arr = _to_torch(t)
+    arr = _to_torch(t, composer=composer, name=name, layer=layer, tok=tok)
     if arr is None:
         return
     fn = _DIR / f"T{tok:02d}_L{layer:02d}_{name}.pt"
     torch.save(arr, fn)
 
 
-def _to_torch(t):
+def _to_torch(t, composer=None, name="?", layer=-1, tok=-1):
     if isinstance(t, torch.Tensor):
         return t.detach().cpu().contiguous()
     try:
         import ttnn
     except Exception:
         return None
-    if isinstance(t, ttnn.Tensor):
+    if not isinstance(t, ttnn.Tensor):
+        return None
+    if composer is not None:
         try:
-            full = ttnn.to_torch(t, mesh_composer=None)
-        except Exception:
-            full = ttnn.to_torch(t)
-        return full.detach().cpu().contiguous()
-    return None
+            full = ttnn.to_torch(t, mesh_composer=composer)
+            return full.detach().cpu().contiguous()
+        except Exception as e:
+            print(f"[seam_dump] WARN composer failed for "
+                  f"T{tok:02d}_L{layer:02d}_{name}: {e}")
+            return None
+    try:
+        shards = ttnn.get_device_tensors(t)
+        s0 = ttnn.to_torch(shards[0])
+        return s0.detach().cpu().contiguous()
+    except Exception as e:
+        print(f"[seam_dump] WARN skip sharded "
+              f"T{tok:02d}_L{layer:02d}_{name}: {type(e).__name__}: {e}")
+        return None

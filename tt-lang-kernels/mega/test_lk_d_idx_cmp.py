@@ -154,12 +154,8 @@ def make_lk_d_idx_cmp_kernel(mesh, sharded_input_memcfg):
     NCAT = 2 * CDIM
     state: dict = {}
 
-    # Fused matmul shape: M=TILE, K=DIM, N=2*CDIM.
-    # Mt=1, Kt=128, Nt=16. block=(1,4,8) part=(1,4,1) -> 4 cores,
-    # Nb=4 N_BPN=1, Kb=16. x is mcast once across both linears.
-    matmul_kernel = _make_summa_matmul_kernel(
-        M=M_PAD, K=DIM, N=NCAT,
-        block_cfg=(1, 4, 8), part_cfg=(1, 4, 1))
+    # Triage: replaced fused SUMMA ttl matmul with ttnn.matmul to bisect
+    # the cmp→score isolated-stress hang. Restore once root-cause is known.
 
     rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -170,25 +166,16 @@ def make_lk_d_idx_cmp_kernel(mesh, sharded_input_memcfg):
                             kv_state_front_tt, kv_state_back_tt,
                             score_state_front_tt, score_state_back_tt,
                             kv_out, score_out):
-        if "scratch" not in state:
-            state["kv_gate_padded_tt"] = ttnn.from_torch(
-                torch.zeros((M_PAD, NCAT), dtype=torch.bfloat16),
-                dtype=ttnn.bfloat16, **rep)
-            state["scratch"] = True
+        # ttnn.matmul replacement for the SUMMA kernel. x_tt is [1, 1, DIM]
+        # bf16 replicated; wkv_gate_w_tt is [DIM, NCAT]. Output is
+        # [1, 1, NCAT] which we slice into kv | score halves.
+        kv_gate_out = ttnn.matmul(
+            x_tt, wkv_gate_w_tt,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
-        # Pad x [1, 1, DIM] -> [TILE, DIM] for SUMMA M-axis.
-        x_2d = ttnn.reshape(x_tt, [B, DIM])
-        x_padded = ttnn.pad(x_2d, padding=[(0, M_PAD - B), (0, 0)], value=0.0)
-
-        # Fused SUMMA: kv|gate = x · [wkv|wgate] -> [TILE, 2*CDIM].
-        matmul_kernel(x_padded, wkv_gate_w_tt, state["kv_gate_padded_tt"])
-
-        # Slice halves + reshape to [1, 1, CDIM].
-        kv_row = ttnn.slice(state["kv_gate_padded_tt"], [0, 0], [B, CDIM])
-        kv_3d = ttnn.reshape(kv_row, [B, 1, CDIM])
-        score_row = ttnn.slice(
-            state["kv_gate_padded_tt"], [0, CDIM], [B, NCAT])
-        score_3d = ttnn.reshape(score_row, [B, 1, CDIM])
+        # Slice halves -> [B, 1, CDIM] each.
+        kv_3d = ttnn.slice(kv_gate_out, [0, 0, 0], [B, 1, CDIM])
+        score_3d = ttnn.slice(kv_gate_out, [0, 0, CDIM], [B, 1, NCAT])
 
         # APE add (TODO: mega).
         ape_slot = ttnn.embedding(

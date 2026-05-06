@@ -106,6 +106,7 @@ from test_lk_d_idx_emit import make_lk_d_idx_emit_kernel  # noqa: E402
 from test_lk_d_idx_score import make_lk_d_idx_score_kernel  # noqa: E402
 from test_lk_d_topk import make_lk_d_topk_kernel   # noqa: E402
 from test_lk_d_comp import make_lk_d_comp_kernel   # noqa: E402
+import test_lk_dsparse as _lk_dsparse_mod          # noqa: E402
 from test_lk_dsparse import make_lk_dsparse_kernel # noqa: E402
 from test_lk_e import make_lk_e_kernel             # noqa: E402
 from test_lk_f import make_lk_f_kernel             # noqa: E402
@@ -131,6 +132,8 @@ from inference import (                            # noqa: E402
     DeviceIndexer,
     DeviceColLinear,
     DeviceLMHead,
+    DeviceSparseAttn,
+    _device_apply_rotary_interleaved,
     DeviceMHC,
     DeviceRMSNorm,
     _mhc_post_to_a_tt,
@@ -138,7 +141,7 @@ from inference import (                            # noqa: E402
     _window_topk_row_for_pos,
     _open_mesh,
     _close_mesh,
-    _phase, _phase_report, _phase_postwarm,
+    _phase as _phase_orig, _phase_report, _phase_postwarm,
     _phase_snapshot_at_trace_warm,
     _PHASE_ACCUM, _PHASE_COUNTS,
     _PHASE_PREWARM_ACCUM, _PHASE_PREWARM_COUNTS,
@@ -146,6 +149,29 @@ from inference import (                            # noqa: E402
     _sylvester_hadamard,
     _weight_to_bf16,
 )
+from contextlib import contextmanager as _contextmanager
+
+# Triage: per-phase host-side enter/exit logging. When DEBUG_PHASE_SYNC
+# is True, also synchronize_device on phase exit so the exit log reflects
+# device-side completion (not just host dispatch). Combined with the
+# per-layer done print, lets us pinpoint exactly which kernel hung the
+# device.
+DEBUG_PHASE_LOG = True
+DEBUG_PHASE_SYNC = False
+_DEBUG_MESH = [None]
+
+
+@_contextmanager
+def _phase(name: str):
+    if DEBUG_PHASE_LOG:
+        print(f"[phase] {name} enter", flush=True)
+    with _phase_orig(name):
+        yield
+    if DEBUG_PHASE_SYNC and _DEBUG_MESH[0] is not None:
+        import ttnn as _ttnn_dbg
+        _ttnn_dbg.synchronize_device(_DEBUG_MESH[0])
+    if DEBUG_PHASE_LOG:
+        print(f"[phase] {name} exit", flush=True)
 
 # Module-level constants used by the per-step buffer / Final-head packing
 # helpers. The mega kernels pin these exactly (DIM, MHC, etc. are baked into
@@ -166,6 +192,12 @@ INDEX_N_HEADS = 64
 INDEX_RATIO = 4
 INDEX_TOPK_BUCKET = 128  # smallest bucket the topk kernel was built for
 INDEX_T_PAD = 128        # indexer kv_cache slot count after padding
+
+# Triage knob: when True, replace lk.lk_dsparse(...) with the legacy
+# DeviceSparseAttn-equivalent ttnn op chain (paged_update_cache + sparse
+# attn body + inverse rotary + wo_a + wo_b). Used to isolate mega kernel
+# drift from input drift. Flip to False once the kernel matches.
+DSPARSE_HYBRID = True
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +287,10 @@ class LayerKernels:
         "lk_dsparse", "lk_e", "lk_f",
         "mhc_ffn", "mhc_attn", "attn_norm",
         "weights",
+        # Triage-only: legacy DeviceSparseAttn + cos/sin/softmax_scale for
+        # the hybrid path that bypasses lk.lk_dsparse.
+        "dsa_legacy", "cos_full_tt", "sin_full_tt", "softmax_scale",
+        "dsparse_sharded_memcfg",
     )
 
     def __init__(self, layer_idx: int):
@@ -292,6 +328,12 @@ class LayerKernels:
         # rather than `ttnn.rms_norm`, which gave numerically different
         # output during bringup.
         self.attn_norm = None
+        # Triage-only: legacy DeviceSparseAttn for hybrid swap.
+        self.dsa_legacy = None
+        self.cos_full_tt = None
+        self.sin_full_tt = None
+        self.softmax_scale = None
+        self.dsparse_sharded_memcfg = None
         # Per-layer device weight tensors uploaded once at offload time.
         # Kept here (not on the closures) so we can also free them on
         # tear-down without poking inside the kernel state.
@@ -514,6 +556,25 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
         sharded_input_memcfg=sharded_memcfg_dsparse,
         softmax_scale=softmax_scale,
     )
+    # Triage-only: legacy DeviceSparseAttn + raw cos/sin tables for the
+    # hybrid swap path. Replaces lk.lk_dsparse(...) end-to-end with the
+    # ttnn-only legacy implementation to isolate kernel vs input drift.
+    lk.dsa_legacy = DeviceSparseAttn(
+        mesh=mesh, attn_sink=attn.attn_sink.data, softmax_scale=softmax_scale)
+    lk.cos_full_tt = ttnn.as_tensor(
+        cos_full_cpu.contiguous(), device=mesh, dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+    )
+    lk.sin_full_tt = ttnn.as_tensor(
+        sin_full_cpu.contiguous(), device=mesh, dtype=ttnn.bfloat16,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+    )
+    lk.softmax_scale = softmax_scale
+    lk.dsparse_sharded_memcfg = sharded_memcfg_dsparse
     # wo_a: nn.Linear weight is [n_groups*o_lora_rank, in_per_group].
     # Lk-Dsparse expects [n_groups, in_per_group, o_lora_rank] (3D, block-diag).
     _n_groups = attn.n_local_groups
@@ -781,6 +842,7 @@ class MegaModel(_BaseModel):
         buffers are allocated below.
         """
         self._mesh = mesh
+        _DEBUG_MESH[0] = mesh
         args = self.args
 
         # Per-step host-upload buffers (input_ids, start_pos, kv_slot). The
@@ -944,6 +1006,70 @@ class MegaModel(_BaseModel):
         ang = torch.outer(t, freqs)            # [seqlen, rd/2]
         return ang.cos().to(torch.bfloat16), ang.sin().to(torch.bfloat16)
 
+    def _hybrid_dsparse(self, lk: "LayerKernels", sb: "StepBuffers",
+                        kv_cache_tt, kv_slot_tt, topk_idxs_tt,
+                        sink_4d_tt, start_pos_tt):
+        """Triage hybrid: ttnn-only mirror of legacy DeviceAttention's sparse
+        block (paged_update_cache + DeviceSparseAttn.forward_device + inverse
+        rotary + block-diag wo_a + wo_b). Writes to sb.attn_out. Used to
+        isolate mega kernel drift from input drift in production."""
+        args = self.args
+        B, S = 1, 1
+        H = args.n_heads
+        D = args.head_dim
+        rd = args.rope_head_dim
+        rd_half = rd // 2
+        win = args.window_size
+        K = win                         # L0 has compress_ratio=0
+        n_groups = args.o_groups
+        o_lora_rank = args.o_lora_rank
+        per_group = (H * D) // n_groups
+
+        # 1. paged_update_cache (matches kernel and legacy).
+        kv_4d = ttnn.reshape(sb.kv_rotated, [1, B, 1, D])
+        kv_4d_sharded = ttnn.to_memory_config(
+            kv_4d, memory_config=lk.dsparse_sharded_memcfg)
+        ttnn.experimental.paged_update_cache(
+            kv_cache_tt, kv_4d_sharded, update_idxs_tensor=kv_slot_tt)
+
+        # 2. Legacy DeviceSparseAttn body. Reuse its idx-mask helper to keep
+        #    the additive -inf path identical.
+        dsa = lk.dsa_legacy
+        idxs_tt, valid_tt = dsa._idxs_int_tile_to_idxs_and_mask(
+            topk_idxs_tt, B, S, K)
+        kv_full_tt = ttnn.reshape(kv_cache_tt, [128, D])
+        o_tt = dsa.forward_device(sb.q_rotated, kv_full_tt, idxs_tt, valid_tt,
+                                  S, K)                   # [B, S, H, D]
+
+        # 3. Inverse rotary on o[..., -rd:].
+        cos = ttnn.embedding(start_pos_tt, lk.cos_full_tt,
+                             layout=ttnn.TILE_LAYOUT)
+        sin = ttnn.embedding(start_pos_tt, lk.sin_full_tt,
+                             layout=ttnn.TILE_LAYOUT)
+        cos = ttnn.reshape(cos, [1, S, 1, rd_half])
+        sin = ttnn.reshape(sin, [1, S, 1, rd_half])
+        o_nope = ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H, D - rd])
+        o_rope = ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H, D])
+        o_rope = _device_apply_rotary_interleaved(
+            ttnn, o_rope, cos, sin, inverse=True)
+        o_tt = ttnn.concat([o_nope, o_rope], dim=-1)
+
+        # 4. Group reshape + block-diag wo_a (replicated [G, in, R] weight).
+        o_perm = ttnn.reshape(o_tt, [B, S, n_groups, per_group])
+        o_perm = ttnn.permute(o_perm, [2, 0, 1, 3])
+        o_g = ttnn.reshape(o_perm, [n_groups, B * S, per_group])
+        o_wo_a_g = ttnn.matmul(
+            o_g, lk.weights["wo_a"], memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        o_wo_a_rs = ttnn.reshape(
+            o_wo_a_g, [n_groups, B, S, o_lora_rank])
+        o_wo_a = ttnn.permute(o_wo_a_rs, [1, 2, 0, 3])
+        o_flat = ttnn.reshape(o_wo_a, [B, S, n_groups * o_lora_rank])
+
+        # 5. wo_b matmul into [B, S, dim].
+        out_tt = ttnn.matmul(
+            o_flat, lk.weights["wo_b"], memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.copy(out_tt, sb.attn_out)
+
     # -----------------------------------------------------------------
     # Hot path
     # -----------------------------------------------------------------
@@ -958,6 +1084,8 @@ class MegaModel(_BaseModel):
         state on core (0, 0) conflicts with the score kernel's PipeNet on
         the same core and the device hangs. Track as a tt-lang issue.
         """
+        print(f"[block] pos={self._dump_pos} L{layer_idx} enter",
+              flush=True)
         _seam.dump("a_tt_in", layer_idx, self._dump_pos, a_tt)
         if layer_idx == 0:
             pass
@@ -983,6 +1111,7 @@ class MegaModel(_BaseModel):
         with _phase("lk_c"):
             lk.lk_c(sb.q_full, x_for_wkv, None, None, start_pos_tt,
                     lk.weights["wkv"], sb.q_rotated, sb.kv_partial)
+        _seam.dump("q_rotated", layer_idx, self._dump_pos, sb.q_rotated)
         _seam.dump("kv_partial", layer_idx, self._dump_pos, sb.kv_partial)
 
         with _phase("lk_d1"):
@@ -1038,7 +1167,6 @@ class MegaModel(_BaseModel):
                         lk.weights["idx_score_state_back_scratch"],
                         self._idx_kv_normed_sink_tt,
                     )
-            ttnn.synchronize_device(self._mesh)
             with _phase("lk_d_idx_score"):
                 lk.lk_d_idx_score(
                     x_for_wkv,
@@ -1104,12 +1232,21 @@ class MegaModel(_BaseModel):
             kv_cache_tt = self._kv_cache_tt[layer_idx]
             kv_slot_tt = self._kv_slot_tt[layer_idx]
             sink_4d_tt = lk.weights["sink_4d"]
-            lk.lk_dsparse(
-                sb.q_rotated, sb.kv_rotated, kv_cache_tt, kv_slot_tt,
-                topk_idxs_tt, sink_4d_tt,
-                None, None, start_pos_tt,
-                lk.weights["wo_a"], lk.weights["wo_b"], sb.attn_out,
-            )
+            if DSPARSE_HYBRID:
+                self._hybrid_dsparse(
+                    lk, sb, kv_cache_tt, kv_slot_tt, topk_idxs_tt,
+                    sink_4d_tt, start_pos_tt)
+            else:
+                _lk_dsparse_mod._TRIAGE_CTX = (layer_idx, self._dump_pos)
+                try:
+                    lk.lk_dsparse(
+                        sb.q_rotated, sb.kv_rotated, kv_cache_tt, kv_slot_tt,
+                        topk_idxs_tt, sink_4d_tt,
+                        None, None, start_pos_tt,
+                        lk.weights["wo_a"], lk.weights["wo_b"], sb.attn_out,
+                    )
+                finally:
+                    _lk_dsparse_mod._TRIAGE_CTX = None
         _seam.dump("attn_out", layer_idx, self._dump_pos, sb.attn_out)
 
         # hc_pre_attn bridge: populate legacy DeviceMHC stash from a_tt so
@@ -1234,6 +1371,8 @@ class MegaModel(_BaseModel):
                 mhc, hidden)
             ttnn.copy(next_a_input_tt, a_tt_next)
         _seam.dump("a_tt_out", layer_idx, self._dump_pos, a_tt_next)
+        print(f"[block] pos={self._dump_pos} L{layer_idx} dispatch done",
+              flush=True)
         return a_tt_next
 
     def _block_forward_mega_full(self, layer_idx: int, lk: LayerKernels,
@@ -1424,12 +1563,17 @@ class MegaModel(_BaseModel):
             kv_cache_tt = self._kv_cache_tt[layer_idx]
             kv_slot_tt = self._kv_slot_tt[layer_idx]
             sink_4d_tt = lk.weights["sink_4d"]
-            lk.lk_dsparse(
-                sb.q_rotated, sb.kv_rotated, kv_cache_tt, kv_slot_tt,
-                topk_idxs_tt, sink_4d_tt,
-                None, None, start_pos_tt,
-                lk.weights["wo_a"], lk.weights["wo_b"], sb.attn_out,
-            )
+            if DSPARSE_HYBRID:
+                self._hybrid_dsparse(
+                    lk, sb, kv_cache_tt, kv_slot_tt, topk_idxs_tt,
+                    sink_4d_tt, start_pos_tt)
+            else:
+                lk.lk_dsparse(
+                    sb.q_rotated, sb.kv_rotated, kv_cache_tt, kv_slot_tt,
+                    topk_idxs_tt, sink_4d_tt,
+                    None, None, start_pos_tt,
+                    lk.weights["wo_a"], lk.weights["wo_b"], sb.attn_out,
+                )
 
         # --- Lk-E: hc_post_attn + ffn_norm + shared expert ---------------
         # Lk-E writes the next residual into a_tt_next and the shared
@@ -1838,7 +1982,8 @@ class MegaModel(_BaseModel):
     def _pre_stage(self, token_id: int, pos: int):
         """Per-step host->device uploads. Writes input_ids, start_pos, and
         per-layer KV slot indices into pre-allocated buffers. Must run
-        BEFORE `execute_trace` since the trace body has no host I/O."""
+        BEFORE `execute_trace` since the trace body has no host I/O.
+        """
         ids = ttnn.from_torch(
             torch.tensor([[token_id]], dtype=torch.int32),
             dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT,
@@ -1970,12 +2115,18 @@ class MegaModel(_BaseModel):
         # from the captured trace per (no_emit / emit) variant.
         self._emit_now = is_emit
         self._dump_pos = pos
+        print(f"[step] pos={pos} tok={token_id} emit={is_emit} "
+              f"warmup={self._trace_warmup_remaining}", flush=True)
         self._pre_stage(token_id, pos)
+        print(f"[step] pos={pos} pre_stage done", flush=True)
 
         if self._trace_warmup_remaining > 0:
             self._trace_warmup_remaining -= 1
             top_val, top_idx = self._step_body()
-            return self._argmax_pull(top_val, top_idx)
+            print(f"[step] pos={pos} step_body done", flush=True)
+            r = self._argmax_pull(top_val, top_idx)
+            print(f"[step] pos={pos} argmax_pull -> {r}", flush=True)
+            return r
 
         target = self._trace_emit if is_emit else self._trace_no_emit
         if target is None:

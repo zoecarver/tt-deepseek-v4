@@ -58,8 +58,10 @@ def main(a_dir: str, b_dir: str) -> int:
         sa = "x".join(str(x) for x in a.shape)
         sb = "x".join(str(x) for x in b.shape)
         if a.shape != b.shape:
-            print(f"{tok:>3} {lyr:>3} {name:<32} {sa:<24} {sb:<24} {'SHAPE!':>9} {'-':>10}")
-            continue
+            if a.numel() != b.numel():
+                print(f"{tok:>3} {lyr:>3} {name:<32} {sa:<24} {sb:<24} {'SHAPE!':>9} {'-':>10}")
+                continue
+            a = a.reshape(b.shape)
         p = pcc(a, b)
         max_d = (a.float() - b.float()).abs().max().item()
         marker = " <<< FIRST_BAD" if (p < 0.99 and not first_bad_printed) else ""
