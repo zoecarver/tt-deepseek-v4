@@ -144,6 +144,7 @@ from inference import (                            # noqa: E402
     _PHASE_PREWARM_ACCUM, _PHASE_PREWARM_COUNTS,
     _MHC_TILE,
     _sylvester_hadamard,
+    _weight_to_bf16,
 )
 
 # Module-level constants used by the per-step buffer / Final-head packing
@@ -252,7 +253,7 @@ class LayerKernels:
         "lk_d_idx_score", "lk_d_topk",
         "lk_d_comp",
         "lk_dsparse", "lk_e", "lk_f",
-        "mhc_ffn", "attn_norm",
+        "mhc_ffn", "mhc_attn", "attn_norm",
         "weights",
     )
 
@@ -279,6 +280,12 @@ class LayerKernels:
         # before the FFN body to populate the stash and hc_post_ffn after
         # to assemble the next layer's a_tt.
         self.mhc_ffn = None
+        # Legacy DeviceMHC for the hc_post_attn bridge — Lk-E's internal
+        # hc_pre_attn / hc_post_attn diverged from legacy at PCC=0.49 in
+        # bring-up triage. Until lk_e is fixed/replaced, we override its
+        # next-residual output with `mhc_attn.hc_post_device(...)` driven
+        # from the (correct) attn_out and a freshly populated stash.
+        self.mhc_attn = None
         # Legacy DeviceRMSNorm for the attn-side bridge (Lk-A bakes gamma
         # into wq_a so it never materializes the post-norm tile, but Lk-C
         # needs it). Using the kernel-based norm (matches legacy exactly)
@@ -336,7 +343,9 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
     # Lk-A expects wq_a in [DIM=in, Q_LORA_RANK=out] orientation with
     # gamma pre-baked into the K (DIM) axis: Wg[k, n] = gamma[k] * W[k, n].
     # nn.Linear stores it as [out, in] so we transpose first.
-    _wq_a_T = attn.wq_a.weight.data.transpose(0, 1).contiguous()
+    # Pass the Parameter (not .data) so _weight_to_bf16 sees .scale and
+    # dequantizes FP8/FP4 weights instead of naive byte-cast.
+    _wq_a_T = _weight_to_bf16(attn.wq_a.weight).transpose(0, 1).contiguous()
     _gamma_attn = layer.attn_norm.weight.data
     _wq_a_baked = (_gamma_attn.float()[:, None] * _wq_a_T.float()) \
         .to(torch.bfloat16).contiguous()
@@ -362,13 +371,13 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
     lk.lk_b = make_lk_b_kernel(
         mesh,
         gamma_cpu=attn.q_norm.weight.data,
-        wq_b_cpu=attn.wq_b.weight.data.transpose(0, 1).contiguous(),
+        wq_b_cpu=_weight_to_bf16(attn.wq_b.weight).transpose(0, 1).contiguous(),
     )
 
     # --- Lk-C: q_rsqrt_norm + q rotary + wkv ------------------------------
     # wkv expected as [DIM=in, HEAD_DIM=out]; transpose from nn.Linear's [out, in].
     lk.lk_c = make_lk_c_kernel(mesh, cos_full_cpu, sin_full_cpu)
-    _wkv_T = attn.wkv.weight.data.transpose(0, 1).contiguous()
+    _wkv_T = _weight_to_bf16(attn.wkv.weight).transpose(0, 1).contiguous()
     lk.weights["wkv"] = _replicate_weight(mesh, _wkv_T, ttnn.bfloat16)
 
     # --- Lk-D1: kv_norm + kv rotary + act_quant_block ---------------------
@@ -391,15 +400,15 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
         # legacy DeviceColLinear path col-shards these on N which would
         # collide with the kernel's internal SUMMA tiling, so we keep our
         # own replicated copies.
-        wq_b_io = ix.wq_b.weight.data.to(torch.bfloat16).transpose(0, 1).contiguous()
+        wq_b_io = _weight_to_bf16(ix.wq_b.weight).transpose(0, 1).contiguous()
         lk.weights["indexer_wq_b"] = ttnn.as_tensor(
             wq_b_io,
             device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
         # cat([wkv, wgate], dim=-1) for the fused indexer-cmp matmul.
-        ix_wkv_io = ix.compressor.wkv.weight.data.to(torch.bfloat16).transpose(0, 1)
-        ix_wgate_io = ix.compressor.wgate.weight.data.to(torch.bfloat16).transpose(0, 1)
+        ix_wkv_io = _weight_to_bf16(ix.compressor.wkv.weight).transpose(0, 1)
+        ix_wgate_io = _weight_to_bf16(ix.compressor.wgate.weight).transpose(0, 1)
         ix_wkv_gate_cpu = torch.cat([ix_wkv_io, ix_wgate_io], dim=-1).contiguous()
         lk.weights["indexer_wkv_gate"] = ttnn.as_tensor(
             ix_wkv_gate_cpu,
@@ -409,7 +418,7 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
         # weights_proj baked with softmax_scale * (H ** -0.5) so the kernel
         # matmul folds in the score scale.
         scale = float(ix.softmax_scale) * (INDEX_N_HEADS ** -0.5)
-        wproj_io = ix.weights_proj.weight.data.to(torch.bfloat16).transpose(0, 1)
+        wproj_io = _weight_to_bf16(ix.weights_proj.weight).transpose(0, 1)
         lk.weights["indexer_wproj_scaled"] = ttnn.as_tensor(
             (wproj_io * scale).contiguous(),
             device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
@@ -457,8 +466,8 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
     if getattr(attn, "compressor", None) is not None and attn.compress_ratio == 4:
         comp_head_dim = attn.compressor.head_dim   # 512
         # wkv / wgate replicated; passed separately.
-        wkv_io = attn.compressor.wkv.weight.data.to(torch.bfloat16).transpose(0, 1).contiguous()
-        wgate_io = attn.compressor.wgate.weight.data.to(torch.bfloat16).transpose(0, 1).contiguous()
+        wkv_io = _weight_to_bf16(attn.compressor.wkv.weight).transpose(0, 1).contiguous()
+        wgate_io = _weight_to_bf16(attn.compressor.wgate.weight).transpose(0, 1).contiguous()
         lk.weights["comp_wkv"] = ttnn.as_tensor(
             wkv_io, device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -509,13 +518,13 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
     # Lk-Dsparse expects [n_groups, in_per_group, o_lora_rank] (3D, block-diag).
     _n_groups = attn.n_local_groups
     _o_lora_rank = attn.o_lora_rank
-    _wo_a_cpu = attn.wo_a.weight.data
+    _wo_a_cpu = _weight_to_bf16(attn.wo_a.weight)
     _out_total, _in_per_group = _wo_a_cpu.shape
     if _out_total != _n_groups * _o_lora_rank:
         raise ValueError(
             f"wo_a shape {tuple(_wo_a_cpu.shape)} != expected "
             f"({_n_groups * _o_lora_rank}, in_per_group)")
-    _wo_a_3d = _wo_a_cpu.to(torch.bfloat16).view(
+    _wo_a_3d = _wo_a_cpu.view(
         _n_groups, _o_lora_rank, _in_per_group).transpose(1, 2).contiguous()
     lk.weights["wo_a"] = ttnn.as_tensor(
         _wo_a_3d, device=mesh, dtype=ttnn.bfloat16,
@@ -523,7 +532,7 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
         mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
     # wo_b: nn.Linear weight is [DIM, n_groups*o_lora_rank]. Lk-Dsparse
     # expects [n_groups*o_lora_rank=in, DIM=out]; transpose.
-    _wo_b_T = attn.wo_b.weight.data.transpose(0, 1).contiguous()
+    _wo_b_T = _weight_to_bf16(attn.wo_b.weight).transpose(0, 1).contiguous()
     lk.weights["wo_b"] = _replicate_weight(mesh, _wo_b_T, ttnn.bfloat16)
 
     # sink_padded: [N_HEADS, TILE] bf16. Col 0 = per-head attn_sink, cols
@@ -569,11 +578,11 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
     )
     # Lk-E SUMMA matmuls expect [K=in, N=out]; nn.Linear stores [out, in].
     lk.weights["w1_shared"] = _replicate_weight(
-        mesh, shared.w1.weight.data.transpose(0, 1).contiguous(), ttnn.bfloat16)
+        mesh, _weight_to_bf16(shared.w1.weight).transpose(0, 1).contiguous(), ttnn.bfloat16)
     lk.weights["w2_shared"] = _replicate_weight(
-        mesh, shared.w2.weight.data.transpose(0, 1).contiguous(), ttnn.bfloat16)
+        mesh, _weight_to_bf16(shared.w2.weight).transpose(0, 1).contiguous(), ttnn.bfloat16)
     lk.weights["w3_shared"] = _replicate_weight(
-        mesh, shared.w3.weight.data.transpose(0, 1).contiguous(), ttnn.bfloat16)
+        mesh, _weight_to_bf16(shared.w3.weight).transpose(0, 1).contiguous(), ttnn.bfloat16)
 
     # --- Lk-F: gate post + routed experts (MoE layers only) --------------
     if isinstance(layer.ffn, MoE):
@@ -581,7 +590,7 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
         lk.lk_f = make_lk_f_kernel(mesh, gate_bias_cpu=gate_bias_cpu)
         # gate matmul expects [DIM=in, N_ROUTED=out]; transpose nn.Linear weight.
         lk.weights["gate_w"] = _replicate_weight(
-            mesh, ffn.gate.weight.data.transpose(0, 1).contiguous(), ttnn.bfloat16)
+            mesh, _weight_to_bf16(ffn.gate.weight).transpose(0, 1).contiguous(), ttnn.bfloat16)
         # gate_bias is baked into the lk_f closure above (factory pads it
         # to [TILE, N_ROUTED] internally), but the callable still takes a
         # gate_bias_tt arg for parity with the test harness — pass the
@@ -604,6 +613,18 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
     lk.mhc_ffn = DeviceMHC(
         mesh=mesh,
         hc_fn=hc_ffn_fn, hc_scale=hc_ffn_scale, hc_base=hc_ffn_base,
+        hc_mult=args.hc_mult, hc_eps=args.hc_eps,
+        sinkhorn_iters=args.hc_sinkhorn_iters, norm_eps=args.norm_eps,
+    )
+
+    # --- mhc_attn: legacy DeviceMHC for hc_post_attn bridge (debug) ------
+    # Bring-up triage shows lk_e's hc_post_attn diverges (PCC=0.49 vs
+    # legacy's 0.88-attn_out baseline). Until that is rooted out, run
+    # legacy hc_pre_attn before lk_e + legacy hc_post_attn after, then
+    # overwrite a_tt_next with the legacy result.
+    lk.mhc_attn = DeviceMHC(
+        mesh=mesh,
+        hc_fn=hc_attn_fn, hc_scale=hc_attn_scale, hc_base=hc_attn_base,
         hc_mult=args.hc_mult, hc_eps=args.hc_eps,
         sinkhorn_iters=args.hc_sinkhorn_iters, norm_eps=args.norm_eps,
     )
@@ -822,8 +843,8 @@ class MegaModel(_BaseModel):
             # has gamma pre-baked into the K axis (see _build_layer_kernels);
             # using it here would compute γ² ⊙ rmsnorm(x) @ wq_a and corrupt
             # the layer-0 residual that flows through every subsequent block.
-            _l0_wq_a_T = l0_layer.attn.wq_a.weight.data.transpose(0, 1) \
-                .contiguous().to(torch.bfloat16)
+            _l0_wq_a_T = _weight_to_bf16(l0_layer.attn.wq_a.weight) \
+                .transpose(0, 1).contiguous()
             self._l0_wq_a_tt = ttnn.as_tensor(
                 _l0_wq_a_T, device=mesh, dtype=ttnn.bfloat16,
                 layout=ttnn.TILE_LAYOUT,
@@ -1089,6 +1110,21 @@ class MegaModel(_BaseModel):
                 None, None, start_pos_tt,
                 lk.weights["wo_a"], lk.weights["wo_b"], sb.attn_out,
             )
+        _seam.dump("attn_out", layer_idx, self._dump_pos, sb.attn_out)
+
+        # hc_pre_attn bridge: populate legacy DeviceMHC stash from a_tt so
+        # the hc_post_attn override below has the correct stash to draw from.
+        # Output of hc_pre_device is discarded — lk_e re-runs hc_pre_attn
+        # internally (and that internal stash is exactly what we are
+        # working around as suspect).
+        with _phase("hc_pre_attn_bridge"):
+            mhc_attn = lk.mhc_attn
+            num_tokens = 1
+            num_tokens_pad = _MHC_TILE
+            mhc = self.args.hc_mult
+            hidden = self.args.dim
+            mhc_attn.hc_pre_device(
+                num_tokens, num_tokens_pad, a_tt=a_tt)
 
         with _phase("lk_e"):
             lk.lk_e(
@@ -1099,6 +1135,31 @@ class MegaModel(_BaseModel):
                 sb.shared_partial, a_tt_next,
                 norm_slice_out=sb.norm_slice,
             )
+        _seam.dump("post_attn_resid_lk_e", layer_idx, self._dump_pos, a_tt_next)
+
+        # hc_post_attn bridge: override lk_e's residual output with legacy
+        # DeviceMHC.hc_post_device. Bring-up triage: lk_e's internal
+        # hc_post_attn diverged at PCC=0.49 vs legacy.
+        with _phase("hc_post_attn_bridge"):
+            x_3d = ttnn.reshape(sb.attn_out, [num_tokens, 1, hidden])
+            x_repeated = ttnn.repeat(x_3d, ttnn.Shape([1, mhc, 1]))
+            x_padded = ttnn.pad(
+                x_repeated,
+                padding=[(0, 0), (0, _MHC_TILE - mhc), (0, 0)],
+                value=0.0)
+            x_post_input = ttnn.reshape(
+                x_padded, [num_tokens * _MHC_TILE, hidden])
+            ttnn.typecast(x_post_input, dtype=ttnn.float32,
+                          output_tensor=mhc_attn._x_upload_tt)
+            attn_post_out_tt = mhc_attn.hc_post_device(num_tokens)
+            legacy_a_input_tt = _mhc_post_to_a_tt(
+                ttnn, attn_post_out_tt, num_tokens, num_tokens_pad,
+                mhc, hidden)
+            ttnn.copy(legacy_a_input_tt, a_tt_next)
+        _seam.dump("post_attn_resid", layer_idx, self._dump_pos, a_tt_next)
+        _seam.dump("ffn_norm_out", layer_idx, self._dump_pos, sb.norm_slice)
+        _seam.dump("shared_partial_post_lk_e", layer_idx, self._dump_pos,
+                   sb.shared_partial)
 
         is_hash_layer = layer_idx < self.args.n_hash_layers
         if is_hash_layer and isinstance(self.transformer.layers[layer_idx].ffn, MoE):
@@ -1136,6 +1197,7 @@ class MegaModel(_BaseModel):
                 routed_3d = ttnn.reshape(routed_full, [1, 1, self.args.dim])
                 ttnn.add(sb.shared_partial, routed_3d,
                          output_tensor=sb.shared_partial)
+        _seam.dump("ffn_out", layer_idx, self._dump_pos, sb.shared_partial)
 
         # hc_post_ffn bridge: legacy DeviceMHC. Lk-E only does hc_post_attn
         # + hc_pre_ffn + shared expert; the FFN-side hc_post is not in any
@@ -1855,6 +1917,18 @@ class MegaModel(_BaseModel):
         _seam.dump("L0_a_tt_out", 0, self._dump_pos, a_tt)
         _seam.dump("L0_wq_a_partial", 0, self._dump_pos, sb.wq_a_out)
         _seam.dump("L0_x_post_norm", 0, self._dump_pos, sb.x_post_norm)
+
+        # Triage probe: re-run wq_a as a plain ttnn.matmul on the same
+        # post-norm tile and weight L0 used. If `L0_wq_a_via_ttnn` matches
+        # legacy's `wq_a_partial` but `L0_wq_a_partial` does not, the SUMMA
+        # matmul kernel is the bug.
+        if _seam.enabled():
+            _xrow = ttnn.slice(sb.x_post_norm, [0, 0], [1, self.args.dim])
+            _xrow3d = ttnn.reshape(_xrow, [1, 1, self.args.dim])
+            _y_probe = ttnn.matmul(
+                _xrow3d, self._l0_wq_a_tt,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _seam.dump("L0_wq_a_via_ttnn", 0, self._dump_pos, _y_probe)
 
         # Optional layer-bisect: env DEBUG_NUM_LAYERS=N runs only the
         # first N transformer blocks (N=0 skips all blocks). Useful for
