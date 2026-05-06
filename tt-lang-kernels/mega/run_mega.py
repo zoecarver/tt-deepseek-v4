@@ -1025,39 +1025,61 @@ class MegaModel(_BaseModel):
         o_lora_rank = args.o_lora_rank
         per_group = (H * D) // n_groups
 
-        # 1. paged_update_cache (matches kernel and legacy).
+        # TODO: hyb_dsparse_probe revisit — granular prints to pinpoint the
+        # L? pos=7 emit-trace-capture hang. Remove once root-cause is found.
+        _hp = lambda tag, layer_idx=getattr(lk, "layer_idx", "?"): print(
+            f"[hyb] L{layer_idx} {tag}", flush=True)
+
+        # TODO: hyb_dsparse_sync revisit — paged_update_cache writes the
+        # L1-sharded cache on core (0,0); without bracketing syncs, prior
+        # pipe-using kernels (lk_d_comp/score/etc.) and downstream
+        # forward_device ops race on core (0,0) and deadlock at varying
+        # emit steps. Mirrors the cmp->score sync.
+        _hp("0.sync_before_paged_update")
+        ttnn.synchronize_device(self._mesh)
+        _hp("1.kv_reshape4d")
         kv_4d = ttnn.reshape(sb.kv_rotated, [1, B, 1, D])
+        _hp("1.kv_to_l1_sharded")
         kv_4d_sharded = ttnn.to_memory_config(
             kv_4d, memory_config=lk.dsparse_sharded_memcfg)
+        _hp("1.paged_update_cache")
         ttnn.experimental.paged_update_cache(
             kv_cache_tt, kv_4d_sharded, update_idxs_tensor=kv_slot_tt)
+        _hp("1.sync_after_paged_update")
+        ttnn.synchronize_device(self._mesh)
 
-        # 2. Legacy DeviceSparseAttn body. Reuse its idx-mask helper to keep
-        #    the additive -inf path identical.
+        _hp("2.idx_mask")
         dsa = lk.dsa_legacy
         idxs_tt, valid_tt = dsa._idxs_int_tile_to_idxs_and_mask(
             topk_idxs_tt, B, S, K)
+        _hp("2.kv_full_reshape")
         kv_full_tt = ttnn.reshape(kv_cache_tt, [128, D])
+        _hp("2.forward_device")
         o_tt = dsa.forward_device(sb.q_rotated, kv_full_tt, idxs_tt, valid_tt,
                                   S, K)                   # [B, S, H, D]
 
-        # 3. Inverse rotary on o[..., -rd:].
+        _hp("3.cos_embed")
         cos = ttnn.embedding(start_pos_tt, lk.cos_full_tt,
                              layout=ttnn.TILE_LAYOUT)
+        _hp("3.sin_embed")
         sin = ttnn.embedding(start_pos_tt, lk.sin_full_tt,
                              layout=ttnn.TILE_LAYOUT)
         cos = ttnn.reshape(cos, [1, S, 1, rd_half])
         sin = ttnn.reshape(sin, [1, S, 1, rd_half])
+        _hp("3.slice_nope_rope")
         o_nope = ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H, D - rd])
         o_rope = ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H, D])
+        _hp("3.inv_rotary")
         o_rope = _device_apply_rotary_interleaved(
             ttnn, o_rope, cos, sin, inverse=True)
+        _hp("3.concat_o")
         o_tt = ttnn.concat([o_nope, o_rope], dim=-1)
 
-        # 4. Group reshape + block-diag wo_a (replicated [G, in, R] weight).
+        _hp("4.permute_group")
         o_perm = ttnn.reshape(o_tt, [B, S, n_groups, per_group])
         o_perm = ttnn.permute(o_perm, [2, 0, 1, 3])
         o_g = ttnn.reshape(o_perm, [n_groups, B * S, per_group])
+        _hp("4.matmul_wo_a")
         o_wo_a_g = ttnn.matmul(
             o_g, lk.weights["wo_a"], memory_config=ttnn.DRAM_MEMORY_CONFIG)
         o_wo_a_rs = ttnn.reshape(
@@ -1065,10 +1087,12 @@ class MegaModel(_BaseModel):
         o_wo_a = ttnn.permute(o_wo_a_rs, [1, 2, 0, 3])
         o_flat = ttnn.reshape(o_wo_a, [B, S, n_groups * o_lora_rank])
 
-        # 5. wo_b matmul into [B, S, dim].
+        _hp("5.matmul_wo_b")
         out_tt = ttnn.matmul(
             o_flat, lk.weights["wo_b"], memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _hp("5.copy_to_attn_out")
         ttnn.copy(out_tt, sb.attn_out)
+        _hp("5.done")
 
     # -----------------------------------------------------------------
     # Hot path
@@ -1216,6 +1240,12 @@ class MegaModel(_BaseModel):
                     lk.weights["comp_cssn_out"],
                     self._comp_kv_normed_sink_tt,
                 )
+            # TODO: lk_d_comp_sync revisit — bisect probe. Bracketing
+            # paged_update_cache with syncs let 4 emit steps pass before
+            # the 5th hangs in the sync drain. Moving the drain to
+            # immediately after lk_d_comp tells us if the deadlock
+            # originates in this kernel's queued state vs. paged_update_cache.
+            ttnn.synchronize_device(self._mesh)
         # Per-step window topk indices: row-pick start_pos from the precomputed
         # [max_seq_len, win] bf16 table (-1 sentinels for unfilled cache slots),
         # typecast back to int32 → [1, 1, win] for lk_dsparse. Without
@@ -2120,8 +2150,13 @@ class MegaModel(_BaseModel):
         self._pre_stage(token_id, pos)
         print(f"[step] pos={pos} pre_stage done", flush=True)
 
-        if self._trace_warmup_remaining > 0:
-            self._trace_warmup_remaining -= 1
+        # TODO: trace_disabled revisit — emit-trace capture deadlocks on
+        # ttnn.concat([scores, sink], dim=-1) inside DeviceSparseAttn
+        # forward_device. Force the eager path on every step so the trace
+        # path never executes. Re-enable once the concat hang is fixed.
+        if True or self._trace_warmup_remaining > 0:
+            if self._trace_warmup_remaining > 0:
+                self._trace_warmup_remaining -= 1
             top_val, top_idx = self._step_body()
             print(f"[step] pos={pos} step_body done", flush=True)
             r = self._argmax_pull(top_val, top_idx)

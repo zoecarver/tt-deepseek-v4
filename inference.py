@@ -4011,23 +4011,55 @@ class DeviceSparseAttn(nn.Module):
         B = 1
         H = self.n_heads
         D = tuple(kv_tt.shape)[-1]
+        # TODO: dsparse_fwd_probe revisit — granular prints to pinpoint the
+        # emit-trace-capture hang. Remove once root-cause is found.
+        _fp = lambda tag: print(f"[fwd] {tag}", flush=True)
         if S == 1:
             sink_for_concat = self.sink_tt
         else:
             sink_for_concat = ttnn.repeat(self.sink_tt, ttnn.Shape([1, S, 1, 1]))
 
+        _fp("a.kv_gather_embed")
         kv_gather = ttnn.embedding(idxs_tt, kv_tt, layout=ttnn.TILE_LAYOUT)
+        _fp("a.kv_gather_reshape")
         kv_gather = ttnn.reshape(kv_gather, [B, S, K, D])
 
+        _fp("b.kv_transpose")
         kv_gather_t = ttnn.transpose(kv_gather, -2, -1)
+        _fp("b.score_matmul")
         scores = ttnn.matmul(q_tt, kv_gather_t)
+        _fp("b.score_scale")
         scores = ttnn.multiply(scores, self.softmax_scale)
+        _fp("b.score_mask_add")
         scores = ttnn.add(scores, valid_tt)
 
-        full = ttnn.concat([scores, sink_for_concat], dim=-1)
-        probs_full = ttnn.softmax(full, dim=-1)
-        probs = ttnn.slice(probs_full, [0, 0, 0, 0], [B, S, H, K])
-        return ttnn.matmul(probs, kv_gather)
+        # Online softmax over [scores | sink] without materializing the
+        # concat. The non-tile-aligned dim=-1 concat (K=64 + sink_dim=1) was
+        # racing under trace capture and even occasionally without trace.
+        #
+        #   full   = concat([scores, sink], dim=-1)
+        #   probs  = softmax(full, dim=-1)[..., :K]
+        # is equivalent to:
+        #   m      = max(max(scores, dim=-1, keepdim=True), sink)
+        #   e_s    = exp(scores - m); e_sk = exp(sink - m)
+        #   denom  = sum(e_s, dim=-1, keepdim=True) + e_sk
+        #   probs  = e_s / denom
+        _fp("c.score_max_kd")
+        score_max = ttnn.max(scores, dim=-1, keepdim=True)
+        _fp("c.m_max_with_sink")
+        m = ttnn.maximum(score_max, sink_for_concat)
+        _fp("c.e_scores")
+        e_scores = ttnn.exp(ttnn.subtract(scores, m))
+        _fp("c.e_sink")
+        e_sink = ttnn.exp(ttnn.subtract(sink_for_concat, m))
+        _fp("c.denom")
+        denom = ttnn.add(ttnn.sum(e_scores, dim=-1, keepdim=True), e_sink)
+        _fp("c.probs")
+        probs = ttnn.divide(e_scores, denom)
+        _fp("d.out_matmul")
+        out = ttnn.matmul(probs, kv_gather)
+        _fp("d.done")
+        return out
 
 
 def _device_apply_rotary_interleaved(ttnn, x_tt, cos_pair_tt, sin_pair_tt, inverse: bool = False):
