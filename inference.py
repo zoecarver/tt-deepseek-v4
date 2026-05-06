@@ -33,6 +33,65 @@ import torch.nn.functional as F
 from safetensors.torch import safe_open
 from huggingface_hub import snapshot_download
 
+
+def _import_mega_kernel(modname: str):
+    """Lazy import of `tt-lang-kernels/mega/test_lk_*.py` factories.
+
+    The mega test files import `inference` lazily, so deferring this until
+    after inference.py is fully loaded breaks the circular dep. Locally the
+    files live two dirs deep; on the remote sandbox they live next to
+    inference.py under /tmp.
+    """
+    import importlib
+    import sys
+    import pathlib
+    here = pathlib.Path(__file__).resolve().parent
+    candidates = [here, here / "tt-lang-kernels" / "mega", pathlib.Path("/tmp")]
+    for cand in candidates:
+        if (cand / f"{modname}.py").exists():
+            if str(cand) not in sys.path:
+                sys.path.insert(0, str(cand))
+            return importlib.import_module(modname)
+    raise ImportError(f"mega kernel module {modname!r} not found in {candidates}")
+
+
+def _resolve_col_linear_bf16(mod) -> torch.Tensor:
+    """Recover the [out, in] bf16 weight of a wq_b/wkv-style linear, whether
+    the module is still a ColumnParallelLinear (CPU) or has been replaced by
+    a DeviceColLinear (which stashes `_cpu_weight` at offload time)."""
+    cpu_w = getattr(mod, "_cpu_weight", None)
+    if cpu_w is None:
+        cpu_w = mod.weight
+    return _weight_to_bf16(cpu_w)
+
+
+def _resolve_q_norm_gamma(mod) -> torch.Tensor:
+    """Recover the bf16 gamma for an RMSNorm whether the module is a CPU
+    RMSNorm or a DeviceRMSNorm (which stashes `_cpu_gamma` at offload)."""
+    cpu_g = getattr(mod, "_cpu_gamma", None)
+    if cpu_g is None:
+        cpu_g = mod.weight.data
+    return cpu_g.to(torch.bfloat16)
+
+
+# Module-level cache for compiled mega kernels. Keyed by (kernel-name, sig).
+# Sharing one ttl.operation across all 43 layers prevents the host-side
+# memory blowup we saw when each DeviceAttention built its own copy.
+_MEGA_KERNEL_CACHE: dict = {}
+
+
+def _get_lk_b_fused_kernel(M: int, K: int, N: int):
+    key = ("lk_b_fused_rms_ksplit", M, K, N)
+    if key not in _MEGA_KERNEL_CACHE:
+        lk_b_mod = _import_mega_kernel("test_lk_b")
+        _MEGA_KERNEL_CACHE[key] = lk_b_mod._make_fused_rms_ksplit_kernel(
+            M=M, K=K, N=N,
+            block_cfg=(1, 16, 4), part_cfg=(1, 8, 8),
+            rms_eps=lk_b_mod.NORM_EPS,
+        )
+    return _MEGA_KERNEL_CACHE[key]
+
+
 # Cross-pipeline seam dump (PCC triage). No-op unless enabled in seam_dump.py.
 try:
     import seam_dump as _seam
@@ -1318,6 +1377,10 @@ class DeviceColLinear(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._w_mapper(),
         )
+        # Stash the original (possibly FP8/FP4-quantized) Parameter so mega
+        # kernels can pull a fresh bf16 replicated copy without re-reading
+        # the safetensors. Memory cost is the original quantized weight.
+        self._cpu_weight = cpu_weight
         self._alloc_decode_tensors()
 
     def _w_mapper(self):
@@ -1744,6 +1807,9 @@ class DeviceRMSNorm(nn.Module):
         self.gamma_tt = ttnn.as_tensor(_pack_rms_gamma(g), **rep)
         self.sc_tt = ttnn.as_tensor(
             torch.ones((_RMS_TILE, _RMS_TILE), dtype=torch.bfloat16), **rep)
+        # Stash unpacked bf16 gamma so mega kernels (e.g. lk_b) can build
+        # their own packed form without re-reading state from disk.
+        self._cpu_gamma = g
         self._alloc_decode_tensors()
 
     def _alloc_decode_tensors(self):
@@ -4794,6 +4860,45 @@ class DeviceAttention(nn.Module):
         self.kv_cache_size_pad = -(-self.kv_cache_size // 32) * 32
         self.kv_cache_tt = None
         self._alloc_decode_tensors()
+        self._setup_lk_b()
+
+    def _setup_lk_b(self):
+        """Mega Lk-B kernel: fused q_norm rmsnorm + wq_b matmul.
+
+        Replaces the legacy `q_norm + reshape + wq_b.forward_device` chain
+        in `forward_device`. Weight is replicated (vs col-sharded
+        `DeviceColLinear`); on Galaxy this fits and avoids the all_gather.
+
+        The compiled ttl.operation is shared across all layers via
+        `_get_lk_b_fused_kernel`; per-layer state is just the gamma-baked
+        weight on device + the per-layer y/scaler scratch tensors.
+        """
+        ttnn = self._ttnn
+        attn = self.attn
+        K = self.q_lora_rank
+        N = self.n_heads * self.head_dim
+        TILE = 32
+        self._lk_b_kernel = _get_lk_b_fused_kernel(M=TILE, K=K, N=N)
+
+        gamma = _resolve_q_norm_gamma(attn.q_norm).flatten().contiguous()
+        wq_b_T = _resolve_col_linear_bf16(attn.wq_b).transpose(0, 1).contiguous()
+        # Bake gamma into wq_b on host: Wg[k,n] = gamma[k] * W[k,n].
+        # bf16 multiply skips the float32 intermediate to keep host RAM down.
+        wq_b_baked = (gamma[:, None] * wq_b_T).to(torch.bfloat16).contiguous()
+
+        rep = dict(
+            device=self.mesh, dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        self._lk_b_w_tt = ttnn.as_tensor(wq_b_baked, **rep)
+        self._lk_b_scaler_tt = ttnn.from_torch(
+            torch.ones((TILE, TILE), dtype=torch.bfloat16), **rep)
+        self._lk_b_y_padded_tt = ttnn.from_torch(
+            torch.zeros((TILE, N), dtype=torch.bfloat16), **rep)
+        self._lk_b_out_tt = ttnn.from_torch(
+            torch.zeros(1, 1, N, dtype=torch.bfloat16), **rep)
 
     def _alloc_decode_tensors(self, B: int = 1):
         """Allocate the joint MLA kv_cache buffer eagerly so first decode
@@ -5168,16 +5273,32 @@ class DeviceAttention(nn.Module):
 
         _dump_layer = attn.layer_id
         _dump_pos = getattr(_block_forward, "_dump_pos", 0)
-        # Q path: wq_a -> q_norm -> wq_b -> per-head rsqrt-norm -> rotary.
+        # Q path: wq_a -> [Lk-B fused q_norm + wq_b] -> per-head rsqrt-norm -> rotary.
         with _phase("attn.q"):
             q_lora_tt = attn.wq_a.forward_device(x_tt)            # [B, S, q_lora_rank]
             _seam.dump("wq_a_partial", _dump_layer, _dump_pos, q_lora_tt)
-            # q_norm: needs a [Mpad, hidden] device tensor. Reshape and pad-on-device.
+            # qr_tt is still needed by the device_indexer score path; it's a
+            # cheap rmsnorm relative to the wq_b matmul that lk_b absorbs.
             q_lora_2d = ttnn.reshape(q_lora_tt, [B * S, self.q_lora_rank])
             qr_2d = self._rmsnorm_device(self.q_norm_dev, q_lora_2d, B * S)
             qr_tt = ttnn.reshape(qr_2d, [B, S, self.q_lora_rank])
-
-            q_full_tt = attn.wq_b.forward_device(qr_tt)           # [B, S, H*D]
+            # SWAP-Lk-B: fused q_norm rmsnorm + wq_b matmul (single ttl.operation).
+            # Pad input [1,1,K] -> [TILE,K] via pad, run the shared kernel
+            # into per-layer y_padded scratch, slice/reshape back.
+            q_lora_padded = ttnn.pad(
+                q_lora_2d, padding=[(0, 32 - B * S), (0, 0)], value=0.0)
+            self._lk_b_kernel(
+                q_lora_padded, self._lk_b_w_tt,
+                self._lk_b_scaler_tt, self._lk_b_y_padded_tt,
+            )
+            y_row = ttnn.slice(
+                self._lk_b_y_padded_tt, [0, 0],
+                [B * S, self.n_heads * self.head_dim])
+            ttnn.copy(
+                ttnn.reshape(y_row, [B, S, self.n_heads * self.head_dim]),
+                self._lk_b_out_tt,
+            )
+            q_full_tt = self._lk_b_out_tt
             _seam.dump("q_full", _dump_layer, _dump_pos, q_full_tt)
             q_tt = ttnn.reshape(q_full_tt, [B, S, H, D])
             q_tt = _device_q_rsqrt_norm(ttnn, q_tt, self.eps)
@@ -5397,19 +5518,26 @@ class DeviceAttention(nn.Module):
         return cos, sin
 
 
-def _open_mesh(shape=(4, 8), trace_region_size: int = 200_000_000):
+def _open_mesh(shape=(4, 8), trace_region_size: int = 200_000_000,
+               kernel_config_extra_bytes: int = 128 * 1024):
     """Open a Galaxy (TG) mesh device. Default shape (4, 8) matches
     SYSTEM_NAME_TO_MESH_SHAPE["TG"] in tt-metal/models/demos/deepseek_v3.
 
     FABRIC_1D is correct here even on a 2D mesh: the model only does 1D
     tensor parallelism (sharded along the 8-col axis, replicated along the
     4-row axis). deepseek_v3's Galaxy demo uses the same setting (see
-    demo/demo.py:292)."""
+    demo/demo.py:292).
+
+    `kernel_config_extra_bytes` shrinks usable worker L1 to enlarge the
+    per-core kernel-config buffer (default ~70KB). Mega fused kernels (lk_b,
+    test_final ksplit, etc.) require this to load."""
     import ttnn
     ttnn.set_fabric_config(ttnn.FabricConfig.FABRIC_1D, ttnn.FabricReliabilityMode.RELAXED_INIT)
-    return ttnn.open_mesh_device(
-        ttnn.MeshShape(*shape), trace_region_size=trace_region_size
-    )
+    kw = dict(trace_region_size=trace_region_size)
+    if kernel_config_extra_bytes > 0:
+        default_l1 = ttnn.device.get_max_worker_l1_unreserved_size()
+        kw["worker_l1_size"] = default_l1 - kernel_config_extra_bytes
+    return ttnn.open_mesh_device(ttnn.MeshShape(*shape), **kw)
 
 
 def _readback_replicated_2d(ttnn, tensor_tt, mesh, mesh_shape):

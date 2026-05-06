@@ -18,10 +18,11 @@ import torch
 import ttnn
 import ttl
 
-import _refs  # noqa: F401
-from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
-
-from inference import DeviceRMSNorm, _RMS_TILE
+try:
+    import _refs  # noqa: F401
+    from _refs import open_mesh, close_mesh, report_pcc, download_chip0, benchmark
+except ImportError:
+    pass  # only needed for standalone test main()
 
 
 Q_LORA_RANK = 1024
@@ -309,6 +310,7 @@ def make_lk_b_kernel(mesh, gamma_cpu, wq_b_cpu):
 
 
 def reference(mesh, q_lora_tt, gamma_cpu, wq_b_w_tt):
+    from inference import DeviceRMSNorm, _RMS_TILE
     rmsn = DeviceRMSNorm(mesh=mesh, cpu_gamma=gamma_cpu, eps=NORM_EPS)
     # Mirror DeviceAttention.forward_device's q_norm step:
     #   q_lora_2d = ttnn.reshape(q_lora, [B*S, q_lora_rank])
