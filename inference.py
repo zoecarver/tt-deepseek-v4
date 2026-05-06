@@ -33,6 +33,16 @@ import torch.nn.functional as F
 from safetensors.torch import safe_open
 from huggingface_hub import snapshot_download
 
+# Cross-pipeline seam dump (PCC triage). No-op unless enabled in seam_dump.py.
+try:
+    import seam_dump as _seam
+except Exception:  # noqa: BLE001
+    class _SeamStub:
+        def dump(self, *a, **kw): pass
+        def set_pipeline(self, *a, **kw): pass
+        def enabled(self): return False
+    _seam = _SeamStub()
+
 
 # ==============================================================================
 # Global state (mirrors deepseek inference/model.py)
@@ -895,6 +905,7 @@ class Transformer(nn.Module):
         input_ids_tt = self._input_ids_tt
         start_pos_tt = self._start_pos_tt
 
+        _dump_pos = getattr(self, "_dump_pos", start_pos)
         with _phase("embed"):
             embed_tt = self.embed(input_ids_tt)
             e_2d = ttnn.reshape(embed_tt, [num_tokens, hidden])
@@ -905,11 +916,14 @@ class Transformer(nn.Module):
                 padding=[(0, num_tokens_pad - num_tokens), (0, 0)],
                 value=0.0,
             )
+        _seam.dump("embed_out", -1, _dump_pos, embed_tt)
         with _phase("blocks"):
-            for layer in self.layers:
+            for layer_idx, layer in enumerate(self.layers):
+                _seam.dump("a_tt_in", layer_idx, _dump_pos, a_tt)
                 a_tt = _block_forward(layer, a_tt, start_pos, start_pos_tt,
                                       input_ids_tt,
                                       B, S, mhc, hidden, orig_dtype)
+                _seam.dump("a_tt_out", layer_idx, _dump_pos, a_tt)
         return a_tt
 
     def _decode_argmax_body(self, B: int, S: int, num_tokens: int,
@@ -6365,6 +6379,7 @@ class Model:
         import ttnn
         ids = torch.tensor([[token_id]], dtype=torch.long)
         transformer = self.transformer
+        transformer._dump_pos = pos
         head = transformer.head
         is_emit = (pos + 1) % 4 == 0
 
@@ -6474,6 +6489,8 @@ def main():
                         help="Path to pickled state_dict cache. First run populates it; "
                              "subsequent runs mmap it (set to empty string to disable).")
     args = parser.parse_args()
+
+    _seam.set_pipeline("legacy")
 
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(min(32, os.cpu_count() or 8))

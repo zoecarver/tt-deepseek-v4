@@ -79,6 +79,16 @@ for _candidate in (_HERE, *_HERE.parents):
 import torch  # noqa: E402
 import ttnn   # noqa: E402
 
+# Cross-pipeline seam dump (PCC triage). No-op unless enabled in seam_dump.py.
+try:
+    import seam_dump as _seam  # noqa: E402
+except Exception:  # noqa: BLE001
+    class _SeamStub:
+        def dump(self, *a, **kw): pass
+        def set_pipeline(self, *a, **kw): pass
+        def enabled(self): return False
+    _seam = _SeamStub()
+
 # ---------------------------------------------------------------------------
 # Kernel factories: one per mega-zone. Each returns a callable that takes
 # per-step ttnn tensors and writes its output into a pre-allocated buffer.
@@ -927,6 +937,7 @@ class MegaModel(_BaseModel):
         state on core (0, 0) conflicts with the score kernel's PipeNet on
         the same core and the device hangs. Track as a tt-lang issue.
         """
+        _seam.dump("a_tt_in", layer_idx, self._dump_pos, a_tt)
         if layer_idx == 0:
             pass
         else:
@@ -936,6 +947,8 @@ class MegaModel(_BaseModel):
             with _phase("lk_a_bridge"):
                 _xn = lk.attn_norm.forward_device(sb.x_pre_norm, num_rows=1)
                 ttnn.copy(_xn, sb.x_post_norm)
+        _seam.dump("wq_a_partial", layer_idx, self._dump_pos, sb.wq_a_out)
+        _seam.dump("x_post_norm", layer_idx, self._dump_pos, sb.x_post_norm)
         with _phase("x_post_norm_to_3d"):
             _row = ttnn.slice(sb.x_post_norm, [0, 0], [1, self.args.dim])
             _row3 = ttnn.reshape(_row, [1, 1, self.args.dim])
@@ -944,13 +957,16 @@ class MegaModel(_BaseModel):
 
         with _phase("lk_b"):
             lk.lk_b(sb.wq_a_out, sb.q_full)
+        _seam.dump("q_full", layer_idx, self._dump_pos, sb.q_full)
 
         with _phase("lk_c"):
             lk.lk_c(sb.q_full, x_for_wkv, None, None, start_pos_tt,
                     lk.weights["wkv"], sb.q_rotated, sb.kv_partial)
+        _seam.dump("kv_partial", layer_idx, self._dump_pos, sb.kv_partial)
 
         with _phase("lk_d1"):
             lk.lk_d1(sb.kv_partial, None, None, start_pos_tt, sb.kv_rotated)
+        _seam.dump("kv_rotated", layer_idx, self._dump_pos, sb.kv_rotated)
 
         if lk.lk_d_idx_q is not None:
             with _phase("lk_d_idx_q"):
@@ -1155,6 +1171,7 @@ class MegaModel(_BaseModel):
                 ttnn, ffn_post_out_tt, num_tokens, num_tokens_pad,
                 mhc, hidden)
             ttnn.copy(next_a_input_tt, a_tt_next)
+        _seam.dump("a_tt_out", layer_idx, self._dump_pos, a_tt_next)
         return a_tt_next
 
     def _block_forward_mega_full(self, layer_idx: int, lk: LayerKernels,
@@ -1821,6 +1838,7 @@ class MegaModel(_BaseModel):
         # 1. Token embedding: input_ids -> [B, S, DIM] bf16, replicated.
         with _phase("embed"):
             embed_tt = self.transformer.embed.forward(self._input_ids_tt)
+        _seam.dump("embed_out", -1, self._dump_pos, embed_tt)
 
         # 2. L0: embed_prep + hc_pre(layer 0) + attn_norm + wq_a. Writes
         # the residual stream into a_tt, layer 0's wq_a partial into
@@ -1834,6 +1852,9 @@ class MegaModel(_BaseModel):
                 a_tt, sb.wq_a_out,
                 x_post_norm_bf16_out=sb.x_post_norm,
             )
+        _seam.dump("L0_a_tt_out", 0, self._dump_pos, a_tt)
+        _seam.dump("L0_wq_a_partial", 0, self._dump_pos, sb.wq_a_out)
+        _seam.dump("L0_x_post_norm", 0, self._dump_pos, sb.x_post_norm)
 
         # Optional layer-bisect: env DEBUG_NUM_LAYERS=N runs only the
         # first N transformer blocks (N=0 skips all blocks). Useful for
@@ -1874,6 +1895,7 @@ class MegaModel(_BaseModel):
         # so the indexer/compressor emit-branch is included or excluded
         # from the captured trace per (no_emit / emit) variant.
         self._emit_now = is_emit
+        self._dump_pos = pos
         self._pre_stage(token_id, pos)
 
         if self._trace_warmup_remaining > 0:
@@ -1963,6 +1985,8 @@ def main():
                             "DS_WEIGHTS_CACHE",
                             "/tmp/deepseek_v4_flash_cache/state_dict.pt"))
     args = parser.parse_args()
+
+    _seam.set_pipeline("mega")
 
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(min(32, os.cpu_count() or 8))
