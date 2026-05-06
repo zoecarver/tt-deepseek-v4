@@ -49,6 +49,34 @@ from inference import (
 )
 
 
+def _prod_like_topk(num_valid: int, K_total: int) -> torch.Tensor:
+    """Return a [B, S, K] int32 topk where the first `num_valid` entries
+    are 0..num_valid-1 and the rest are -1 (matches production at
+    pos < window_size)."""
+    out = torch.full((B, S, K_total), -1, dtype=torch.int32)
+    nv = min(num_valid, K_total)
+    for k in range(nv):
+        out[0, 0, k] = k
+    return out
+
+
+def _prod_like_kv_cache(num_valid: int) -> torch.Tensor:
+    """Return [1, 1, KV_CACHE_SIZE_PAD, HEAD_DIM] bf16 with the first
+    `num_valid` slots filled with random data and the rest exactly zero
+    (matches production at pos < window_size)."""
+    cache = torch.zeros(1, 1, KV_CACHE_SIZE_PAD, HEAD_DIM, dtype=torch.bfloat16)
+    nv = min(num_valid, KV_CACHE_SIZE_PAD)
+    if nv > 0:
+        cache[:, :, :nv, :] = torch.randn(
+            1, 1, nv, HEAD_DIM, dtype=torch.bfloat16) * 0.1
+    return cache
+
+
+# Triage hook: when set to (layer_idx, tok) the lk_dsparse kernel emits
+# seam_dump.dump for the named intermediates. Cleared between calls.
+_TRIAGE_CTX: tuple[int, int] | None = None
+
+
 DIM = 4096
 N_HEADS = 64
 HEAD_DIM = 512
@@ -658,8 +686,11 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         # Lowering needs tt-lang int->uint32 cast + tile<->row-major converter.
         topk_idxs_bf16 = ttnn.typecast(topk_idxs_tt, dtype=ttnn.bfloat16)
         topk_2d = ttnn.reshape(topk_idxs_bf16, [B, K])
-        topk_padded_in = ttnn.pad(
-            topk_2d, padding=[(0, TILE - B), (0, 0)], value=0.0)
+        # Broadcast row 0 to all TILE rows. The score+mask kernel reads the
+        # idx tile element-wise alongside the [TILE, K] score tile, so every
+        # head row needs the same idx values; zero-padding rows 1..31 leaks
+        # invalid kv slots through softmax for heads 1..31 of each tile-row.
+        topk_padded_in = ttnn.repeat(topk_2d, ttnn.Shape([TILE, 1]))
         safe = ttnn.clamp(topk_idxs_tt, min=0)
         safe = ttnn.reshape(safe, [B, S * K])
         safe = ttnn.typecast(safe, dtype=ttnn.uint32)
@@ -697,6 +728,10 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         probs_2d = ttnn.reshape(probs, [H, K])
         kv_gather_2d = ttnn.reshape(kv_gather_4d, [K, D])
         matmul_output(probs_2d, kv_gather_2d, state["o_padded"])
+        if _TRIAGE_CTX is not None:
+            import seam_dump as _seam_dbg
+            _seam_dbg.dump("dsp_o_post_attn",
+                           _TRIAGE_CTX[0], _TRIAGE_CTX[1], state["o_padded"])
 
         # 9. Inverse rotary on o[..., -rd:] via swap-SUMMA + rotary-combine.
         # Operates on the 2D [H, D] layout and slices the rope tail directly.
@@ -711,6 +746,10 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
                             state["o_rope_rot"])
         o_full_2d = ttnn.concat([o_nope_2d, state["o_rope_rot"]], dim=-1)
         o_concat = ttnn.reshape(o_full_2d, [B, S, H, D])
+        if _TRIAGE_CTX is not None:
+            import seam_dump as _seam_dbg
+            _seam_dbg.dump("dsp_o_post_rotary",
+                           _TRIAGE_CTX[0], _TRIAGE_CTX[1], o_concat)
 
         # 10. Group reshape + permute.
         # TODO: mega fusion blocked: ttnn used for permute + per-group slice.
@@ -731,6 +770,10 @@ def make_lk_dsparse_kernel(mesh, cos_full_cpu, sin_full_cpu,
         o_wo_a_perm = ttnn.permute(o_wo_a_g, [1, 0, 2])
         o_flat_padded = ttnn.reshape(
             o_wo_a_perm, [TILE, N_GROUPS * O_LORA_RANK])
+        if _TRIAGE_CTX is not None:
+            import seam_dump as _seam_dbg
+            _seam_dbg.dump("dsp_o_post_wo_a",
+                           _TRIAGE_CTX[0], _TRIAGE_CTX[1], o_flat_padded)
 
         # 13. SUMMA wo_b: o_flat [TILE, 8192] @ wo_b_w [8192, DIM] -> [TILE, DIM].
         matmul_wo_b(o_flat_padded, wo_b_w_tt, state["wo_b_out_padded"])
@@ -798,29 +841,59 @@ def reference(mesh, q_tt, kv_tt, kv_cache_tt, kv_slot_tt, topk_idxs_tt,
     return ttnn.matmul(o_flat, wo_b_w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
+# Triage knobs (edit in-place; run-test.sh does not pass env vars).
+# Decomposed so each factor can be flipped independently. Defaults reproduce
+# production: galaxy mesh + L1 q/kv + sparse-cache + sentinel-padded topk +
+# slot=4 write. All four True together gives PCC ≈ 0.54.
+USE_GALAXY_MESH = True            # (4,8) vs (1,4)
+USE_L1_QKV = True                 # q/kv in L1 vs DRAM
+USE_SPARSE_CACHE = True           # first NUM_VALID slots random, rest zero
+USE_SENTINEL_IDXS = True          # idx >= NUM_VALID -> -1 sentinel
+NUM_VALID = 5                     # how many kv_cache slots are filled
+SLOT = NUM_VALID - 1              # paged_update_cache write slot
+
+MESH_SHAPE = (4, 8) if USE_GALAXY_MESH else (1, 4)
+
+
 def main():
     torch.manual_seed(0)
-    mesh = open_mesh()
+    print(f"[lk_dsparse] mesh={MESH_SHAPE} L1_QKV={USE_L1_QKV} "
+          f"SPARSE_CACHE={USE_SPARSE_CACHE} SENTINEL_IDXS={USE_SENTINEL_IDXS} "
+          f"NUM_VALID={NUM_VALID} SLOT={SLOT}")
+    mesh = open_mesh(shape=MESH_SHAPE)
     mesh_shape = tuple(mesh.shape)
     try:
         q = torch.randn(B, S, N_HEADS, HEAD_DIM, dtype=torch.bfloat16) * 0.1
         kv = torch.randn(B, S, HEAD_DIM, dtype=torch.bfloat16) * 0.1
-        kv_cache = torch.randn(1, 1, KV_CACHE_SIZE_PAD, HEAD_DIM, dtype=torch.bfloat16) * 0.1
-        # Random valid topk indices in [0, KV_CACHE_SIZE_PAD).
-        topk_idxs = torch.randint(0, KV_CACHE_SIZE_PAD, (B, S, K), dtype=torch.int32)
+        if USE_SPARSE_CACHE:
+            kv_cache = _prod_like_kv_cache(NUM_VALID)
+        else:
+            kv_cache = torch.randn(
+                1, 1, KV_CACHE_SIZE_PAD, HEAD_DIM, dtype=torch.bfloat16) * 0.1
+        if USE_SENTINEL_IDXS:
+            topk_idxs = _prod_like_topk(NUM_VALID, K)
+        else:
+            topk_idxs = torch.randint(
+                0, KV_CACHE_SIZE_PAD, (B, S, K), dtype=torch.int32)
         attn_sink = torch.randn(N_HEADS, dtype=torch.float32) * 0.1
         cos_full = torch.randn(MAX_SEQ_LEN, ROPE_HEAD_DIM // 2, dtype=torch.bfloat16) * 0.5
         sin_full = torch.randn(MAX_SEQ_LEN, ROPE_HEAD_DIM // 2, dtype=torch.bfloat16) * 0.5
         in_per_group = (N_HEADS * HEAD_DIM) // N_GROUPS
         wo_a_w = torch.randn(N_GROUPS, in_per_group, O_LORA_RANK, dtype=torch.bfloat16) * 0.02
         wo_b_w = torch.randn(N_GROUPS * O_LORA_RANK, DIM, dtype=torch.bfloat16) * 0.02
-        kv_slot = torch.tensor([1], dtype=torch.int32)
-        start_pos = torch.tensor([[1]], dtype=torch.int32)
+        kv_slot = torch.tensor([SLOT], dtype=torch.int32)
+        start_pos = torch.tensor([[SLOT]], dtype=torch.int32)
         softmax_scale = float(HEAD_DIM ** -0.5)
 
+        # Production places sb.q_rotated/sb.kv_rotated in L1; standalone
+        # default keeps DRAM.
+        qkv_mem = ttnn.L1_MEMORY_CONFIG if USE_L1_QKV else ttnn.DRAM_MEMORY_CONFIG
         rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
                    mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+        rep_qkv = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
+                       memory_config=qkv_mem,
+                       mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
 
         # Two parallel copies of kv_cache so the kernel and reference each
         # mutate their own (paged_update_cache writes in place).
@@ -829,8 +902,8 @@ def main():
         kv_cache_kernel_tt = ttnn.as_tensor(kv_cache.contiguous(),
                                             dtype=ttnn.bfloat16, **rep)
 
-        q_tt = ttnn.as_tensor(q.contiguous(), dtype=ttnn.bfloat16, **rep)
-        kv_tt = ttnn.as_tensor(kv.contiguous(), dtype=ttnn.bfloat16, **rep)
+        q_tt = ttnn.as_tensor(q.contiguous(), dtype=ttnn.bfloat16, **rep_qkv)
+        kv_tt = ttnn.as_tensor(kv.contiguous(), dtype=ttnn.bfloat16, **rep_qkv)
         topk_idxs_tt = ttnn.as_tensor(topk_idxs.contiguous(),
                                       dtype=ttnn.int32, **rep)
         cos_full_tt = ttnn.as_tensor(cos_full.contiguous(),
