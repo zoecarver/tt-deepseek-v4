@@ -61,7 +61,21 @@ Ad-hoc, one-shot probe scripts (checking a ttnn API signature, listing device op
 
 ## Hang recovery
 
-**Never attempt hang recovery yourself. Do not run `pkill`, `tt-smi`, `tt-smi -r`, or any other recovery command. If you suspect the device is hung or in a bad state, stop and ask the user — they will handle recovery.**
+You have one recovery primitive: `/tmp/galaxy-reset.sh`. It does
+`pkill -9 python` inside the `ubuntu-ird-all` container, sleeps 3s, runs
+`/home/ubuntu/.local/bin/tt-smi -r` on the galaxy host (NOT inside the
+container), then sleeps 5s for the device to come back.
+
+**You may call `/tmp/galaxy-reset.sh` exactly ONCE per hang.** If the
+device is still in a bad state after that single attempt (next
+`run-test.sh --hw` invocation hangs again, errors out before kernels
+dispatch, or shows the lock-held message below), STOP and ask the user.
+Do not retry, do not chain resets, do not run `pkill` / `tt-smi` /
+`tt-smi -r` / `tt-smi -glx_reset` / etc. directly.
+
+This primitive resets shared hardware. Only invoke it when you have
+positive evidence the device is wedged (see "Detecting a hang" below) —
+do not run it as a precaution.
 
 ### Detecting a hang vs. normal slow progress
 
@@ -77,11 +91,13 @@ The exact log line to grep for is:
 ```
 Waiting for lock 'CHIP_IN_USE_1_PCIe' which is currently held by thread TID: <pid>, PID: <pid>
 ```
-If you see this, the current run is queued behind a stale process and will not progress. Stop and ask the user to clear it.
+If you see this, the current run is queued behind a stale process and will not progress. `/tmp/galaxy-reset.sh` clears it (the `pkill` stage handles the stale process); use the one allowed call.
 
 ### When a hang is suspected
 
-Stop and ask the user. Do not run any recovery commands.
+1. Confirm it's a real hang (markers printed, no progress for >5 min, or the lock-held message above).
+2. Run `/tmp/galaxy-reset.sh` ONCE.
+3. Re-launch the failing test. If it progresses, continue. If it hangs again, stop and ask the user.
 
 ## Inference script shape
 

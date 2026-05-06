@@ -120,6 +120,7 @@ from inference import (                            # noqa: E402
     DeviceCompressor,
     DeviceIndexer,
     DeviceColLinear,
+    DeviceLMHead,
     DeviceMHC,
     DeviceRMSNorm,
     _mhc_post_to_a_tt,
@@ -528,6 +529,14 @@ def _build_layer_kernels(mesh, layer: Block, layer_idx: int,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
     )
+    sink_4d_cpu = attn.attn_sink.data.to(torch.bfloat16).view(
+        1, 1, N_HEADS, 1).contiguous()
+    lk.weights["sink_4d"] = ttnn.as_tensor(
+        sink_4d_cpu, device=mesh, dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+    )
 
     # --- Lk-E: hc_post_attn + ffn_norm + shared expert + (optional) gate -
     if isinstance(layer.ffn, MoE):
@@ -825,6 +834,21 @@ class MegaModel(_BaseModel):
         with _phase("setup.final"):
             self._final_kernel = make_final_kernel(mesh)
             self._build_final_constants(mesh)
+            # Legacy DeviceLMHead alternate path: column-parallel sharded
+            # lm_head + per-chip topk. Used in `_step_body` instead of the
+            # mega Final kernel until the gibberish in the mega lmhead
+            # fusion is root-caused.
+            tr = self.transformer
+            self._device_lm_head = DeviceLMHead(
+                mesh, tr.head.weight.data,
+                norm_weight=tr.norm.weight.data,
+                norm_eps=tr.norm.eps,
+                hc_fn=tr.hc_head_fn.data,
+                hc_scale=tr.hc_head_scale.data,
+                hc_base=tr.hc_head_base.data,
+                hc_eps=tr.hc_eps,
+                hc_mult=tr.hc_mult,
+            )
 
         with _phase("setup.routed_experts"):
             # Reuses the base Model's bfp4_b cache loader (preprocessed
@@ -1030,11 +1054,10 @@ class MegaModel(_BaseModel):
         with _phase("lk_dsparse"):
             kv_cache_tt = self._kv_cache_tt[layer_idx]
             kv_slot_tt = self._kv_slot_tt[layer_idx]
-            sink_padded_tt = lk.weights["sink_padded"]
-            sm_scaler_tt = self._sm_scaler_tt
+            sink_4d_tt = lk.weights["sink_4d"]
             lk.lk_dsparse(
                 sb.q_rotated, sb.kv_rotated, kv_cache_tt, kv_slot_tt,
-                topk_idxs_tt, sink_padded_tt, sm_scaler_tt,
+                topk_idxs_tt, sink_4d_tt,
                 None, None, start_pos_tt,
                 lk.weights["wo_a"], lk.weights["wo_b"], sb.attn_out,
             )
@@ -1309,11 +1332,10 @@ class MegaModel(_BaseModel):
         with _phase("lk_dsparse"):
             kv_cache_tt = self._kv_cache_tt[layer_idx]
             kv_slot_tt = self._kv_slot_tt[layer_idx]
-            sink_padded_tt = lk.weights["sink_padded"]
-            sm_scaler_tt = self._sm_scaler_tt
+            sink_4d_tt = lk.weights["sink_4d"]
             lk.lk_dsparse(
                 sb.q_rotated, sb.kv_rotated, kv_cache_tt, kv_slot_tt,
-                topk_idxs_tt, sink_padded_tt, sm_scaler_tt,
+                topk_idxs_tt, sink_4d_tt,
                 None, None, start_pos_tt,
                 lk.weights["wo_a"], lk.weights["wo_b"], sb.attn_out,
             )
@@ -1819,21 +1841,14 @@ class MegaModel(_BaseModel):
                 a_tt,                       # ping-pong residual buffers
             )
 
-        # 4. Demote final residual fp32 -> bf16 for the Final head.
-        with _phase("a_tt_to_bf16"):
-            ttnn.typecast(a_tt, dtype=ttnn.bfloat16,
-                          output_tensor=sb.a_tt_bf16)
-
-        # 5. Final head: hc_combiner + fused-rms-ksplit + argmax. Returns
-        # per-chip (top_val, top_idx); _argmax_pull globalizes them.
+        # 4. Final head via legacy DeviceLMHead: hc_combiner + final RMSNorm
+        # + column-parallel lm_head matmul + per-chip top-1. Returns
+        # (idxs_tt, vals_tt); _argmax_pull globalizes them. The mega-fused
+        # Final kernel produces gibberish output, so we use the blessed
+        # ttnn op chain here while that's debugged.
         with _phase("final"):
-            top_val, top_idx = self._final_kernel(
-                sb.a_tt_bf16,
-                self._final_hc_fn_t_scaled_tt,
-                self._final_hc_base_tile_tt,
-                self._final_scaler_tt,
-                self._final_w_baked_tt,
-            )
+            top_idx, top_val = self._device_lm_head.forward_argmax_device(
+                a_tt, num_tokens=1)
         return top_val, top_idx
 
     # -----------------------------------------------------------------
@@ -1880,30 +1895,10 @@ class MegaModel(_BaseModel):
         return self._argmax_pull(top_val, top_idx)
 
     def _argmax_pull(self, top_val, top_idx) -> int:
-        """Read per-chip top-1 device tensors and return the global argmax.
-
-        Mega replicates the lm_head across the full mesh: every chip holds
-        the full [DIM, VOCAB] head and `ttnn.argmax` returns a global vocab
-        index. Logits agree across chips up to bf16 accumulation noise,
-        which is enough to flip near-tied argmaxes (we've seen the live
-        token indexed at 65802 on most chips and at 26075/42691 on others).
-        Pick the chip whose top-1 has the highest value — its logit at
-        that index dominates whatever the dissenting chips picked."""
-        vals = ttnn.to_torch(top_val, mesh_composer=ttnn.ConcatMesh2dToTensor(
-            self._mesh, tuple(self._mesh.shape), dims=(0, 1)))
-        idxs = ttnn.to_torch(top_idx, mesh_composer=ttnn.ConcatMesh2dToTensor(
-            self._mesh, tuple(self._mesh.shape), dims=(0, 1)))
-        flat_vals = vals.flatten().float()
-        flat_idxs = idxs.flatten().long()
-        if os.environ.get("DEBUG_LOGITS"):
-            print(f"[debug] top vals (per chip): "
-                  f"min={float(flat_vals.min()):.3f} "
-                  f"max={float(flat_vals.max()):.3f} "
-                  f"mean={float(flat_vals.mean()):.3f}")
-            print(f"[debug] top idxs (per chip first 8): "
-                  f"{flat_idxs[:8].tolist()}")
-        winning_chip = int(flat_vals.argmax().item())
-        return int(flat_idxs[winning_chip].item())
+        """Pull per-chip top-1 (column-parallel sharded vocab) and return the
+        global argmax. Delegates to `DeviceLMHead.argmax_pull` so the chip
+        index → vocab offset stays consistent with the lm_head sharding."""
+        return self._device_lm_head.argmax_pull(top_idx, top_val)
 
     @torch.inference_mode()
     def prefill(self, tokens: list[int]) -> int:
