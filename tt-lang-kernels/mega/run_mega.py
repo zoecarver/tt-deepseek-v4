@@ -807,6 +807,18 @@ class MegaModel(_BaseModel):
                 hc_base_cpu=hc_attn_base,
                 gamma_cpu=l0_layer.attn_norm.weight.data,
             )
+            # L0 applies attn_norm gamma internally (rmsnorm has gamma_tt),
+            # so it MUST receive an unbaked wq_a. Lk-A's `lk.weights["wq_a"]`
+            # has gamma pre-baked into the K axis (see _build_layer_kernels);
+            # using it here would compute γ² ⊙ rmsnorm(x) @ wq_a and corrupt
+            # the layer-0 residual that flows through every subsequent block.
+            _l0_wq_a_T = l0_layer.attn.wq_a.weight.data.transpose(0, 1) \
+                .contiguous().to(torch.bfloat16)
+            self._l0_wq_a_tt = ttnn.as_tensor(
+                _l0_wq_a_T, device=mesh, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
 
         with _phase("setup.layers"):
             for i, layer in enumerate(self.transformer.layers):
@@ -1818,7 +1830,7 @@ class MegaModel(_BaseModel):
         with _phase("l0"):
             l0_lk = self._layer_kernels[0]
             self._l0_kernel(
-                embed_tt, l0_lk.weights["wq_a"],
+                embed_tt, self._l0_wq_a_tt,
                 a_tt, sb.wq_a_out,
                 x_post_norm_bf16_out=sb.x_post_norm,
             )
@@ -1903,10 +1915,16 @@ class MegaModel(_BaseModel):
     @torch.inference_mode()
     def prefill(self, tokens: list[int]) -> int:
         """Greedy prefill via repeated `step_decode`. The trace machinery
-        handles the warmup window."""
+        handles the warmup window. Prints the per-step predicted next-token
+        so divergence in prefill (vs decode) is visible."""
         nxt = -1
         for i, tok in enumerate(tokens):
             nxt = self.step_decode(tok, i)
+            try:
+                tok_str = self.tokenizer.decode([nxt])
+            except Exception:
+                tok_str = "?"
+            print(f"[prefill] pos={i} input_tok={tok} -> next={nxt} {tok_str!r}")
         return nxt
 
     @torch.inference_mode()
