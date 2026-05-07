@@ -5296,6 +5296,11 @@ class DeviceAttention(nn.Module):
         self.q_rsqrt_ones_tt = ttnn.as_tensor(
             torch.full((self.head_dim,), self.softmax_scale,
                        dtype=torch.bfloat16), **rep)
+        # 1D gamma for ttnn.rms_norm direct call on kv_norm/q_norm.
+        self.kv_norm_gamma_1d_tt = ttnn.as_tensor(
+            self.kv_norm_dev._cpu_gamma.contiguous(), **rep)
+        self.q_norm_gamma_1d_tt = ttnn.as_tensor(
+            self.q_norm_dev._cpu_gamma.contiguous(), **rep)
         self.max_seq_len = cos_full.shape[0]
 
         # wo_a: head-sharded across cols. Original CPU weight is
@@ -5892,9 +5897,8 @@ class DeviceAttention(nn.Module):
                 kv_tt = fused_kv_pre_tt
             else:
                 kv_tt = attn.wkv.forward_device(x_tt)             # [B, S, D]
-            kv_2d = ttnn.reshape(kv_tt, [B * S, D])
-            kv_2d = self._rmsnorm_device(self.kv_norm_dev, kv_2d, B * S)
-            kv_tt = ttnn.reshape(kv_2d, [B, S, D])
+            kv_tt = ttnn.rms_norm(
+                kv_tt, weight=self.kv_norm_gamma_1d_tt, epsilon=self.eps)
             ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd],
                        output_tensor=self._kv_nope_scratch_tt)
             ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D],
@@ -5949,8 +5953,9 @@ class DeviceAttention(nn.Module):
                 if T_active > 0:
                     if device_indexer is not None:
                         with _phase("attn.topk.indexer"):
-                            qr_2d = self._rmsnorm_device(
-                                self.q_norm_dev, q_lora_2d, B * S)
+                            qr_2d = ttnn.rms_norm(
+                                q_lora_2d, weight=self.q_norm_gamma_1d_tt,
+                                epsilon=self.eps)
                             qr_tt = ttnn.reshape(
                                 qr_2d, [B, S, self.q_lora_rank])
                             score_tt = device_indexer.forward_device_score(
@@ -6048,25 +6053,6 @@ class DeviceAttention(nn.Module):
             # all_gather + col-parallel matmul + all_gather pair.
             out_tt = attn.wo_b.forward_device(self._wo_a_local_tt)
         return out_tt
-
-    def _rmsnorm_device(self, norm_dev: "DeviceRMSNorm", x_2d_tt, num_rows: int):
-        """Run device rmsnorm on a 2D [M, hidden] device tensor. Pads M to TILE
-        on device, runs the kernel, then slices the output back to [num_rows,
-        hidden]."""
-        ttnn = self._ttnn
-        Mpad = -(-num_rows // _RMS_TILE) * _RMS_TILE
-        cur_M = tuple(x_2d_tt.shape)[0]
-        hidden = tuple(x_2d_tt.shape)[1]
-        if cur_M < Mpad:
-            x_2d_tt = ttnn.pad(
-                x_2d_tt,
-                padding=[(0, Mpad - cur_M), (0, 0)],
-                value=0.0,
-            )
-        out = norm_dev.forward_device(x_2d_tt, num_rows)
-        if num_rows < Mpad:
-            out = ttnn.slice(out, [0, 0], [num_rows, hidden])
-        return out
 
     def _rotary_tables(self, start_pos_tt, S: int, q_dims: int):
         """Pick cos_ext/sin_signed rows for `start_pos_tt` via ttnn.embedding
