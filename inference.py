@@ -4794,6 +4794,8 @@ class DeviceCompressor(nn.Module):
         ratio = self.compress_ratio
         if self.kv_state_front_tt is None:
             self._alloc_decode_tensors(B)
+        if getattr(self, "_slots_shared", False):
+            return
         slot_in_ape = start_pos % ratio
         state_slot_int = (ratio + slot_in_ape) if self.overlap else slot_in_ape
         emit_slot_int = self.slot_offset + (start_pos // ratio)
@@ -6724,6 +6726,36 @@ class Model:
             attn._device_indexer = di
             self._device_indexers.append(di)
             self._device_compressors.append(ix_dc)
+
+        # Within each (compress_ratio, overlap, slot_offset) group, every
+        # DeviceCompressor instance computes the same state_slot and
+        # emit_slot per token. Pick a shared owner per group, rebind the
+        # other instances' _state_slot_tt/_emit_slot_tt to the owner's
+        # buffers, deallocate the duplicates, and skip per-instance
+        # uploads. Drops ~120 host->device uploads/token to ~6.
+        import ttnn as _ttnn_local
+        # Force eager allocation so the slot buffers exist before sharing.
+        for dc in self._device_compressors:
+            if dc.kv_state_front_tt is None:
+                dc._alloc_decode_tensors(1)
+        slot_groups: dict = {}
+        for dc in self._device_compressors:
+            key = (dc.compress_ratio, bool(dc.overlap), dc.slot_offset)
+            if key not in slot_groups:
+                slot_groups[key] = dc
+                continue
+            owner = slot_groups[key]
+            try:
+                _ttnn_local.deallocate(dc._state_slot_tt)
+            except Exception:
+                pass
+            try:
+                _ttnn_local.deallocate(dc._emit_slot_tt)
+            except Exception:
+                pass
+            dc._state_slot_tt = owner._state_slot_tt
+            dc._emit_slot_tt = owner._emit_slot_tt
+            dc._slots_shared = True
 
     def offload_moe_routed_experts(self, mesh):
         """Attach cached bfp4_b routed-expert weights to every non-hash MoE
