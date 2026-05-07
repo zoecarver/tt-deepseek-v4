@@ -850,11 +850,23 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
             attn_obj._lk_a(
                 x,
                 attn_obj._lk_a_wq_a_w_tt,
-                attn_obj._lk_a_wq_a_out_tt,
+                attn_obj._lk_a_wq_a_partial_tt,
                 x_pre_norm_bf16_out=attn_obj._lk_a_x_pre_norm_tt,
                 post_tt_out=mhc_attn._post_tt,
                 comb_sk_out_tt_out=mhc_attn._comb_sk_out_tt,
             )
+            if getattr(attn_obj, "_lk_a_full_mesh", False):
+                # 2-stage all_gather: cluster_axis=1 collapses the col-axis
+                # shard, cluster_axis=0 then collapses the row-axis remainder
+                # to publish replicated _lk_a_wq_a_out_tt.
+                ttnn.all_gather(
+                    attn_obj._lk_a_wq_a_partial_tt, dim=-1, cluster_axis=1,
+                    num_links=1,
+                    output_tensor=attn_obj._lk_a_wq_a_row_gathered_tt)
+                ttnn.all_gather(
+                    attn_obj._lk_a_wq_a_row_gathered_tt, dim=-1, cluster_axis=0,
+                    num_links=1,
+                    output_tensor=attn_obj._lk_a_wq_a_out_tt)
             mhc_attn._stash_a_tt = x
             mhc_attn._stash_post_tt = mhc_attn._post_tt
             mhc_attn._stash_comb_sk_tt = mhc_attn._comb_sk_out_tt
@@ -7035,29 +7047,63 @@ class Model:
             attn_norm_dn = layer.attn_norm.forward.__self__
             gamma_cpu = attn_norm_dn._cpu_gamma
 
+            mesh_shape = tuple(mesh.shape)
+            num_chips = mesh_shape[0] * mesh_shape[1]
+            q_lora_rank = self.args.q_lora_rank
+            full_mesh_lk_a = (q_lora_rank % (num_chips * _RMS_TILE) == 0)
+            n_per_chip = (q_lora_rank // num_chips) if full_mesh_lk_a else q_lora_rank
+
             lk_a = make_lk_a(
                 mesh,
                 hc_fn_cpu=layer.hc_attn_fn,
                 hc_scale_cpu=layer.hc_attn_scale,
                 hc_base_cpu=layer.hc_attn_base,
                 gamma_cpu=gamma_cpu,
+                n_per_chip=n_per_chip,
             )
 
             wq_a_T = _weight_to_bf16(wq_a_cpu).transpose(0, 1).contiguous()
             gamma_f32 = gamma_cpu.detach().to(torch.float32)
             wq_a_baked = (gamma_f32[:, None] * wq_a_T.float()) \
                 .to(torch.bfloat16).contiguous()
+            wq_a_mapper = (ttnn.ShardTensorToMesh(mesh, dim=-1)
+                           if full_mesh_lk_a
+                           else ttnn.ReplicateTensorToMesh(mesh))
             attn._lk_a_wq_a_w_tt = ttnn.as_tensor(
                 wq_a_baked, device=mesh, dtype=ttnn.bfloat16,
                 layout=ttnn.TILE_LAYOUT,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+                mesh_mapper=wq_a_mapper,
             )
+            # Replicated final output the rest of attention consumes.
             attn._lk_a_wq_a_out_tt = ttnn.zeros(
-                shape=(1, 1, self.args.q_lora_rank),
+                shape=(1, 1, q_lora_rank),
                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                 device=mesh, memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
+            if full_mesh_lk_a:
+                # Per-chip kernel output [1, 1, q_lora_rank] sharded along the
+                # full mesh on the last dim. The 2-stage all_gather
+                # (cluster_axis=1 then 0) reconstructs the replicated
+                # _lk_a_wq_a_out_tt.
+                zeros_qlora = torch.zeros(1, 1, q_lora_rank, dtype=torch.bfloat16)
+                attn._lk_a_wq_a_partial_tt = ttnn.from_torch(
+                    zeros_qlora, device=mesh, dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=-1),
+                )
+                attn._lk_a_wq_a_row_gathered_tt = ttnn.from_torch(
+                    zeros_qlora, device=mesh, dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ShardTensor2dMesh(
+                        mesh, mesh_shape, dims=(-1, None)),
+                )
+            else:
+                attn._lk_a_wq_a_partial_tt = attn._lk_a_wq_a_out_tt
+                attn._lk_a_wq_a_row_gathered_tt = None
+            attn._lk_a_full_mesh = full_mesh_lk_a
             attn._lk_a_x_pre_norm_tt = ttnn.zeros(
                 shape=(_RMS_TILE, self.args.dim),
                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,

@@ -635,14 +635,28 @@ def _make_fused_rms_summa_kernel(M: int, K: int, N: int,
     return fused_kernel
 
 
-def make_lk_a_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
+def make_lk_a_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu,
+                     n_per_chip: int = Q_LORA_RANK):
     """Mega kernel for Lk-A = hc_pre + typecast + attn_norm + wq_a matmul.
 
     Composes 5 tt-lang dispatches all defined locally in this file:
     norm_fn_ksplit + split_mixes + sinkhorn + apply_mix_h +
     fused (rmsnorm + SUMMA wq_a matmul). Constants/scratch tensors are
     allocated up front from cpu-side weights.
+
+    `n_per_chip` is the per-chip slice of `Q_LORA_RANK` along the matmul N
+    axis. The default replicates the full Q_LORA_RANK on every chip; passing
+    a smaller value (e.g. Q_LORA_RANK // num_chips) lets the caller shard
+    the gamma-baked wq_a weight across the mesh and post-gather the output.
+    The kernel writes a per-chip [1, 1, n_per_chip] slab into `out_tt`; the
+    caller is responsible for any cross-chip all_gather.
     """
+    if Q_LORA_RANK % n_per_chip:
+        raise ValueError(
+            f"Q_LORA_RANK={Q_LORA_RANK} not divisible by n_per_chip={n_per_chip}")
+    if n_per_chip % TILE:
+        raise ValueError(
+            f"n_per_chip={n_per_chip} must be a multiple of TILE={TILE}")
     K_tiles = D // TILE                                # 512
     h_tiles = DIM // TILE                              # 128
     norm_fn_kernel = _make_mhc_norm_fn_ksplit_kernel(
@@ -654,9 +668,22 @@ def make_lk_a_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
         num_slices=NUM_TOKENS, repeat=HC_SINKHORN_ITERS, eps=HC_EPS)
     apply_mix_kernel = _make_mhc_apply_mix_h_kernel(
         num_tokens=NUM_TOKENS, h_tiles=h_tiles)
+    n_tiles_per_chip = n_per_chip // TILE
+    if n_tiles_per_chip == 1:
+        # Single-tile N (one core per chip): no N-parallelism, single-core grid.
+        fused_block_cfg = (1, 1, 8)
+        fused_part_cfg = (1, 1, 1)
+    elif n_tiles_per_chip % 8 == 0:
+        # Use 8 cores along N with bn=n_tiles_per_chip/8.
+        fused_block_cfg = (1, n_tiles_per_chip // 8, 8)
+        fused_part_cfg = (1, 8, 1)
+    else:
+        # Fall back to single-block N, parallelize across N-tiles.
+        fused_block_cfg = (1, 1, 8)
+        fused_part_cfg = (1, n_tiles_per_chip, 1)
     fused_rms_matmul_kernel = _make_fused_rms_summa_kernel(
-        M=TILE, K=DIM, N=Q_LORA_RANK,
-        block_cfg=(1, 4, 8), part_cfg=(1, 8, 1),
+        M=TILE, K=DIM, N=n_per_chip,
+        block_cfg=fused_block_cfg, part_cfg=fused_part_cfg,
         rms_eps=NORM_EPS)
 
     rep_fp32 = dict(device=mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
@@ -720,7 +747,7 @@ def make_lk_a_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
             state["a_sliced_scratch_tt"] = _zeros_fp32((NUM_TOKENS, MHC * DIM))
             # fused rms+matmul scratch
             state["rms_in_tt"] = _zeros_bf16((TILE, DIM))   # bf16 input post-typecast
-            state["y_padded_tt"] = _zeros_bf16((TILE, Q_LORA_RANK))
+            state["y_padded_tt"] = _zeros_bf16((TILE, n_per_chip))
             state["scratch"] = True
 
         mixes_tt = state["mixes_tt"]
@@ -798,8 +825,8 @@ def make_lk_a_kernel(mesh, hc_fn_cpu, hc_scale_cpu, hc_base_cpu, gamma_cpu):
         fused_rms_matmul_kernel(
             state["rms_in_tt"], wq_a_w_tt, sc_bf16_tt, state["y_padded_tt"])
         y_row = ttnn.slice(state["y_padded_tt"], [0, 0],
-                           [NUM_TOKENS, Q_LORA_RANK])
-        y_3d = ttnn.reshape(y_row, [1, 1, Q_LORA_RANK])
+                           [NUM_TOKENS, n_per_chip])
+        y_3d = ttnn.reshape(y_row, [1, 1, n_per_chip])
         ttnn.copy(y_3d, out_tt)
 
         # 10. Optionally publish the bf16 pre-norm hc_pre output as
