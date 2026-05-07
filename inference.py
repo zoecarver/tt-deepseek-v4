@@ -5209,11 +5209,13 @@ class DeviceIndexer(nn.Module):
 
         # TODO(tt-lang): fuse relu * weights * sum + topk into a single
         # `indexer_score_reduce` kernel (README candidate #4).
-        score = ttnn.relu(score)
         # Multiply weights along the head dim (-2) and reduce out heads. Avoids
         # the explicit transpose between score and the head-dim broadcast.
+        # relu is fused into multiply via input_tensor_a_activations, dropping
+        # the separate ttnn.relu dispatch.
         w_b = ttnn.reshape(w_tt, [B, 1, H_local, 1])
-        score = ttnn.multiply(score, w_b)
+        score = ttnn.multiply(score, w_b,
+                              input_tensor_a_activations=[ttnn.UnaryOpType.RELU])
         partial = ttnn.sum(score, dim=-2, keepdim=False)         # per-chip [B, 1, T_pad]
         # Combine the per-col head partials. cluster_axis=1 leaves the
         # input replicated across rows, so the result is fully replicated
@@ -5847,11 +5849,11 @@ class DeviceAttention(nn.Module):
                 q_lora_tt = fused_q_lora_tt
             else:
                 q_lora_tt = attn.wq_a.forward_device(x_tt)        # [B, S, q_lora_rank]
-            # qr_tt is still needed by the device_indexer score path; it's a
-            # cheap rmsnorm relative to the wq_b matmul that lk_b absorbs.
+            # qr_tt is only consumed by the indexer score path; defer the
+            # q_norm rmsnorm + reshape to that branch so non-indexer layers
+            # (~half) skip it entirely. Lk-B does its own internal rmsnorm,
+            # so the wq_b path doesn't need qr_tt.
             q_lora_2d = ttnn.reshape(q_lora_tt, [B * S, self.q_lora_rank])
-            qr_2d = self._rmsnorm_device(self.q_norm_dev, q_lora_2d, B * S)
-            qr_tt = ttnn.reshape(qr_2d, [B, S, self.q_lora_rank])
             # SWAP-Lk-B: fused q_norm rmsnorm + wq_b matmul (single ttl.operation).
             # wq_b is head-sharded across cols, so the per-chip kernel produces
             # only n_local_heads * head_dim outputs. Pad input [1,1,K] ->
@@ -5944,6 +5946,10 @@ class DeviceAttention(nn.Module):
                 if T_active > 0:
                     if device_indexer is not None:
                         with _phase("attn.topk.indexer"):
+                            qr_2d = self._rmsnorm_device(
+                                self.q_norm_dev, q_lora_2d, B * S)
+                            qr_tt = ttnn.reshape(
+                                qr_2d, [B, S, self.q_lora_rank])
                             score_tt = device_indexer.forward_device_score(
                                 x_tt, qr_tt, B, start_pos,
                                 start_pos_tt=start_pos_tt,
