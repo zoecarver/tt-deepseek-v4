@@ -4496,8 +4496,8 @@ def _device_apply_rotary_swap(ttnn, x_tt, cos_ext_tt, sin_signed_tt, P_tt,
                               inverse: bool = False):
     """Single-pass interleaved rotary using a precomputed swap matrix.
 
-    Replaces the 13-op slice/multiply/concat chain with 4 ttnn ops:
-    one matmul + two multiplies + one add (or subtract for inverse).
+    Non-inverse: out = x*cos + swapped*sin → matmul + multiply + addcmul (3 ops).
+    Inverse:     out = x*cos - swapped*sin → matmul + 2 multiplies + subtract (4 ops).
 
     See `_build_rotary_aux_tables` / `_build_rotary_swap_matrix` for
     table layouts. cos_ext_tt / sin_signed_tt must broadcast against
@@ -4505,10 +4505,12 @@ def _device_apply_rotary_swap(ttnn, x_tt, cos_ext_tt, sin_signed_tt, P_tt,
     """
     swapped = ttnn.matmul(x_tt, P_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
     c_term = ttnn.multiply(x_tt, cos_ext_tt)
-    s_term = ttnn.multiply(swapped, sin_signed_tt)
     if inverse:
+        s_term = ttnn.multiply(swapped, sin_signed_tt)
         return ttnn.subtract(c_term, s_term)
-    return ttnn.add(c_term, s_term)
+    # addcmul(input, t1, t2) = input + t1 * t2; folds the s_term multiply
+    # and final add into one fused dispatch.
+    return ttnn.addcmul(c_term, swapped, sin_signed_tt)
 
 
 def _device_q_rsqrt_norm(ttnn, q_tt, eps: float):
