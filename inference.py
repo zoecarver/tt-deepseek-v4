@@ -130,6 +130,19 @@ def _get_lk_e_make_kernel():
     return _MEGA_KERNEL_CACHE["lk_e_make_kernel"]
 
 
+def _get_lk_d1_make_kernel():
+    """Lazy-import test_lk_d1's `make_lk_d1_kernel` factory.
+
+    Lk-D1 fuses kv_norm + rotary + act_quant_block over a [B, S, head_dim]
+    bf16 tensor (replicated across the col axis post wkv all_gather). The
+    factory bakes per-layer kv_norm gamma + cos/sin tables into the closure.
+    """
+    if "lk_d1_make_kernel" not in _MEGA_KERNEL_CACHE:
+        lk_d1_mod = _import_mega_kernel("test_lk_d1")
+        _MEGA_KERNEL_CACHE["lk_d1_make_kernel"] = lk_d1_mod.make_lk_d1_kernel
+    return _MEGA_KERNEL_CACHE["lk_d1_make_kernel"]
+
+
 # ==============================================================================
 # Global state (mirrors deepseek inference/model.py)
 # ==============================================================================
@@ -4512,6 +4525,17 @@ def _device_apply_rotary_swap(ttnn, x_tt, cos_ext_tt, sin_signed_tt, P_tt,
     return ttnn.addcmul(c_term, swapped, sin_signed_tt, value=value)
 
 
+def _device_apply_rotary_interleaved(ttnn, x_tt, cos_tt, sin_tt,
+                                     inverse: bool = False):
+    """Stub kept for mega-kernel PCC tests that import this symbol.
+
+    Hot-path uses `_device_apply_rotary_swap` (extended cos/sin + swap matmul).
+    """
+    raise NotImplementedError(
+        "_device_apply_rotary_interleaved is a compatibility stub; "
+        "use _device_apply_rotary_swap for live device rotary")
+
+
 def _device_q_rsqrt_norm(ttnn, q_tt, eps: float):
     """Per-head rsqrt-norm: q *= rsqrt(mean(q^2, last) + eps).
 
@@ -5283,6 +5307,9 @@ class DeviceAttention(nn.Module):
         )
         self.cos_full_tt = ttnn.as_tensor(cos_full, **rep)
         self.sin_full_tt = ttnn.as_tensor(sin_full, **rep)
+        # Saved for the Lk-D1 kernel factory (cpu copies, baked into closure).
+        self._cos_full_cpu = cos_full
+        self._sin_full_cpu = sin_full
         cos_ext_cpu, sin_signed_cpu = _build_rotary_aux_tables(
             cos_full, sin_full)
         self.cos_ext_tt = ttnn.as_tensor(cos_ext_cpu, **rep)
@@ -5656,6 +5683,24 @@ class DeviceAttention(nn.Module):
             ),
         )
 
+        # Lk-D1 mega kernel: kv_norm + rotary(rope-half) + act_quant_block(nope-half).
+        # Closure bakes per-layer kv_norm gamma + global cos/sin tables.
+        # Output shape matches the legacy [B, S, head_dim] bf16 path. The
+        # kernel writes into self._lk_d1_out_tt; replicated across the mesh
+        # (the input kv_tt is replicated post-wkv-allgather).
+        self._lk_d1_kernel = _get_lk_d1_make_kernel()(
+            self.mesh,
+            gamma_cpu=self.kv_norm_dev._cpu_gamma.contiguous(),
+            cos_full_cpu=self._cos_full_cpu,
+            sin_full_cpu=self._sin_full_cpu,
+        )
+        self._lk_d1_out_tt = ttnn.from_torch(
+            torch.zeros(B, S, D, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         """Single-token forward. Prefill is driven externally as a per-token
         loop, so seqlen is always 1 and start_pos==0 is handled by _decode."""
@@ -5841,8 +5886,6 @@ class DeviceAttention(nn.Module):
             start_pos_tt, self.sin_signed_tt, layout=ttnn.TILE_LAYOUT)
         cos_ext_4d = ttnn.reshape(cos_2d, [1, S, 1, rd])
         sin_signed_4d = ttnn.reshape(sin_2d, [1, S, 1, rd])
-        cos_ext_3d = ttnn.reshape(cos_2d, [1, S, rd])
-        sin_signed_3d = ttnn.reshape(sin_2d, [1, S, rd])
 
         # When `offload_attn_wq_a_and_wkv` ran, both projections share one
         # DeviceColLinear (concatenated weight). Run a single matmul + gather
@@ -5905,43 +5948,20 @@ class DeviceAttention(nn.Module):
                 self.rope_P_tt, inverse=False)
             q_tt = ttnn.concat([self._q_nope_scratch_tt, q_rope], dim=-1)
 
-        # KV path: wkv -> kv_norm -> rotary.
+        # KV path: wkv -> kv_norm -> rotary -> nope-half act_quant.
+        # SWAP-Lk-D1: all post-wkv work is fused into one tt-lang dispatch
+        # (ttl rmsnorm + swap-SUMMA rotary + ttl act_quant_block). Output is
+        # the assembled [B, S, head_dim] bf16 (nope-quantized + rope-rotated).
         with _phase("attn.kv"):
             if wq_a_wkv_fused:
                 kv_tt = fused_kv_pre_tt
             else:
                 kv_tt = attn.wkv.forward_device(x_tt)             # [B, S, D]
-            kv_tt = ttnn.rms_norm(
-                kv_tt, weight=self.kv_norm_gamma_1d_tt, epsilon=self.eps)
-            ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd],
-                       output_tensor=self._kv_nope_scratch_tt)
-            ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D],
-                       output_tensor=self._kv_rope_scratch_tt)
-            kv_rope = _device_apply_rotary_swap(
-                ttnn, self._kv_rope_scratch_tt, cos_ext_3d, sin_signed_3d,
-                self.rope_P_tt, inverse=False)
-
-            # Device-side act_quant on the nope region (bf16 round-trip; no fp8
-            # cast under the bf16-everywhere precision policy). One tt-lang
-            # kernel dispatch replaces the 9-op chain in `_device_act_quant_block`.
-            # The kernel only reads tile (0, 0..NB); a logical-[B*S, N] input in
-            # TILE_LAYOUT shares the [1 tile-row, N/TILE] grid with [TILE, N], so
-            # no host-side pad is required.
-            if ttl_act_quant_block_M32_N448_B64 is None:
-                raise RuntimeError(
-                    "act_quant_block kernel not pre-built; "
-                    "call prebuild_ttl_decode_kernels(args) first")
-            nope_2d = ttnn.reshape(self._kv_nope_scratch_tt, [B * S, D - rd])
-            ttl_act_quant_block_M32_N448_B64(
-                nope_2d,
-                self._act_quant_sc_tt,
-                self._act_quant_out_tt,
+            self._lk_d1_kernel(
+                kv_tt, self.cos_full_tt, self.sin_full_tt,
+                start_pos_tt, self._lk_d1_out_tt,
             )
-            kv_nope_q = ttnn.reshape(
-                ttnn.slice(self._act_quant_out_tt, [0, 0], [B * S, D - rd]),
-                [B, S, D - rd],
-            )
-            kv_tt = ttnn.concat([kv_nope_q, kv_rope], dim=-1)
+            kv_tt = self._lk_d1_out_tt
 
         # Build the topk index tensor entirely on device.
         # Window slot indices are sliced from the precomputed
