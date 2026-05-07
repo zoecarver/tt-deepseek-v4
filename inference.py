@@ -5379,9 +5379,28 @@ class DeviceAttention(nn.Module):
         # pre_stage_decode (called by the orchestrator before forward_device,
         # outside any future trace region). Body below is pure device work.
 
+        # When `offload_attn_wq_a_and_wkv` ran, both projections share one
+        # DeviceColLinear (concatenated weight). Run a single matmul + gather
+        # and slice the output into q_lora and pre-norm kv. Falls back to two
+        # separate forward_device calls when fusion is disabled.
+        wq_a_wkv_fused = attn.wq_a is attn.wkv
+        if wq_a_wkv_fused:
+            with _phase("attn.qkv_fused"):
+                fused_dw = attn.wq_a
+                qkv_tt = fused_dw.forward_device(x_tt)
+                q_out = fused_dw._fused_q_out
+                kv_out = fused_dw._fused_kv_out
+                fused_q_lora_tt = ttnn.slice(
+                    qkv_tt, [0, 0, 0], [B, S, q_out])
+                fused_kv_pre_tt = ttnn.slice(
+                    qkv_tt, [0, 0, q_out], [B, S, q_out + kv_out])
+
         # Q path: wq_a -> [Lk-B fused q_norm + wq_b] -> per-head rsqrt-norm -> rotary.
         with _phase("attn.q"):
-            q_lora_tt = attn.wq_a.forward_device(x_tt)            # [B, S, q_lora_rank]
+            if wq_a_wkv_fused:
+                q_lora_tt = fused_q_lora_tt
+            else:
+                q_lora_tt = attn.wq_a.forward_device(x_tt)        # [B, S, q_lora_rank]
             # qr_tt is still needed by the device_indexer score path; it's a
             # cheap rmsnorm relative to the wq_b matmul that lk_b absorbs.
             q_lora_2d = ttnn.reshape(q_lora_tt, [B * S, self.q_lora_rank])
@@ -5419,7 +5438,10 @@ class DeviceAttention(nn.Module):
 
         # KV path: wkv -> kv_norm -> rotary.
         with _phase("attn.kv"):
-            kv_tt = attn.wkv.forward_device(x_tt)                 # [B, S, D]
+            if wq_a_wkv_fused:
+                kv_tt = fused_kv_pre_tt
+            else:
+                kv_tt = attn.wkv.forward_device(x_tt)             # [B, S, D]
             kv_2d = ttnn.reshape(kv_tt, [B * S, D])
             kv_2d = self._rmsnorm_device(self.kv_norm_dev, kv_2d, B * S)
             kv_tt = ttnn.reshape(kv_2d, [B, S, D])
@@ -6051,6 +6073,34 @@ class Model:
             attn = layer.attn
             dw = DeviceColLinear(mesh, attn.wkv.weight)
             attn.wkv = dw
+            self._device_wkv.append(dw)
+
+    def offload_attn_wq_a_and_wkv(self, mesh):
+        """Fuse wq_a + wkv into a single column-parallel matmul.
+
+        Both share the same input x [B, S, dim]. Concatenating the weights
+        along the output axis collapses two `DeviceColLinear.forward_device`
+        calls (2 matmuls + 2 all_gather chains) into one, at the cost of two
+        cheap on-device slices. `attn.wq_a` and `attn.wkv` are bound to the
+        same fused instance so downstream `isinstance(..., DeviceColLinear)`
+        checks still pass; `forward_device` detects fusion via identity
+        (`attn.wq_a is attn.wkv`) and slices the gathered output.
+        """
+        self._device_wq_a = []
+        self._device_wkv = []
+        for layer in self.transformer.layers:
+            attn = layer.attn
+            wq_a_w = _weight_to_bf16(attn.wq_a.weight)
+            wkv_w = _weight_to_bf16(attn.wkv.weight)
+            q_out = wq_a_w.shape[0]
+            kv_out = wkv_w.shape[0]
+            fused_w = torch.cat([wq_a_w, wkv_w], dim=0).contiguous()
+            dw = DeviceColLinear(mesh, fused_w)
+            dw._fused_q_out = q_out
+            dw._fused_kv_out = kv_out
+            attn.wq_a = dw
+            attn.wkv = dw
+            self._device_wq_a.append(dw)
             self._device_wkv.append(dw)
 
     def offload_sparse_attn(self, mesh):
@@ -6800,9 +6850,8 @@ def main():
     model.offload_lm_head(mesh)
     print(f"[phase] lm_head offloaded in {time.time() - t0:.1f}s")
     for label, method in (
-        ("wq_a", model.offload_attn_wq_a),
+        ("wq_a_wkv", model.offload_attn_wq_a_and_wkv),
         ("wq_b", model.offload_attn_wq_b),
-        ("wkv", model.offload_attn_wkv),
         ("wo_b", model.offload_attn_wo_b),
         ("moe_gate", model.offload_moe_gate),
         ("moe_shared_expert", model.offload_moe_shared_expert),
