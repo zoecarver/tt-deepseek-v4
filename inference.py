@@ -5503,6 +5503,9 @@ class DeviceAttention(nn.Module):
         # so the 5-op invalid-mask chain collapses into addcmul: see
         # _indexer_topk_body for the closed form.
         self._topk_neg_const_per_bucket = {}
+        # Int32 [B,1,k] tile of constant -1, used by the indexer topk
+        # post-fixup so the 2-op (add+addcmul) chain becomes 1 addcmul.
+        self._topk_neg_one_int_per_bucket = {}
         if self.compress_ratio == 4:
             max_T_for_buckets = self.max_seq_len // self.compress_ratio
             for bk in _INDEXER_TOPK_BUCKETS:
@@ -5534,6 +5537,15 @@ class DeviceAttention(nn.Module):
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     mesh_mapper=self._upload_mapper,
                 )
+                k_fixed = min(attn.indexer.index_topk, bk)
+                if k_fixed not in self._topk_neg_one_int_per_bucket:
+                    self._topk_neg_one_int_per_bucket[k_fixed] = ttnn.from_torch(
+                        torch.full((B, 1, k_fixed), -1, dtype=torch.int32),
+                        device=self.mesh, dtype=ttnn.int32,
+                        layout=ttnn.TILE_LAYOUT,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        mesh_mapper=self._upload_mapper,
+                    )
 
         # Inputs for the attn.topk indexer body. The body runs inline (no
         # per-bucket inner trace) so the whole attention forward can be
@@ -5730,13 +5742,15 @@ class DeviceAttention(nn.Module):
             self._topk_neg_const_per_bucket[bucket], value=1.0)
         vals_tt, idxs_tt = ttnn.topk(
             masked_tt, k=k_fixed, dim=-1, largest=True, sorted=True)
-        invalid_int = ttnn.lt(vals_tt, -1000.0, dtype=ttnn.int32)
+        valid_int = ttnn.ge(vals_tt, -1000.0, dtype=ttnn.int32)
         idxs_int = ttnn.typecast(idxs_tt, dtype=ttnn.int32)
-        idxs_winned = ttnn.add(idxs_int, win)
-        idxs_plus_1 = ttnn.add(idxs_winned, 1)
-        # cmp_idxs_int = idxs_winned - idxs_plus_1 * invalid_int
+        idxs_plus = ttnn.add(idxs_int, win + 1)
+        # cmp_idxs_int = -1 + (idx + win + 1) * valid:
+        #   valid=1 -> idx + win
+        #   valid=0 -> -1
         return ttnn.addcmul(
-            idxs_winned, idxs_plus_1, invalid_int, value=-1.0)
+            self._topk_neg_one_int_per_bucket[k_fixed], idxs_plus,
+            valid_int, value=1.0)
 
     def pre_stage_decode(self, start_pos: int, B: int = 1, S: int = 1):
         """Per-step host->device uploads for this attention layer (and its
