@@ -5127,10 +5127,11 @@ class DeviceIndexer(nn.Module):
         # TODO(tt-lang): fuse relu * weights * sum + topk into a single
         # `indexer_score_reduce` kernel (README candidate #4).
         score = ttnn.relu(score)
-        score_t = ttnn.transpose(score, -2, -1)                  # [B, 1, T_pad, H_local]
-        w_b = ttnn.reshape(w_tt, [B, 1, 1, H_local])
-        score_t = ttnn.multiply(score_t, w_b)
-        partial = ttnn.sum(score_t, dim=-1, keepdim=False)       # per-chip [B, 1, T_pad]
+        # Multiply weights along the head dim (-2) and reduce out heads. Avoids
+        # the explicit transpose between score and the head-dim broadcast.
+        w_b = ttnn.reshape(w_tt, [B, 1, H_local, 1])
+        score = ttnn.multiply(score, w_b)
+        partial = ttnn.sum(score, dim=-2, keepdim=False)         # per-chip [B, 1, T_pad]
         # Combine the per-col head partials. cluster_axis=1 leaves the
         # input replicated across rows, so the result is fully replicated
         # (matching the score scratch buffer's mesh mapper).
