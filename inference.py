@@ -5712,17 +5712,15 @@ class DeviceAttention(nn.Module):
         ramp_int_tt = self._topk_ramp_int_per_bucket[bucket]
         t_active_tt = self._t_active_persistent_per_bucket[bucket]
         # masked = score + (mask - 1) * 1e4 = score - invalid * 1e4
-        # collapses 5 ops (lt + typecast + sub + mul + add) into 3 (ge +
-        # typecast + addcmul) by carrying the -1e4 in a persistent tile.
-        invalid_bool = ttnn.ge(ramp_int_tt, t_active_tt)
-        invalid_bf16 = ttnn.typecast(invalid_bool, dtype=ttnn.bfloat16)
+        # collapses 5 ops (lt + typecast + sub + mul + add) into 2 (ge with
+        # dtype=bf16 emits {0.0, 1.0} directly + addcmul with the -1e4 const).
+        invalid_bf16 = ttnn.ge(ramp_int_tt, t_active_tt, dtype=ttnn.bfloat16)
         masked_tt = ttnn.addcmul(
             score_slice_tt, invalid_bf16,
             self._topk_neg_const_per_bucket[bucket], value=1.0)
         vals_tt, idxs_tt = ttnn.topk(
             masked_tt, k=k_fixed, dim=-1, largest=True, sorted=True)
-        invalid_bf16 = ttnn.lt(vals_tt, -1000.0)
-        invalid_int = ttnn.typecast(invalid_bf16, dtype=ttnn.int32)
+        invalid_int = ttnn.lt(vals_tt, -1000.0, dtype=ttnn.int32)
         idxs_int = ttnn.typecast(idxs_tt, dtype=ttnn.int32)
         idxs_winned = ttnn.add(idxs_int, win)
         idxs_plus_1 = ttnn.add(idxs_winned, 1)
