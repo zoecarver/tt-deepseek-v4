@@ -1575,6 +1575,76 @@ class DeviceColLinear(nn.Module):
         return self._gather_out_tt
 
 
+class DeviceRowLinear(nn.Module):
+    """Row-parallel linear across the col axis (cluster_axis=1).
+
+    Weight: [out, in] (nn.Linear order). Transposed to [in, out] for ttnn,
+    sharded on the input dim along the col axis, replicated on the row
+    axis. Each chip holds [in/n_cols, out].
+
+    Input must be col-sharded on its last dim (in/n_cols per chip),
+    matching the upstream producer's `dims=(None, -1)` layout. The matmul
+    is K-sharded: per-chip output is a partial sum of shape
+    [..., out_dim], replicated in shape across the mesh. A single
+    cluster_axis=1 all_reduce sums the partials into the final replicated
+    output.
+
+    Replaces a (replicate-via-all_gather + col-parallel matmul + gather)
+    pair with (matmul + all_reduce), saving one CCL/layer when the wo_a
+    output is already col-sharded.
+    """
+
+    def __init__(self, mesh, cpu_weight: torch.Tensor):
+        super().__init__()
+        import ttnn
+        self._ttnn = ttnn
+        self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        n_rows, n_cols = self.mesh_shape
+        out_dim, in_dim = cpu_weight.shape
+        if in_dim % n_cols != 0:
+            raise ValueError(
+                f"row-linear in_dim {in_dim} not divisible by mesh cols {n_cols}"
+            )
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        w_io = _weight_to_bf16(cpu_weight).transpose(0, 1).contiguous()  # [in, out]
+        self.w_tt = ttnn.as_tensor(
+            w_io,
+            device=mesh,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(
+                mesh, self.mesh_shape, dims=(None, 0)),
+        )
+        self._cpu_weight = cpu_weight
+        self._alloc_decode_tensors()
+
+    def _alloc_decode_tensors(self):
+        ttnn = self._ttnn
+        zeros = torch.zeros(1, 1, self.out_dim, dtype=torch.bfloat16)
+        # Matmul output: K-sharded matmul produces a partial sum that has
+        # the same logical shape on every chip but different values. Use
+        # ReplicateTensorToMesh so the framework's per-chip shape matches
+        # the matmul's output tile spec.
+        self._partial_out_tt = ttnn.from_torch(
+            zeros,
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+
+    def forward_device(self, x_tt) -> "object":
+        """Device-only path. x_tt: col-sharded input on its last dim
+        ([..., in/n_cols] per chip). Returns replicated [..., out_dim]
+        after a single cluster_axis=1 all_reduce."""
+        ttnn = self._ttnn
+        ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    optional_output_tensor=self._partial_out_tt)
+        return ttnn.all_reduce(self._partial_out_tt, cluster_axis=1, num_links=1)
+
+
 class DeviceMoEGate(nn.Module):
     """V4-Flash MoE gate (sqrtsoftplus score_func) on a 1xN mesh.
 
@@ -5147,10 +5217,11 @@ class DeviceAttention(nn.Module):
 
     Owns nothing but small tables (cos/sin, attn_sink, kv_norm/q_norm) and
     references to the existing per-attn DeviceColLinear / DeviceGroupedLinear
-    instances. Reuses `DeviceRMSNorm.forward_device` for q_norm/kv_norm,
-    `DeviceColLinear.forward_device` for wq_a/wq_b/wkv/wo_b,
-    `DeviceGroupedLinear.forward_device` for wo_a, and
-    `DeviceSparseAttn.forward_device` for sparse_attn.
+    / DeviceRowLinear instances. Reuses `DeviceRMSNorm.forward_device` for
+    q_norm/kv_norm, `DeviceColLinear.forward_device` for wq_a/wq_b/wkv,
+    `DeviceRowLinear.forward_device` for wo_b (col-axis K-shard +
+    cluster_axis=1 all_reduce), `DeviceGroupedLinear.forward_device` for
+    wo_a, and `DeviceSparseAttn.forward_device` for sparse_attn.
 
     Decode path (start_pos > 0, seqlen == 1): one upload of x, end-to-end
     on device, one download. CPU side effects (act_quant, kv_cache update,
@@ -5485,13 +5556,12 @@ class DeviceAttention(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=head_shard_4d,
         )
-        # Pre-allocated destinations for the head-shard wo_a path. Per chip
-        # logical shape after the local matmul is [1, B*S, o_lora_rank]
-        # (one group's contribution); the cluster_axis=1 all_gather along
-        # dim=-1 assembles the full [1, B*S, n_groups * o_lora_rank] tensor.
-        # _wo_a_local_tt is allocated as a col-sharded tensor of the full
-        # gathered shape so the per-chip slice exactly matches the matmul
-        # output and we can write directly via optional_output_tensor=.
+        # Pre-allocated destination for the head-shard wo_a matmul. Per
+        # chip logical shape is [1, B*S, o_lora_rank] (one group's
+        # contribution); the framework view is col-sharded on dim=-1 so
+        # logical full is [1, B*S, n_groups * o_lora_rank]. DeviceRowLinear
+        # (wo_b) consumes this directly via a K-sharded matmul + a single
+        # cluster_axis=1 all_reduce.
         n_groups_full = self.n_groups * self.o_lora_rank
         self._wo_a_local_tt = ttnn.from_torch(
             torch.zeros(1, B * S, n_groups_full, dtype=torch.bfloat16),
@@ -5499,12 +5569,6 @@ class DeviceAttention(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ShardTensor2dMesh(
                 self.mesh, self.mesh_shape, dims=(None, -1)),
-        )
-        self._wo_a_gathered_tt = ttnn.from_torch(
-            torch.zeros(1, B * S, n_groups_full, dtype=torch.bfloat16),
-            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=self._upload_mapper,
         )
         # Scratch for the act_quant_block tt-lang kernel: persistent output
         # buffer (kernel writes into it; we then slice row 0). The scaler is
@@ -5920,8 +5984,9 @@ class DeviceAttention(nn.Module):
             # of n_local_heads heads (== one of the n_groups groups). Flatten
             # head*D into wo_a's input dim and do a single matmul against the
             # local [1, in, R] weight. The leading 1 broadcasts; result is
-            # per-chip [1, B*S, R]. Reshape to [B, S, R] and all-gather along
-            # the col axis to assemble the full [B, S, n_groups * R] tensor.
+            # per-chip [1, B*S, R]. _wo_a_local_tt is col-sharded on its last
+            # dim (logical full = [1, B*S, n_groups*R]); each col already
+            # holds the slice that wo_b's row-parallel input wants.
             in_per = self.wo_a_in_per_group
             if in_per != H_local * D:
                 raise RuntimeError(
@@ -5932,12 +5997,11 @@ class DeviceAttention(nn.Module):
                 o_g_3d, self.wo_a_w_tt,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 optional_output_tensor=self._wo_a_local_tt)
-            ttnn.all_gather(
-                self._wo_a_local_tt, dim=-1, cluster_axis=1,
-                num_links=1, output_tensor=self._wo_a_gathered_tt)
-            wo_b_in = ttnn.reshape(
-                self._wo_a_gathered_tt, [B, S, self.n_groups * self.o_lora_rank])
-            out_tt = attn.wo_b.forward_device(wo_b_in)
+            # DeviceRowLinear consumes the col-sharded wo_a output directly:
+            # the K-sharded matmul produces a partial sum which is summed by
+            # a single cluster_axis=1 all_reduce, replacing the legacy
+            # all_gather + col-parallel matmul + all_gather pair.
+            out_tt = attn.wo_b.forward_device(self._wo_a_local_tt)
         return out_tt
 
     def _rmsnorm_device(self, norm_dev: "DeviceRMSNorm", x_2d_tt, num_rows: int):
@@ -6925,17 +6989,17 @@ class Model:
             self._device_moe_gates.append(dg)
 
     def offload_attn_wo_b(self, mesh):
-        """Col-parallel shard wo_b on its 4096-wide output dim.
-
-        Row-parallel is the TP-correct pattern (shard on the 8192 input) and
-        DeviceRowLinear exists, but it was producing garbage — tracked as
-        follow-up tech debt. Col-parallel here is numerically equivalent
-        with more activation bandwidth per chip (fine on QB fabric).
+        """Row-parallel shard wo_b on its 8192-wide input dim along the col
+        axis. The wo_a output is already col-sharded on its `n_groups *
+        o_lora_rank` last dim, so wo_b consumes per-chip [..., R=1024]
+        directly without an upstream all_gather. Per-chip output is a
+        partial sum [..., dim=4096] reduced by one cluster_axis=1
+        all_reduce. Net 2 all_gathers/layer → 1 all_reduce/layer.
         """
         self._device_wo_b = []
         for layer in self.transformer.layers:
             attn = layer.attn
-            dw = DeviceColLinear(mesh, attn.wo_b.weight)
+            dw = DeviceRowLinear(mesh, attn.wo_b.weight)
             attn.wo_b = dw
             self._device_wo_b.append(dw)
 
@@ -6949,13 +7013,17 @@ class Model:
         self._device_attn_full = []
         for layer in self.transformer.layers:
             attn = layer.attn
-            for w_attr in ("wq_a", "wq_b", "wkv", "wo_b"):
+            for w_attr in ("wq_a", "wq_b", "wkv"):
                 w = getattr(attn, w_attr)
                 if not isinstance(w, DeviceColLinear):
                     raise RuntimeError(
                         f"offload_attn_full must run after "
                         f"offload_attn_{w_attr}"
                     )
+            if not isinstance(attn.wo_b, DeviceRowLinear):
+                raise RuntimeError(
+                    "offload_attn_full must run after offload_attn_wo_b"
+                )
             if not hasattr(self, "_device_sparse_attn"):
                 raise RuntimeError(
                     "offload_attn_full must run after offload_sparse_attn"
