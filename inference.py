@@ -4340,8 +4340,7 @@ class DeviceSparseAttn(nn.Module):
         kv_gather = ttnn.embedding(idxs_tt, kv_tt, layout=ttnn.TILE_LAYOUT)
         kv_gather = ttnn.reshape(kv_gather, [B, S, K, D])
 
-        kv_gather_t = ttnn.transpose(kv_gather, -2, -1)
-        scores = ttnn.matmul(q_tt, kv_gather_t)
+        scores = ttnn.matmul(q_tt, kv_gather, transpose_b=True)
         scores = ttnn.multiply(scores, self.softmax_scale)
         scores = ttnn.add(scores, valid_tt)
 
@@ -5094,10 +5093,10 @@ class DeviceIndexer(nn.Module):
             optional_output_tensor=self._w_out_tt)
         w_tt = ttnn.multiply(self._w_out_tt, scale)
 
-        kv_T_tt = ttnn.transpose(self.dc.kv_cache_tt, -2, -1)   # [B, 1, D, T_pad]
-        # kv is replicated across the mesh; matmul against the head-sharded
-        # q produces a per-chip [B, 1, H_local, T_pad] partial.
-        score = ttnn.matmul(q_tt, kv_T_tt)                       # [B, 1, H_local, T_pad]
+        # kv_cache is replicated across the mesh; matmul(q, kv_cache^T) via
+        # transpose_b folds the explicit transpose into the score matmul.
+        # Per-chip output is [B, 1, H_local, T_pad].
+        score = ttnn.matmul(q_tt, self.dc.kv_cache_tt, transpose_b=True)
 
         # TODO(tt-lang): fuse relu * weights * sum + topk into a single
         # `indexer_score_reduce` kernel (README candidate #4).
