@@ -104,6 +104,19 @@ def _get_lk_f_gate_post_kernel(M: int, K: int, N: int):
     return _MEGA_KERNEL_CACHE[key]
 
 
+def _get_lk_a_make_kernel():
+    """Lazy-import test_lk_a's `make_lk_a_kernel` factory.
+
+    The factory builds a closure over 5 ttl.operations + per-layer constants
+    (hc_attn_fn, gamma, etc). tt-lang dedupes structurally identical compiled
+    programs across layers so the per-layer cost is just the closure setup.
+    """
+    if "lk_a_make_kernel" not in _MEGA_KERNEL_CACHE:
+        lk_a_mod = _import_mega_kernel("test_lk_a")
+        _MEGA_KERNEL_CACHE["lk_a_make_kernel"] = lk_a_mod.make_lk_a_kernel
+    return _MEGA_KERNEL_CACHE["lk_a_make_kernel"]
+
+
 # ==============================================================================
 # Global state (mirrors deepseek inference/model.py)
 # ==============================================================================
@@ -816,18 +829,43 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
     num_tokens = B * S
     num_tokens_pad = -(-num_tokens // _MHC_TILE) * _MHC_TILE
 
-    with _phase("block.hc_pre"):
-        hc_out_fp32 = mhc_attn.hc_pre_device(
-            num_tokens, num_tokens_pad, a_tt=x)
-    with _phase("block.norm"):
-        # DeviceRMSNorm.forward_device reads its x_tt arg directly and writes
-        # _out_tt; _x_upload_tt is only used by the host-upload wrapper. Reuse
-        # it here as the typecast destination so we don't alloc a fresh
-        # [Mpad, hidden] bf16 buffer per call.
-        ttnn.typecast(hc_out_fp32, dtype=ttnn.bfloat16,
-                      output_tensor=attn_norm_dn._x_upload_tt)
-        norm_out_tt = attn_norm_dn.forward_device(
-            attn_norm_dn._x_upload_tt, num_tokens)
+    attn_obj = layer.attn
+    lk_a_active = getattr(attn_obj, "_lk_a_active", False)
+    lk_a_wq_a_out_tt = None
+    if lk_a_active:
+        with _phase("block.lk_a"):
+            attn_obj._lk_a(
+                x,
+                attn_obj._lk_a_wq_a_w_tt,
+                attn_obj._lk_a_wq_a_out_tt,
+                x_pre_norm_bf16_out=attn_obj._lk_a_x_pre_norm_tt,
+                post_tt_out=mhc_attn._post_tt,
+                comb_sk_out_tt_out=mhc_attn._comb_sk_out_tt,
+            )
+            mhc_attn._stash_a_tt = x
+            mhc_attn._stash_post_tt = mhc_attn._post_tt
+            mhc_attn._stash_comb_sk_tt = mhc_attn._comb_sk_out_tt
+            lk_a_wq_a_out_tt = attn_obj._lk_a_wq_a_out_tt
+        with _phase("block.norm"):
+            # Lk-A bakes gamma into wq_a so x_normed is never materialized
+            # inside the kernel; consumers (wkv, compressor, indexer) need
+            # x_normed, so run a small bridge rmsnorm on the bf16 hc_pre
+            # output that Lk-A publishes.
+            norm_out_tt = attn_norm_dn.forward_device(
+                attn_obj._lk_a_x_pre_norm_tt, num_tokens)
+    else:
+        with _phase("block.hc_pre"):
+            hc_out_fp32 = mhc_attn.hc_pre_device(
+                num_tokens, num_tokens_pad, a_tt=x)
+        with _phase("block.norm"):
+            # DeviceRMSNorm.forward_device reads its x_tt arg directly and writes
+            # _out_tt; _x_upload_tt is only used by the host-upload wrapper. Reuse
+            # it here as the typecast destination so we don't alloc a fresh
+            # [Mpad, hidden] bf16 buffer per call.
+            ttnn.typecast(hc_out_fp32, dtype=ttnn.bfloat16,
+                          output_tensor=attn_norm_dn._x_upload_tt)
+            norm_out_tt = attn_norm_dn.forward_device(
+                attn_norm_dn._x_upload_tt, num_tokens)
     with _phase("block.attn"):
         ttnn.slice(norm_out_tt, [0, 0], [num_tokens, hidden],
                    output_tensor=mhc_attn._norm_slice_tt)
@@ -835,7 +873,9 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
         # pre_stage_decode is called by Transformer._run_blocks for ALL
         # layers BEFORE the block loop, so the body here is pure device
         # work (no host->device uploads inside what will be the trace).
-        attn_out_tt = attn_dev.forward_device(bridge_tt, start_pos, start_pos_tt)
+        attn_out_tt = attn_dev.forward_device(
+            bridge_tt, start_pos, start_pos_tt,
+            wq_a_out_tt=lk_a_wq_a_out_tt)
     with _phase("block.hc_post"):
         x_2d = ttnn.reshape(attn_out_tt, [num_tokens, 1, hidden])
         x_repeated = ttnn.repeat(x_2d, ttnn.Shape([1, mhc, 1]))
@@ -5562,7 +5602,8 @@ class DeviceAttention(nn.Module):
                 self._stage_indexer_topk_inputs(
                     B, S, bucket_pre, T_active_pre)
 
-    def forward_device(self, x_tt, start_pos: int, start_pos_tt):
+    def forward_device(self, x_tt, start_pos: int, start_pos_tt,
+                       wq_a_out_tt=None):
         """Pure-device attention body. x_tt is the pre-uploaded
         [B, 1, dim] device tensor; returns out_tt [B, 1, dim] device
         tensor. Caller is responsible for upload/download.
@@ -5575,6 +5616,11 @@ class DeviceAttention(nn.Module):
 
         Requires offload_compressor_indexer: attn._device_compressor and
         (when compress_ratio is set) attn._device_indexer must be bound.
+
+        wq_a_out_tt: when provided ([1, 1, q_lora_rank] bf16, replicated),
+        skip the fused wq_a/wkv matmul on x_tt and use it as q_lora. Lk-A
+        publishes this from a hc_pre+rmsnorm+wq_a fused kernel; wkv runs
+        as a separate matmul on x_tt (post-norm bridge tensor).
         """
         ttnn = self._ttnn
         attn = self.attn
@@ -5606,7 +5652,10 @@ class DeviceAttention(nn.Module):
         # DeviceColLinear (concatenated weight). Run a single matmul + gather
         # and slice the output into q_lora and pre-norm kv. Falls back to two
         # separate forward_device calls when fusion is disabled.
-        wq_a_wkv_fused = attn.wq_a is attn.wkv
+        # SWAP-Lk-A path (wq_a_out_tt supplied): q_lora was already produced
+        # by the Lk-A mega kernel from the residual; only wkv runs here.
+        lk_a_path = wq_a_out_tt is not None
+        wq_a_wkv_fused = (not lk_a_path) and (attn.wq_a is attn.wkv)
         if wq_a_wkv_fused:
             with _phase("attn.qkv_fused"):
                 fused_dw = attn.wq_a
@@ -5620,7 +5669,9 @@ class DeviceAttention(nn.Module):
 
         # Q path: wq_a -> [Lk-B fused q_norm + wq_b] -> per-head rsqrt-norm -> rotary.
         with _phase("attn.q"):
-            if wq_a_wkv_fused:
+            if lk_a_path:
+                q_lora_tt = wq_a_out_tt
+            elif wq_a_wkv_fused:
                 q_lora_tt = fused_q_lora_tt
             else:
                 q_lora_tt = attn.wq_a.forward_device(x_tt)        # [B, S, q_lora_rank]
@@ -6903,6 +6954,98 @@ class Model:
             layer._device_mhc_ffn = mhc_ffn
             self._device_mhc.append((mhc_attn, mhc_ffn))
 
+    def offload_lk_a(self, mesh):
+        """Mega kernel SWAP: hc_pre_attn + attn_norm + wq_a fused via Lk-A.
+
+        Replaces `block.hc_pre + block.norm + attn.qkv_fused` (for the wq_a
+        output) with one call into `make_lk_a_kernel`. The kernel pre-bakes
+        attn_norm gamma into wq_a (Wg[k,n] = gamma[k] * W[k,n]) so the
+        post-norm tile is never materialized inside the kernel; downstream
+        consumers (wkv, compressor, indexer) get x_normed via a small
+        bridge `attn_norm.forward_device` call on the bf16 hc_pre output
+        that Lk-A publishes.
+
+        Requires:
+          * `offload_attn_wq_a_and_wkv` (provides the fused DeviceColLinear
+            whose `_cpu_weight` we slice into wq_a-only and wkv-only).
+          * `offload_rms_norms` (provides DeviceRMSNorm with stashed gamma).
+          * `offload_mhc` (provides DeviceMHC with `_post_tt`/`_comb_sk_out_tt`
+            buffers that Lk-A writes into for the matching hc_post stash).
+
+        Replaces `attn.wkv` with a wkv-only DeviceColLinear so the legacy
+        attn forward can compute wkv on x_normed without redundant wq_a
+        compute. The fused DeviceColLinear instance for attn.wq_a is left
+        bound (DeviceAttention.forward gates on `attn._lk_a_active`); its
+        device weight is freed via `_lk_a_release_fused`.
+        """
+        import ttnn
+        make_lk_a = _get_lk_a_make_kernel()
+        self._lk_a_kernels = []
+        for layer in self.transformer.layers:
+            attn = layer.attn
+            if not (attn.wq_a is attn.wkv):
+                raise RuntimeError(
+                    "offload_lk_a expects offload_attn_wq_a_and_wkv to have "
+                    "fused wq_a+wkv into one DeviceColLinear")
+            fused_dw = attn.wq_a
+            q_out = fused_dw._fused_q_out
+            kv_out = fused_dw._fused_kv_out
+            fused_cpu = fused_dw._cpu_weight
+            wq_a_cpu = fused_cpu[:q_out].contiguous()
+            wkv_cpu = fused_cpu[q_out:q_out + kv_out].contiguous()
+
+            attn_norm_dn = layer.attn_norm.forward.__self__
+            gamma_cpu = attn_norm_dn._cpu_gamma
+
+            lk_a = make_lk_a(
+                mesh,
+                hc_fn_cpu=layer.hc_attn_fn,
+                hc_scale_cpu=layer.hc_attn_scale,
+                hc_base_cpu=layer.hc_attn_base,
+                gamma_cpu=gamma_cpu,
+            )
+
+            wq_a_T = _weight_to_bf16(wq_a_cpu).transpose(0, 1).contiguous()
+            gamma_f32 = gamma_cpu.detach().to(torch.float32)
+            wq_a_baked = (gamma_f32[:, None] * wq_a_T.float()) \
+                .to(torch.bfloat16).contiguous()
+            attn._lk_a_wq_a_w_tt = ttnn.as_tensor(
+                wq_a_baked, device=mesh, dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            )
+            attn._lk_a_wq_a_out_tt = ttnn.zeros(
+                shape=(1, 1, self.args.q_lora_rank),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=mesh, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            attn._lk_a_x_pre_norm_tt = ttnn.zeros(
+                shape=(_RMS_TILE, self.args.dim),
+                dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=mesh, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            attn._lk_a = lk_a
+            attn._lk_a_active = True
+
+            # Replace fused attn.wkv with a wkv-only DeviceColLinear so the
+            # legacy attn forward computes only kv on x_normed (no redundant
+            # wq_a). The original fused DeviceColLinear stays bound to
+            # attn.wq_a so `offload_attn_full`'s isinstance check still
+            # passes; freeing the device weight is best-effort.
+            wkv_only = DeviceColLinear(mesh, wkv_cpu)
+            wkv_only._fused_q_out = 0
+            wkv_only._fused_kv_out = kv_out
+            attn.wkv = wkv_only
+            self._device_wkv[layer.layer_id] = wkv_only
+
+            try:
+                ttnn.deallocate(fused_dw.w_tt)
+            except Exception:
+                pass
+
+            self._lk_a_kernels.append(lk_a)
+
     def _iter_device_modules(self):
         """Yield every Device* instance the model has constructed. Single
         source of truth for the orchestrator and any future tracing wiring."""
@@ -7111,6 +7254,7 @@ def main():
         ("sparse_attn", model.offload_sparse_attn),
         ("attn_full", model.offload_attn_full),
         ("mhc", model.offload_mhc),
+        ("lk_a", model.offload_lk_a),
         ("compressor_indexer", model.offload_compressor_indexer),
     ):
         print(f"[phase] offloading {label} on mesh ...")
