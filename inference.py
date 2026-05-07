@@ -5787,6 +5787,17 @@ class DeviceAttention(nn.Module):
         # pre_stage_decode (called by the orchestrator before forward_device,
         # outside any future trace region). Body below is pure device work.
 
+        # Hoist rotary table embedding+reshape once per layer; q/kv/o share
+        # the same start_pos_tt. Saves 6 ops/layer (3 calls × 4 ops -> 6 total).
+        cos_2d = ttnn.embedding(
+            start_pos_tt, self.cos_ext_tt, layout=ttnn.TILE_LAYOUT)
+        sin_2d = ttnn.embedding(
+            start_pos_tt, self.sin_signed_tt, layout=ttnn.TILE_LAYOUT)
+        cos_ext_4d = ttnn.reshape(cos_2d, [1, S, 1, rd])
+        sin_signed_4d = ttnn.reshape(sin_2d, [1, S, 1, rd])
+        cos_ext_3d = ttnn.reshape(cos_2d, [1, S, rd])
+        sin_signed_3d = ttnn.reshape(sin_2d, [1, S, rd])
+
         # When `offload_attn_wq_a_and_wkv` ran, both projections share one
         # DeviceColLinear (concatenated weight). Run a single matmul + gather
         # and slice the output into q_lora and pre-norm kv. Falls back to two
@@ -5838,15 +5849,13 @@ class DeviceAttention(nn.Module):
             q_tt = ttnn.rms_norm(
                 q_tt, weight=self.q_rsqrt_ones_tt, epsilon=self.eps)
 
-            cos_q_ext, sin_q_signed = self._rotary_tables(
-                start_pos_tt, S, q_dims=4)
             # Rotate q[..., -rd:] by slicing -> rotating -> concatenating.
             ttnn.slice(q_tt, [0, 0, 0, 0], [B, S, H_local, D - rd],
                        output_tensor=self._q_nope_scratch_tt)
             ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, S, H_local, D],
                        output_tensor=self._q_rope_scratch_tt)
             q_rope = _device_apply_rotary_swap(
-                ttnn, self._q_rope_scratch_tt, cos_q_ext, sin_q_signed,
+                ttnn, self._q_rope_scratch_tt, cos_ext_4d, sin_signed_4d,
                 self.rope_P_tt, inverse=False)
             q_tt = ttnn.concat([self._q_nope_scratch_tt, q_rope], dim=-1)
 
@@ -5859,14 +5868,12 @@ class DeviceAttention(nn.Module):
             kv_2d = ttnn.reshape(kv_tt, [B * S, D])
             kv_2d = self._rmsnorm_device(self.kv_norm_dev, kv_2d, B * S)
             kv_tt = ttnn.reshape(kv_2d, [B, S, D])
-            cos_kv_ext, sin_kv_signed = self._rotary_tables(
-                start_pos_tt, S, q_dims=3)
             ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd],
                        output_tensor=self._kv_nope_scratch_tt)
             ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D],
                        output_tensor=self._kv_rope_scratch_tt)
             kv_rope = _device_apply_rotary_swap(
-                ttnn, self._kv_rope_scratch_tt, cos_kv_ext, sin_kv_signed,
+                ttnn, self._kv_rope_scratch_tt, cos_ext_3d, sin_signed_3d,
                 self.rope_P_tt, inverse=False)
 
             # Device-side act_quant on the nope region (bf16 round-trip; no fp8
@@ -5976,14 +5983,12 @@ class DeviceAttention(nn.Module):
 
         with _phase("attn.o"):
             # Inverse rotary on o[..., -rd:]. o_tt is per-col [B,S,H_local,D].
-            cos_o_ext, sin_o_signed = self._rotary_tables(
-                start_pos_tt, S, q_dims=4)
             ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H_local, D - rd],
                        output_tensor=self._o_nope_scratch_tt)
             ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H_local, D],
                        output_tensor=self._o_rope_scratch_tt)
             o_rope = _device_apply_rotary_swap(
-                ttnn, self._o_rope_scratch_tt, cos_o_ext, sin_o_signed,
+                ttnn, self._o_rope_scratch_tt, cos_ext_4d, sin_signed_4d,
                 self.rope_P_tt, inverse=True)
             o_tt = ttnn.concat([self._o_nope_scratch_tt, o_rope], dim=-1)
 
