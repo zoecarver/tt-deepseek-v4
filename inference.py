@@ -4647,8 +4647,19 @@ class DeviceCompressor(nn.Module):
                 "DeviceCompressor decode buffers not allocated; "
                 "call pre_stage_decode at least once before forward_device.")
 
-        kv_tt = self.wkv.forward_device(x_tt)
-        score_tt = self.wgate.forward_device(x_tt)
+        if self.wkv is self.wgate:
+            # offload_compressor_linears fused wkv + wgate into one matmul.
+            fused_dw = self.wkv
+            fused_tt = fused_dw.forward_device(x_tt)
+            kv_out = fused_dw._fused_kv_out
+            gate_out = fused_dw._fused_gate_out
+            B = int(x_tt.shape[0])
+            kv_tt = ttnn.slice(fused_tt, [0, 0, 0], [B, 1, kv_out])
+            score_tt = ttnn.slice(
+                fused_tt, [0, 0, kv_out], [B, 1, kv_out + gate_out])
+        else:
+            kv_tt = self.wkv.forward_device(x_tt)
+            score_tt = self.wgate.forward_device(x_tt)
 
         # ape_padded_tt[start_pos] == ape_tt[start_pos % ratio]; lets the
         # row pick stay on device.
@@ -6222,17 +6233,25 @@ class Model:
     def offload_compressor_linears(self, mesh):
         """Col-parallel shard Compressor.wkv + wgate on the 1xN mesh for every
         layer that has a compressor (attn.compress_ratio > 0 OR indexer's
-        compressor). Linear compute is on device; the rest of Compressor
-        stays CPU."""
+        compressor). wkv and wgate share the same input x and project to
+        the same output dim, so we concat their weights and run a single
+        col-parallel matmul + all_gather; `DeviceCompressor.forward_device`
+        slices the result. The rest of Compressor stays CPU."""
         self._device_compressor_linears = []
         for layer in self.transformer.layers:
             attn = layer.attn
             for comp in self._iter_compressors(attn):
-                for attr in ("wkv", "wgate"):
-                    lin = getattr(comp, attr)
-                    dw = DeviceColLinear(mesh, lin.weight)
-                    setattr(comp, attr, dw)
-                    self._device_compressor_linears.append(dw)
+                wkv_w = _weight_to_bf16(comp.wkv.weight)
+                wgate_w = _weight_to_bf16(comp.wgate.weight)
+                kv_out = wkv_w.shape[0]
+                gate_out = wgate_w.shape[0]
+                fused_w = torch.cat([wkv_w, wgate_w], dim=0).contiguous()
+                dw = DeviceColLinear(mesh, fused_w)
+                dw._fused_kv_out = kv_out
+                dw._fused_gate_out = gate_out
+                comp.wkv = dw
+                comp.wgate = dw
+                self._device_compressor_linears.append(dw)
 
     def offload_indexer_linears(self, mesh):
         """Col-parallel shard Indexer.wq_b + weights_proj on the 1xN mesh for
