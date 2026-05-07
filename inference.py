@@ -722,8 +722,10 @@ class MoE(nn.Module):
             limit = float(self.experts[0].swiglu_limit)
             ttnn.clamp(y1, max=limit, output_tensor=y1)
             ttnn.clamp(y3, min=-limit, max=limit, output_tensor=y3)
-        ttnn.silu(y1, output_tensor=y1)
-        ttnn.multiply(y1, y3, output_tensor=y1)  # glu = silu(y1) * y3 (in-place)
+        # Fused silu(y1) * y3 via input_tensor_a_activations kwarg
+        # (ttnn.mul applies SILU to a before the multiply, single dispatch).
+        ttnn.multiply(y1, y3, output_tensor=y1,
+                      input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
 
         y = ttnn.matmul(y1, self._w2_tt,
                         optional_output_tensor=self._fp4_y2_scratch_tt)
@@ -4013,9 +4015,6 @@ class DeviceSharedExpert(nn.Module):
         self._y3_tt = ttnn.from_torch(
             torch.zeros(1, self.inter_dim, dtype=torch.bfloat16),
             mesh_mapper=col_shard, **common)
-        self._silu_tt = ttnn.from_torch(
-            torch.zeros(1, self.inter_dim, dtype=torch.bfloat16),
-            mesh_mapper=col_shard, **common)
         self._mid_tt = ttnn.from_torch(
             torch.zeros(1, self.inter_dim, dtype=torch.bfloat16),
             mesh_mapper=col_shard, **common)
@@ -4039,8 +4038,11 @@ class DeviceSharedExpert(nn.Module):
             ttnn.clamp(self._y1_tt, max=self.swiglu_limit, output_tensor=self._y1_tt)
             ttnn.clamp(self._y3_tt, min=-self.swiglu_limit, max=self.swiglu_limit,
                        output_tensor=self._y3_tt)
-        ttnn.silu(self._y1_tt, output_tensor=self._silu_tt)
-        ttnn.multiply(self._silu_tt, self._y3_tt, output_tensor=self._mid_tt)
+        # Fused silu(y1) * y3 via input_tensor_a_activations kwarg: ttnn.mul
+        # applies SILU to input a before the multiply, dropping the separate
+        # silu dispatch (and its _silu_tt scratch in the dataflow).
+        ttnn.multiply(self._y1_tt, self._y3_tt, output_tensor=self._mid_tt,
+                      input_tensor_a_activations=[ttnn.UnaryOpType.SILU])
         ttnn.matmul(self._mid_tt, self.w2_tt,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._partial_tt)
