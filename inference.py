@@ -4435,7 +4435,8 @@ class DeviceSparseAttn(nn.Module):
         kv_gather = ttnn.reshape(kv_gather, [B, S, K, D])
 
         scores = ttnn.matmul(q_tt, kv_gather, transpose_b=True)
-        scores = ttnn.multiply(scores, self.softmax_scale)
+        # softmax_scale is pre-baked into q via DeviceAttention.q_rsqrt_ones_tt,
+        # so scores arrives already scaled; just add the additive validity mask.
         scores = ttnn.add(scores, valid_tt)
 
         # Online softmax over [scores | sink] without materializing the
@@ -5280,10 +5281,13 @@ class DeviceAttention(nn.Module):
         self.sin_signed_tt = ttnn.as_tensor(sin_signed_cpu, **rep)
         self.rope_P_tt = ttnn.as_tensor(
             _build_rotary_swap_matrix(rd), **rep)
-        # Per-head rsqrt-norm uses ttnn.rms_norm with an all-ones gamma
-        # (no-op affine), folding mul/mean/add/rsqrt/mul into one dispatch.
+        # Per-head rsqrt-norm uses ttnn.rms_norm with gamma=softmax_scale,
+        # folding mul/mean/add/rsqrt/mul into one dispatch AND pre-scaling
+        # q by softmax_scale (which propagates linearly through rotary, so
+        # sparse_attn drops its `scores * softmax_scale` op entirely).
         self.q_rsqrt_ones_tt = ttnn.as_tensor(
-            torch.ones(self.head_dim, dtype=torch.bfloat16), **rep)
+            torch.full((self.head_dim,), self.softmax_scale,
+                       dtype=torch.bfloat16), **rep)
         self.max_seq_len = cos_full.shape[0]
 
         # wo_a: head-sharded across cols. Original CPU weight is
