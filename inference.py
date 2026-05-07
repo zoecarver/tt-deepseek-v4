@@ -4214,17 +4214,22 @@ class DeviceSharedExpert(nn.Module):
             mesh_mapper=replicate, **common)
         self._upload_mapper = replicate
 
-    def _compute_partial(self):
+    def _compute_partial(self, x_in_tt=None):
         """SwiGLU pipeline through the w2 matmul; leaves the per-chip partial
         sum in self._partial_tt without the cross-mesh all_reduce. Caller
         decides whether to all_reduce here or fold this into a downstream
         combined all_reduce (see MoE.forward_device, which sums the routed
-        and shared partials before a single full-mesh reduce)."""
+        and shared partials before a single full-mesh reduce).
+
+        x_in_tt: optional [1, dim] bf16 replicated device tensor to read from
+        (must be a trace-stable buffer). When None, falls back to the
+        per-instance _x_upload_tt (the host-upload path)."""
         ttnn = self._ttnn
-        ttnn.matmul(self._x_upload_tt, self.w1_tt,
+        x_in = self._x_upload_tt if x_in_tt is None else x_in_tt
+        ttnn.matmul(x_in, self.w1_tt,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._y1_tt)
-        ttnn.matmul(self._x_upload_tt, self.w3_tt,
+        ttnn.matmul(x_in, self.w3_tt,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._y3_tt)
         if self.swiglu_limit > 0:
@@ -4241,31 +4246,23 @@ class DeviceSharedExpert(nn.Module):
                     optional_output_tensor=self._partial_tt)
         return self._partial_tt
 
-    def _compute_body(self):
-        """SwiGLU + all_reduce. Used by the standalone forward_device wrapper
-        that returns a fully-reduced [1, dim] tensor."""
-        ttnn = self._ttnn
-        partial = self._compute_partial()
-        return ttnn.all_reduce(partial)
-
     def forward_device(self, x_tt):
         """Pure-device shared-expert SwiGLU. x_tt: [M=1, dim] bf16 device
-        tensor (replicated). Returns out_tt [1, dim] replicated (post
-        all_reduce). No host transfers. The body runs inline so this layer
-        can be embedded inside an outer whole-decode-step trace.
+        tensor (replicated, trace-stable buffer). Returns out_tt [1, dim]
+        replicated (post all_reduce). No host transfers. The body runs
+        inline so this layer can be embedded inside an outer whole-decode-step
+        trace.
         """
         ttnn = self._ttnn
-        ttnn.copy(x_tt, self._x_upload_tt)
-        return self._compute_body()
+        partial = self._compute_partial(x_in_tt=x_tt)
+        return ttnn.all_reduce(partial)
 
     def forward_device_partial(self, x_tt):
         """Like forward_device, but returns the per-chip partial sum BEFORE
         all_reduce. The caller is responsible for combining this partial
         with another partial (e.g. routed MoE y_local) and issuing the
         all_reduce once. Saves one full-mesh CCL per layer."""
-        ttnn = self._ttnn
-        ttnn.copy(x_tt, self._x_upload_tt)
-        return self._compute_partial()
+        return self._compute_partial(x_in_tt=x_tt)
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """x: [M=1, dim] -> [M=1, dim]. weights matches Expert.forward
