@@ -143,6 +143,20 @@ def _get_lk_d1_make_kernel():
     return _MEGA_KERNEL_CACHE["lk_d1_make_kernel"]
 
 
+def _get_lk_d_idx_q_headshard_make_kernel():
+    """Lazy-import test_lk_d_idx_q's `make_lk_d_idx_q_kernel_headshard`.
+
+    Head-shard variant of Lk-D-idx-q: SUMMA wq_b (col-sharded weight)
+    fused with per-head rotary on the rope half. Walsh-Hadamard rotation
+    is omitted (the indexer cancels it via matching rotation on kv).
+    """
+    if "lk_d_idx_q_headshard_make_kernel" not in _MEGA_KERNEL_CACHE:
+        mod = _import_mega_kernel("test_lk_d_idx_q")
+        _MEGA_KERNEL_CACHE["lk_d_idx_q_headshard_make_kernel"] = (
+            mod.make_lk_d_idx_q_kernel_headshard)
+    return _MEGA_KERNEL_CACHE["lk_d_idx_q_headshard_make_kernel"]
+
+
 # ==============================================================================
 # Global state (mirrors deepseek inference/model.py)
 # ==============================================================================
@@ -5157,66 +5171,63 @@ class DeviceIndexer(nn.Module):
         )
         self._alloc_decode_tensors()
 
+        # Lk-D-idx-q head-shard mega kernel: fuses wq_b SUMMA (col-sharded
+        # weight, per-chip n=H_local*D) with per-head rotary on the rope
+        # half. Replaces ttnn.matmul + reshape + 2x slice + rotary swap form
+        # (matmul + multiply + addcmul) + concat = ~7 ttnn dispatches.
+        self._lk_d_idx_q_kernel = _get_lk_d_idx_q_headshard_make_kernel()(
+            self.mesh,
+            cos_full_cpu=cos_full_cpu,
+            sin_full_cpu=sin_full_cpu,
+            n_per_chip=self.n_local_heads * self.head_dim,
+            h_per_chip=self.n_local_heads,
+        )
+
     def _alloc_decode_tensors(self):
         """Per-step output buffers for the head-sharded matmuls. Both are
-        col-axis sharded along the last (head) dim; per-chip slice equals
-        n_local_heads * head_dim (q) or n_local_heads (w)."""
+        col-axis sharded along the last dim; per-chip slice equals
+        n_local_heads (w_out) or n_local_heads * head_dim (lk_d_idx_q via
+        the n_heads axis)."""
         ttnn = self._ttnn
         col_shard = ttnn.ShardTensor2dMesh(
             self.mesh, self.mesh_shape, dims=(None, -1))
-        H_full = self.n_heads * self.head_dim
-        self._wq_b_out_tt = ttnn.from_torch(
-            torch.zeros(1, 1, H_full, dtype=torch.bfloat16),
-            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=col_shard,
-        )
         self._w_out_tt = ttnn.from_torch(
             torch.zeros(1, 1, self.n_heads, dtype=torch.bfloat16),
             device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=col_shard,
         )
+        # Per-step Lk-D-idx-q output. Logical [1, 1, n_heads, head_dim]
+        # sharded on the n_heads axis (-2): per-chip [B, 1, H_local, D].
+        head_shard = ttnn.ShardTensor2dMesh(
+            self.mesh, self.mesh_shape, dims=(None, -2))
+        self._lk_d_idx_q_out_tt = ttnn.from_torch(
+            torch.zeros(1, 1, self.n_heads, self.head_dim,
+                        dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=head_shard,
+        )
 
     def forward_device_score(self, x_tt, qr_tt, B: int, start_pos: int,
-                              start_pos_tt, cos_ext_4d=None,
-                              sin_signed_4d=None):
+                              start_pos_tt):
         ttnn = self._ttnn
-        H_full = self.n_heads
         H_local = self.n_local_heads
-        D = self.head_dim
-        rd = self.rope_head_dim
         if start_pos_tt is None:
             raise ValueError(
                 "DeviceIndexer.forward_device_score requires start_pos_tt "
                 "(no host->device upload inside the trace body).")
 
-        # Head-sharded wq_b: per-chip output is [1, 1, H_local * D].
-        ttnn.matmul(
-            qr_tt, self._wq_b_w_tt,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            optional_output_tensor=self._wq_b_out_tt)
-        q_tt = ttnn.reshape(self._wq_b_out_tt, [B, 1, H_local, D])
-
-        # Reuse attn's hoisted [1,S,1,rd] cos/sin when supplied (indexer.freqs_cis
-        # is bound to attn.freqs_cis at offload, so the tables are identical).
-        if cos_ext_4d is None or sin_signed_4d is None:
-            cos_2d = ttnn.embedding(
-                start_pos_tt, self.cos_ext_tt, layout=ttnn.TILE_LAYOUT)
-            sin_2d = ttnn.embedding(
-                start_pos_tt, self.sin_signed_tt, layout=ttnn.TILE_LAYOUT)
-            cos_ext_4d = ttnn.reshape(cos_2d, [1, 1, 1, rd])
-            sin_signed_4d = ttnn.reshape(sin_2d, [1, 1, 1, rd])
-        q_nope = ttnn.slice(q_tt, [0, 0, 0, 0],     [B, 1, H_local, D - rd])
-        q_rope = ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, 1, H_local, D])
-        q_rope = _device_apply_rotary_swap(
-            ttnn, q_rope, cos_ext_4d, sin_signed_4d, self.rope_P_tt,
-            inverse=False)
-        q_tt = ttnn.concat([q_nope, q_rope], dim=-1)
-
-        # _device_rotate_activation (Walsh-Hadamard) skipped: both q and the
-        # indexer kv_cache previously got the same orthogonal rotation, which
-        # cancels in score = q_rot @ kv_rot^T. See DeviceCompressor._emit_body.
+        # Lk-D-idx-q mega kernel: SUMMA wq_b matmul + per-head rotary on
+        # the rope half, fused into one ttl dispatch + a few ttnn shape ops.
+        # Replaces ttnn.matmul + reshape + 2 slices + rotary swap (matmul +
+        # multiply + addcmul) + concat = ~7 ttnn dispatches.
+        # Walsh-Hadamard skipped: q and indexer kv_cache previously got the
+        # same orthogonal rotation, which cancels in score = q @ kv^T. See
+        # DeviceCompressor._emit_body for the matched-rotation rationale.
+        self._lk_d_idx_q_kernel(
+            qr_tt, start_pos_tt, self._wq_b_w_tt, self._lk_d_idx_q_out_tt)
+        q_tt = self._lk_d_idx_q_out_tt
 
         # fp4_act_quant SKIPPED (bf16 policy).
         self.dc.forward_device(x_tt, B, start_pos, start_pos_tt=start_pos_tt)
@@ -5995,8 +6006,6 @@ class DeviceAttention(nn.Module):
                             score_tt = device_indexer.forward_device_score(
                                 x_tt, qr_tt, B, start_pos,
                                 start_pos_tt=start_pos_tt,
-                                cos_ext_4d=cos_ext_4d,
-                                sin_signed_4d=sin_signed_4d,
                             )
                             bucket = _pick_indexer_topk_bucket(T_active)
                             k_fixed = min(device_indexer.index_topk, bucket)

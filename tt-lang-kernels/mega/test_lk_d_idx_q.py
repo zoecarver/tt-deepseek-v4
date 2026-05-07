@@ -311,6 +311,261 @@ def _build_swap_matrix(rd: int) -> torch.Tensor:
     return P
 
 
+def _make_fused_summa_rotary_headshard_kernel(
+        M, K, N, h_per_chip, D, rd,
+        block_cfg, part_cfg,
+        fp32_dest_acc_en: bool = True):
+    """SUMMA wq_b matmul + per-head rotary on the rope half, fused.
+
+    Layout: per chip we own h_per_chip heads. Along N-axis the layout is
+    [head_0: nope (D-rd) | rope (rd), head_1: nope | rope, ...]. With bn=1
+    and Np=h_per_chip, each col-core owns ONE head's full N_BPN=D/TILE tiles.
+    First (D-rd)/TILE tiles → nope passthrough; last rd/TILE tiles → rope
+    rotary applied via swap matrix.
+
+    Output (per chip): [TILE, h_per_chip*D] with head h's nope at cols
+    [h*D, h*D+(D-rd)) and rotated rope at cols [h*D+(D-rd), (h+1)*D).
+    """
+    bm, bn, bk = block_cfg
+    Mp, Np, Kp = part_cfg
+    if Mp != 1 or bn != 1:
+        raise ValueError(
+            f"head-shard kernel requires Mp=1 bn=1, got Mp={Mp} bn={bn}")
+    if Kp < 2:
+        raise ValueError(f"K_parts must be >= 2, got {Kp}")
+    if N != h_per_chip * D:
+        raise ValueError(
+            f"N={N} != h_per_chip*D = {h_per_chip}*{D} = {h_per_chip * D}")
+    Mt, Nt, Kt = M // TILE, N // TILE, K // TILE
+    if Mt % bm or Nt % bn or Kt % bk:
+        raise ValueError(
+            f"block must divide shape (tiles): Mt={Mt} Nt={Nt} Kt={Kt} "
+            f"block=(bm={bm}, bn={bn}, bk={bk})")
+    Mb, Nb, Kb = Mt // bm, Nt // bn, Kt // bk
+    if Nb % Np or Kb % Kp or Mb != 1:
+        raise ValueError(
+            f"block/part mismatch: Mb={Mb} Nb={Nb} Kb={Kb} Np={Np} Kp={Kp}")
+    if Np != h_per_chip:
+        raise ValueError(
+            f"current design assumes Np={Np} == h_per_chip={h_per_chip}; "
+            "one head per col-core")
+    N_BPN = Nb // Np
+    K_BPN = Kb // Kp
+    nope_tiles_per_head = (D - rd) // TILE
+    rope_tiles_per_head = rd // TILE
+    if N_BPN != nope_tiles_per_head + rope_tiles_per_head:
+        raise ValueError(
+            f"N_BPN={N_BPN} != nope+rope per head = "
+            f"{nope_tiles_per_head}+{rope_tiles_per_head}")
+
+    @ttl.operation(grid=(Np, Kp), fp32_dest_acc_en=fp32_dest_acc_en)
+    def fused_summa_rot(a, w, P, cos, sin, out):
+        a_pipes = [ttl.Pipe(src=(0, k_p), dst=(slice(0, Np), k_p))
+                   for k_p in range(Kp)]
+        mcast_a_net = ttl.PipeNet(a_pipes)
+        reduce_pipes = [ttl.Pipe(src=(n_p, k_p), dst=(n_p, 0))
+                        for n_p in range(Np) for k_p in range(1, Kp)]
+        reduce_net = ttl.PipeNet(reduce_pipes)
+
+        a_cb = ttl.make_dataflow_buffer_like(a, shape=(bm, bk), block_count=2)
+        b_cb = ttl.make_dataflow_buffer_like(w, shape=(bk, bn), block_count=2)
+        partial_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
+        recv_cb = ttl.make_dataflow_buffer_like(
+            out, shape=(bm, bn), block_count=max(2, Kp - 1))
+        out_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
+        # Rotary side inputs (only used by rope tiles on root cores):
+        P_cb = ttl.make_dataflow_buffer_like(P, shape=(bn, bn), block_count=2)
+        cos_cb = ttl.make_dataflow_buffer_like(cos, shape=(1, bn), block_count=2)
+        sin_cb = ttl.make_dataflow_buffer_like(sin, shape=(1, bn), block_count=2)
+        swap_cb = ttl.make_dataflow_buffer_like(out, shape=(bm, bn), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            _, row_c = ttl.node(dims=2)
+            for local_nb in range(N_BPN):
+                p = partial_cb.reserve()
+                for _ in range(K_BPN):
+                    a_blk = a_cb.wait()
+                    b_blk = b_cb.wait()
+                    p += a_blk @ b_blk
+
+                if row_c == 0:
+                    for _ in range(Kp - 1):
+                        prev = partial_cb.wait()
+                        r = recv_cb.wait()
+                        new = partial_cb.reserve()
+                        new.store(prev + r)
+                    final = partial_cb.wait()
+                    o = out_cb.reserve()
+                    if local_nb < nope_tiles_per_head:
+                        o.store(final)
+                    else:
+                        # rope tile: out = final * cos + (final @ P) * sin
+                        P_blk = P_cb.wait()
+                        sw = swap_cb.reserve()
+                        sw.store(final @ P_blk)
+                        sw_blk = swap_cb.wait()
+                        c_blk = cos_cb.wait()
+                        s_blk = sin_cb.wait()
+                        o.store(final * c_blk + sw_blk * s_blk)
+
+        @ttl.datamovement()
+        def dm_read():
+            _, row_c = ttl.node(dims=2)
+            for local_nb in range(N_BPN):
+                for kb_local in range(K_BPN):
+                    kc = (row_c * K_BPN + kb_local) * bk
+                    a_blk = a_cb.reserve()
+
+                    def read_a(pipe):
+                        ttl.copy(a[0:bm, kc:kc + bk], a_blk).wait()
+                        ttl.copy(a_blk, pipe).wait()
+
+                    mcast_a_net.if_src(read_a)
+                    mcast_a_net.if_dst(
+                        lambda pipe: (ttl.copy(pipe, a_blk).wait(),))
+
+                if row_c == 0:
+                    def recv(pipe):
+                        r = recv_cb.reserve()
+                        ttl.copy(pipe, r).wait()
+
+                    reduce_net.if_dst(recv)
+
+                    if local_nb >= nope_tiles_per_head:
+                        rope_pos = local_nb - nope_tiles_per_head
+                        rk = rope_pos * bn
+                        ttl.copy(P[rk:rk + bn, rk:rk + bn],
+                                 P_cb.reserve()).wait()
+                        ttl.copy(cos[0:1, rk:rk + bn],
+                                 cos_cb.reserve()).wait()
+                        ttl.copy(sin[0:1, rk:rk + bn],
+                                 sin_cb.reserve()).wait()
+                else:
+                    p = partial_cb.wait()
+
+                    def send(pipe):
+                        ttl.copy(p, pipe).wait()
+
+                    reduce_net.if_src(send)
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, row_c = ttl.node(dims=2)
+            for local_nb in range(N_BPN):
+                nb = col_c * N_BPN + local_nb
+                nc = nb * bn
+                for kb_local in range(K_BPN):
+                    kc = (row_c * K_BPN + kb_local) * bk
+                    b_blk = b_cb.reserve()
+                    ttl.copy(w[kc:kc + bk, nc:nc + bn], b_blk).wait()
+                if row_c == 0:
+                    o = out_cb.wait()
+                    ttl.copy(o, out[0:bm, nc:nc + bn]).wait()
+
+    return fused_summa_rot
+
+
+def make_lk_d_idx_q_kernel_headshard(mesh, cos_full_cpu, sin_full_cpu,
+                                      n_per_chip: int = None,
+                                      h_per_chip: int = None):
+    """Mega kernel for Lk-D-idx-q on legacy's head-shard architecture.
+
+    Per-chip view: indexer.wq_b is [Q_LORA_RANK, n_per_chip] with
+    n_per_chip = h_per_chip * INDEX_HEAD_DIM. The kernel fuses:
+      qr [1,1,Q_LORA_RANK] (replicated)
+        → pad to [TILE, Q_LORA_RANK]
+        → SUMMA matmul against per-chip wq_b → [TILE, n_per_chip]
+        → per-head: rotary on rope half (last rd cols of each head, cols
+                    [h*D+(D-rd), (h+1)*D))
+        → reshape [B, S, h_per_chip, D]
+
+    Walsh-Hadamard rotation is OMITTED: legacy's score = q @ kv_cache^T sees
+    matching rotations on q and kv that cancel, so the indexer Q-path drops
+    the post-rotary Hadamard matmul entirely.
+    """
+    D = INDEX_HEAD_DIM
+    rd = ROPE_HEAD_DIM
+    if h_per_chip is None:
+        h_per_chip = 8
+    if n_per_chip is None:
+        n_per_chip = h_per_chip * D
+    if n_per_chip != h_per_chip * D:
+        raise ValueError(
+            f"n_per_chip={n_per_chip} != h_per_chip*D={h_per_chip * D}")
+    M_PAD = TILE
+
+    state: dict = {}
+
+    # Fused SUMMA + rotary kernel. K=Q_LORA_RANK=1024 → Kt=32.
+    # bk=4 → Kb=8 → Kp=8 → K_BPN=1. Np=h_per_chip → N_BPN=D/TILE=4.
+    fused_kernel = _make_fused_summa_rotary_headshard_kernel(
+        M=M_PAD, K=Q_LORA_RANK, N=n_per_chip, h_per_chip=h_per_chip,
+        D=D, rd=rd,
+        block_cfg=(1, 1, 4),
+        part_cfg=(1, h_per_chip, 8))
+
+    mesh_shape = tuple(mesh.shape)
+    n_rows, n_cols = mesh_shape
+    H_full = h_per_chip * n_cols
+    # Replicated tables on the mesh. Cos/sin/P are read-only.
+    rep_replicated = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
+                          memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                          mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    # Sharded scratch: full [TILE, H_full*D] split last-dim across cols, so
+    # per-chip is [TILE, n_per_chip]. Matches wq_b's col-shard so the SUMMA
+    # output's per-chip slice aligns with the per-chip wq_b columns.
+    col_shard_2d = ttnn.ShardTensor2dMesh(mesh, mesh_shape, dims=(None, -1))
+
+    cos_ext_packed, sin_signed_packed = _build_rotary_tables(
+        cos_full_cpu, sin_full_cpu, inverse=False)
+    cos_ext_tt = ttnn.as_tensor(
+        cos_ext_packed, dtype=ttnn.bfloat16, **rep_replicated)
+    sin_signed_tt = ttnn.as_tensor(
+        sin_signed_packed, dtype=ttnn.bfloat16, **rep_replicated)
+    P_cpu = _build_swap_matrix(rd)
+    P_tt = ttnn.as_tensor(
+        P_cpu.contiguous(), dtype=ttnn.bfloat16, **rep_replicated)
+
+    def lk_d_idx_q_headshard_kernel(qr_tt, start_pos_tt, indexer_wq_b_tt, out):
+        if "scratch" not in state:
+            state["q_padded_tt"] = ttnn.from_torch(
+                torch.zeros((M_PAD, H_full * D), dtype=torch.bfloat16),
+                device=mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=col_shard_2d,
+            )
+            state["scratch"] = True
+
+        # 1. Pad qr [1,1,K] -> [TILE, K] for SUMMA M-axis.
+        qr_2d = ttnn.reshape(qr_tt, [B * S, Q_LORA_RANK])
+        qr_padded = ttnn.pad(
+            qr_2d, padding=[(0, M_PAD - B * S), (0, 0)], value=0.0)
+
+        # 2. Lookup cos/sin at start_pos. Tables are TILE-replicated along
+        # row axis so reshape to [TILE, rd] gives a per-row-replicated tile.
+        cos_b_2d = ttnn.embedding(
+            start_pos_tt, cos_ext_tt, layout=ttnn.TILE_LAYOUT)
+        sin_b_2d = ttnn.embedding(
+            start_pos_tt, sin_signed_tt, layout=ttnn.TILE_LAYOUT)
+        cos_b = ttnn.reshape(cos_b_2d, [TILE, rd])
+        sin_b = ttnn.reshape(sin_b_2d, [TILE, rd])
+
+        # 3. Fused SUMMA + rotary into the col-sharded scratch buffer.
+        fused_kernel(qr_padded, indexer_wq_b_tt, P_tt, cos_b, sin_b,
+                     state["q_padded_tt"])
+
+        # 4. Slice out the real row, reshape to [B, S, h_per_chip, D] and copy
+        # into caller's output buffer. ttnn.slice/reshape on a sharded tensor
+        # use per-chip dimensions (matches DeviceColLinear/DeviceRowLinear's
+        # head-shard pattern in inference.py).
+        q_row = ttnn.slice(state["q_padded_tt"], [0, 0], [B * S, n_per_chip])
+        q_4d = ttnn.reshape(q_row, [B, S, h_per_chip, D])
+        ttnn.copy(q_4d, out)
+
+    return lk_d_idx_q_headshard_kernel
+
+
 def make_lk_d_idx_q_kernel(mesh, cos_full_cpu, sin_full_cpu):
     """Mega kernel for Lk-D-idx-q.
 
