@@ -5764,12 +5764,7 @@ class DeviceAttention(nn.Module):
             y_row = ttnn.slice(
                 self._lk_b_y_padded_tt, [0, 0],
                 [B * S, N_per_col])
-            ttnn.copy(
-                ttnn.reshape(y_row, [B, S, N_per_col]),
-                self._lk_b_out_tt,
-            )
-            q_full_tt = self._lk_b_out_tt
-            q_tt = ttnn.reshape(q_full_tt, [B, S, H_local, D])
+            q_tt = ttnn.reshape(y_row, [B, S, H_local, D])
             q_tt = _device_q_rsqrt_norm(ttnn, q_tt, self.eps)
 
             cos_q_ext, sin_q_signed = self._rotary_tables(
