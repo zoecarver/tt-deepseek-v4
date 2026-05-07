@@ -421,7 +421,8 @@ def _make_q_rotary_headshard_kernel(n_per_chip: int, h_per_chip: int,
 def make_lk_c_q_rotary_kernel_headshard(mesh, cos_full_cpu, sin_full_cpu,
                                          n_per_chip: int, h_per_chip: int,
                                          head_dim: int,
-                                         rope_head_dim: int = ROPE_HEAD_DIM):
+                                         rope_head_dim: int = ROPE_HEAD_DIM,
+                                         inverse: bool = False):
     """Mega kernel for the Lk-C q-rotary slice on legacy's head-shard.
 
     Replaces (per call): 2x ttnn.slice + matmul + multiply + addcmul +
@@ -430,7 +431,8 @@ def make_lk_c_q_rotary_kernel_headshard(mesh, cos_full_cpu, sin_full_cpu,
 
     Caller must pass the SAME ttnn tensor as both input q_tt and the
     out arg. Nope cols are unchanged; rope cols are overwritten with
-    `q*cos + (q@P)*sin`.
+    `q*cos + (q@P)*sin_signed` (forward) or `q*cos - (q@P)*sin_signed`
+    (inverse, with sin sign baked into the table).
     """
     if n_per_chip != h_per_chip * head_dim:
         raise ValueError(
@@ -445,7 +447,7 @@ def make_lk_c_q_rotary_kernel_headshard(mesh, cos_full_cpu, sin_full_cpu,
                memory_config=ttnn.DRAM_MEMORY_CONFIG,
                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
     cos_ext_packed, sin_signed_packed = _build_rotary_tables(
-        cos_full_cpu, sin_full_cpu, inverse=False)
+        cos_full_cpu, sin_full_cpu, inverse=inverse)
     cos_ext_tt = ttnn.as_tensor(cos_ext_packed, dtype=ttnn.bfloat16, **rep)
     sin_signed_tt = ttnn.as_tensor(sin_signed_packed, dtype=ttnn.bfloat16, **rep)
     P_cpu = _build_swap_matrix(rope_head_dim)

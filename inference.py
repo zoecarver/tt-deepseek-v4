@@ -5739,6 +5739,21 @@ class DeviceAttention(nn.Module):
             rope_head_dim=self.rope_head_dim,
         )
 
+        # Lk-O-rotary: in-place inverse rotary on rope cols of o_tt
+        # (post-sparse_attn). Same head-shard kernel as Lk-C-Q with the
+        # inverse sin sign baked into the table. Replaces (per call) 2x
+        # slice + matmul + multiply + addcmul + concat = 6 ttnn dispatches.
+        self._lk_o_rotary_kernel = _get_lk_c_q_rotary_headshard_make_kernel()(
+            self.mesh,
+            cos_full_cpu=self._cos_full_cpu,
+            sin_full_cpu=self._sin_full_cpu,
+            n_per_chip=self.n_local_heads * self.head_dim,
+            h_per_chip=self.n_local_heads,
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_head_dim,
+            inverse=True,
+        )
+
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         """Single-token forward. Prefill is driven externally as a per-token
         loop, so seqlen is always 1 and start_pos==0 is handled by _decode."""
@@ -5916,15 +5931,6 @@ class DeviceAttention(nn.Module):
         # pre_stage_decode (called by the orchestrator before forward_device,
         # outside any future trace region). Body below is pure device work.
 
-        # Hoist rotary table embedding+reshape once per layer; q/kv/o share
-        # the same start_pos_tt. Saves 6 ops/layer (3 calls × 4 ops -> 6 total).
-        cos_2d = ttnn.embedding(
-            start_pos_tt, self.cos_ext_tt, layout=ttnn.TILE_LAYOUT)
-        sin_2d = ttnn.embedding(
-            start_pos_tt, self.sin_signed_tt, layout=ttnn.TILE_LAYOUT)
-        cos_ext_4d = ttnn.reshape(cos_2d, [1, S, 1, rd])
-        sin_signed_4d = ttnn.reshape(sin_2d, [1, S, 1, rd])
-
         # When `offload_attn_wq_a_and_wkv` ran, both projections share one
         # DeviceColLinear (concatenated weight). Run a single matmul + gather
         # and slice the output into q_lora and pre-norm kv. Falls back to two
@@ -6088,15 +6094,13 @@ class DeviceAttention(nn.Module):
             # o_tt: [B, S, H, D].
 
         with _phase("attn.o"):
-            # Inverse rotary on o[..., -rd:]. o_tt is per-col [B,S,H_local,D].
-            ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H_local, D - rd],
-                       output_tensor=self._o_nope_scratch_tt)
-            ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H_local, D],
-                       output_tensor=self._o_rope_scratch_tt)
-            o_rope = _device_apply_rotary_swap(
-                ttnn, self._o_rope_scratch_tt, cos_ext_4d, sin_signed_4d,
-                self.rope_P_tt, inverse=True)
-            o_tt = ttnn.concat([self._o_nope_scratch_tt, o_rope], dim=-1)
+            # SWAP-Lk-O-rotary: in-place inverse rotary on rope cols of
+            # o_tt. Replaces 2x slice + matmul + multiply + addcmul + concat
+            # (6 ttnn dispatches) with one ttl.operation. ttnn.reshape
+            # between [B, S, H_local, D] and 2D [B*S, H_local*D] is free.
+            o_2d = ttnn.reshape(o_tt, [B * S, H_local * D])
+            self._lk_o_rotary_kernel(o_2d, start_pos_tt)
+            o_tt = ttnn.reshape(o_2d, [B, S, H_local, D])
 
             # Head-sharded wo_a: per chip, o_tt represents this col's group
             # of n_local_heads heads (== one of the n_groups groups). Flatten
