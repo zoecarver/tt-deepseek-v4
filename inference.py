@@ -665,7 +665,10 @@ class MoE(nn.Module):
                 f"x_tt last dim {int(x_tt.shape[-1])} != self.dim {self.dim}"
             )
 
-        shared_out_tt = shared_dev.forward_device(x_tt)
+        # Run shared SwiGLU through w2 but stop short of all_reduce. The
+        # routed path appends its own [1, dim] partial sum to this and
+        # issues a single combined all_reduce, saving one full-mesh CCL.
+        shared_partial_tt = shared_dev.forward_device_partial(x_tt)
 
         gate_dev = self.gate._device_gate
         if self.gate.hash:
@@ -673,10 +676,10 @@ class MoE(nn.Module):
         else:
             weights_tt, indices_tt = gate_dev.forward_device(x_tt)
         return self._forward_device_routed_cached(
-            x_tt, weights_tt, indices_tt, shared_out_tt)
+            x_tt, weights_tt, indices_tt, shared_partial_tt)
 
     def _forward_device_routed_cached(
-        self, x_tt, weights_tt, indices_tt, shared_out_tt
+        self, x_tt, weights_tt, indices_tt, shared_partial_tt
     ):
         """Path D body: per-chip 8-expert grouped MLP + selection mask.
 
@@ -684,7 +687,10 @@ class MoE(nn.Module):
           x_tt: bf16 [1, dim] replicated
           weights_tt: bf16 [1, topk] replicated (gate output, normalized * route_scale)
           indices_tt: int32 [1, topk] replicated
-          shared_out_tt: bf16 [1, dim] replicated (shared expert output)
+          shared_partial_tt: bf16 [1, dim] per-chip partial sum from the
+            shared expert (BEFORE its all_reduce). The routed partial is
+            added to it and a single combined all_reduce produces the final
+            replicated output.
 
         Cached weights (attached by Model.offload_moe_routed_experts;
         natively quantized as bfp4_b — ttnn.matmul dequantizes each tile
@@ -748,11 +754,13 @@ class MoE(nn.Module):
         # Sum across local experts: keepdim=True so result stays rank 4.
         y_local = ttnn.sum(y, dim=1, keepdim=True)  # [1, 1, 1, dim]
 
-        # All-reduce across the (rows*cols) mesh: full 256-expert sum.
-        y_full = ttnn.all_reduce(y_local)
-
-        y_2d = ttnn.reshape(y_full, [1, dim])
-        return ttnn.add(y_2d, shared_out_tt)
+        # Combine routed partial with shared partial BEFORE the cross-mesh
+        # all_reduce. AR(a) + AR(b) = AR(a + b) for sum-based reduce, so
+        # one full-mesh CCL replaces the two original all_reduces (one per
+        # expert path) and saves ~1 CCL/layer × 43 layers per token.
+        y_local_2d = ttnn.reshape(y_local, [1, dim])
+        combined = ttnn.add(y_local_2d, shared_partial_tt)
+        return ttnn.all_reduce(combined)
 
 
 class Block(nn.Module):
@@ -4036,10 +4044,12 @@ class DeviceSharedExpert(nn.Module):
             mesh_mapper=replicate, **common)
         self._upload_mapper = replicate
 
-    def _compute_body(self):
-        """Pure-device SwiGLU body that reads from the stable _x_upload_tt
-        buffer. Caller (forward_device) is responsible for staging the input
-        via ttnn.copy before the trace replays this body."""
+    def _compute_partial(self):
+        """SwiGLU pipeline through the w2 matmul; leaves the per-chip partial
+        sum in self._partial_tt without the cross-mesh all_reduce. Caller
+        decides whether to all_reduce here or fold this into a downstream
+        combined all_reduce (see MoE.forward_device, which sums the routed
+        and shared partials before a single full-mesh reduce)."""
         ttnn = self._ttnn
         ttnn.matmul(self._x_upload_tt, self.w1_tt,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -4059,7 +4069,14 @@ class DeviceSharedExpert(nn.Module):
         ttnn.matmul(self._mid_tt, self.w2_tt,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._partial_tt)
-        return ttnn.all_reduce(self._partial_tt)
+        return self._partial_tt
+
+    def _compute_body(self):
+        """SwiGLU + all_reduce. Used by the standalone forward_device wrapper
+        that returns a fully-reduced [1, dim] tensor."""
+        ttnn = self._ttnn
+        partial = self._compute_partial()
+        return ttnn.all_reduce(partial)
 
     def forward_device(self, x_tt):
         """Pure-device shared-expert SwiGLU. x_tt: [M=1, dim] bf16 device
@@ -4070,6 +4087,15 @@ class DeviceSharedExpert(nn.Module):
         ttnn = self._ttnn
         ttnn.copy(x_tt, self._x_upload_tt)
         return self._compute_body()
+
+    def forward_device_partial(self, x_tt):
+        """Like forward_device, but returns the per-chip partial sum BEFORE
+        all_reduce. The caller is responsible for combining this partial
+        with another partial (e.g. routed MoE y_local) and issuing the
+        all_reduce once. Saves one full-mesh CCL per layer."""
+        ttnn = self._ttnn
+        ttnn.copy(x_tt, self._x_upload_tt)
+        return self._compute_partial()
 
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """x: [M=1, dim] -> [M=1, dim]. weights matches Expert.forward
