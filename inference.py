@@ -4452,8 +4452,11 @@ class DeviceSparseAttn(nn.Module):
         #   probs  = e_s / denom
         score_max = ttnn.max(scores, dim=-1, keepdim=True)
         m = ttnn.maximum(score_max, sink_for_concat)
-        e_scores = ttnn.exp(ttnn.subtract(scores, m))
-        e_sink = ttnn.exp(ttnn.subtract(sink_for_concat, m))
+        # Fuse exp into subtract via UnaryOpType.EXP fused activation; saves
+        # one ttnn dispatch per online-softmax branch (2 ops/layer × 43).
+        e_scores = ttnn.subtract(scores, m, activations=[ttnn.UnaryOpType.EXP])
+        e_sink = ttnn.subtract(
+            sink_for_concat, m, activations=[ttnn.UnaryOpType.EXP])
         denom = ttnn.add(ttnn.sum(e_scores, dim=-1, keepdim=True), e_sink)
         probs = ttnn.divide(e_scores, denom)
         out = ttnn.matmul(probs, kv_gather)
