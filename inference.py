@@ -5014,8 +5014,11 @@ class DeviceCompressor(nn.Module):
             ttnn, kv_rope, cos_ext, sin_signed, self.rope_P_tt, inverse=False)
         kv_normed = ttnn.concat([kv_nope, kv_rope], dim=-1)
 
-        if self.rotate:
-            kv_normed = _device_rotate_activation(ttnn, kv_normed, self.h_tt)
+        # rotate (Walsh-Hadamard) is paired with the indexer's q-side rotation;
+        # both cancel in q_rot @ kv_rot^T = q @ kv^T (H orthogonal). The only
+        # consumer of this kv_cache is the indexer score matmul, so we skip
+        # both sides. Originally there for fp4-act-quant outlier reduction;
+        # under the bf16 policy there's no quantization to protect.
 
         self._paged_update_cache(
             self.kv_cache_tt, kv_normed, self._emit_slot_tt, B, d)
@@ -5189,7 +5192,10 @@ class DeviceIndexer(nn.Module):
             ttnn, q_rope, cos_ext_4d, sin_signed_4d, self.rope_P_tt,
             inverse=False)
         q_tt = ttnn.concat([q_nope, q_rope], dim=-1)
-        q_tt = _device_rotate_activation(ttnn, q_tt, self.h_tt)
+
+        # _device_rotate_activation (Walsh-Hadamard) skipped: both q and the
+        # indexer kv_cache previously got the same orthogonal rotation, which
+        # cancels in score = q_rot @ kv_rot^T. See DeviceCompressor._emit_body.
 
         # fp4_act_quant SKIPPED (bf16 policy).
         self.dc.forward_device(x_tt, B, start_pos, start_pos_tt=start_pos_tt)
