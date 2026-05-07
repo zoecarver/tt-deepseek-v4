@@ -2864,6 +2864,94 @@ def _compile_compressor_slot_shift_kernel(num_buffers: int, ratio_pad: int, d: i
     return slot_shift_kernel
 
 
+def _compile_fanout_compressor_slot_shift_kernel(ratio_pad: int, d: int):
+    """Lk-D-comp 4-way state buffer fanout (P5 parallelism).
+
+    The legacy emit step calls `slot_shift` four times (one per buffer:
+    kv_state_front, kv_state_back, score_state_front, score_state_back),
+    then four `ttnn.copy` to write back. 8 serialized dispatches per emit.
+
+    The four buffers are independent — each is the same `out = P @ buf`
+    math at the same `[TILE, d]` shape. Fan them across one grid:
+    grid=(COL, 4); core_row picks the buffer, core_col covers the d-tiles
+    (each col handles `TPC = N_tiles // COL` tiles). Writes back in place
+    (input == output tensor) to drop the four trailing `ttnn.copy`s.
+
+    Result: 8 dispatches collapse to 1, with 4x core utilization on the
+    shift compute (4 buffers run on disjoint quadrants of the grid).
+    """
+    if ratio_pad != _RMS_TILE:
+        raise ValueError(
+            f"ratio_pad={ratio_pad} != TILE={_RMS_TILE} unsupported "
+            f"(V4-Flash uses ratio_pad=32; multi-tile P needs different math)"
+        )
+    if d % _RMS_TILE != 0:
+        raise ValueError(f"d={d} not multiple of TILE={_RMS_TILE}")
+
+    N_tiles = d // _RMS_TILE
+    COL = min(N_tiles, 8)
+    if N_tiles % COL:
+        raise ValueError(f"N_tiles={N_tiles} not divisible by COL={COL}")
+    TPC = N_tiles // COL
+
+    @ttl.operation(grid=(COL, 4))
+    def fanout_slot_shift_kernel(buf_a, buf_b, buf_c, buf_d, P):
+        a_dfb = ttl.make_dataflow_buffer_like(buf_a, shape=(1, 1), block_count=2)
+        b_dfb = ttl.make_dataflow_buffer_like(buf_b, shape=(1, 1), block_count=2)
+        c_dfb = ttl.make_dataflow_buffer_like(buf_c, shape=(1, 1), block_count=2)
+        e_dfb = ttl.make_dataflow_buffer_like(buf_d, shape=(1, 1), block_count=2)
+        P_dfb = ttl.make_dataflow_buffer_like(P, shape=(1, 1), block_count=1)
+        out_a_dfb = ttl.make_dataflow_buffer_like(buf_a, shape=(1, 1), block_count=2)
+        out_b_dfb = ttl.make_dataflow_buffer_like(buf_b, shape=(1, 1), block_count=2)
+        out_c_dfb = ttl.make_dataflow_buffer_like(buf_c, shape=(1, 1), block_count=2)
+        out_e_dfb = ttl.make_dataflow_buffer_like(buf_d, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            _, core_row = ttl.node(dims=2)
+            P_tile = P_dfb.wait()
+            for _k in range(TPC):
+                if core_row == 0:
+                    out_a_dfb.reserve().store(P_tile @ a_dfb.wait())
+                elif core_row == 1:
+                    out_b_dfb.reserve().store(P_tile @ b_dfb.wait())
+                elif core_row == 2:
+                    out_c_dfb.reserve().store(P_tile @ c_dfb.wait())
+                else:
+                    out_e_dfb.reserve().store(P_tile @ e_dfb.wait())
+
+        @ttl.datamovement()
+        def dm_read():
+            core_col, core_row = ttl.node(dims=2)
+            ttl.copy(P[0, 0], P_dfb.reserve()).wait()
+            for k in range(TPC):
+                tile_idx = core_col * TPC + k
+                if core_row == 0:
+                    ttl.copy(buf_a[0, tile_idx], a_dfb.reserve()).wait()
+                elif core_row == 1:
+                    ttl.copy(buf_b[0, tile_idx], b_dfb.reserve()).wait()
+                elif core_row == 2:
+                    ttl.copy(buf_c[0, tile_idx], c_dfb.reserve()).wait()
+                else:
+                    ttl.copy(buf_d[0, tile_idx], e_dfb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_col, core_row = ttl.node(dims=2)
+            for k in range(TPC):
+                tile_idx = core_col * TPC + k
+                if core_row == 0:
+                    ttl.copy(out_a_dfb.wait(), buf_a[0, tile_idx]).wait()
+                elif core_row == 1:
+                    ttl.copy(out_b_dfb.wait(), buf_b[0, tile_idx]).wait()
+                elif core_row == 2:
+                    ttl.copy(out_c_dfb.wait(), buf_c[0, tile_idx]).wait()
+                else:
+                    ttl.copy(out_e_dfb.wait(), buf_d[0, tile_idx]).wait()
+
+    return fanout_slot_shift_kernel
+
+
 def _compressor_shift_matrix(ratio: int, ratio_pad: int) -> torch.Tensor:
     """Build the [ratio_pad, ratio_pad] shift matrix P for slot-shift kernel.
     P @ buf produces:
@@ -3281,6 +3369,13 @@ def _get_ttl_compressor_slot_shift_kernel(num_buffers: int, ratio_pad: int, d: i
     )
 
 
+def _get_ttl_fanout_compressor_slot_shift_kernel(ratio_pad: int, d: int):
+    return _cached_kernel(
+        ("fanout_compressor_slot_shift", ratio_pad, d),
+        lambda: _compile_fanout_compressor_slot_shift_kernel(ratio_pad, d),
+    )
+
+
 def _get_ttl_compressor_softmax_sum_norm_kernel(ratio: int, ratio_pad: int,
                                                  d: int, rms_eps: float):
     return _cached_kernel(
@@ -3319,6 +3414,12 @@ ttl_mhc_post_N1_h128 = None               # decode (num_tokens=1, h_tiles=128)
 ttl_compressor_slot_shift_B1_pad32_d512 = None  # attention compressor (head_dim=512)
 ttl_compressor_slot_shift_B1_pad32_d128 = None  # indexer compressor (index_head_dim=128)
 
+# 4-way fanout slot-shift: one dispatch handles all 4 state buffers
+# (kv_front/back, score_front/back) on disjoint quadrants of the grid, in
+# place. Replaces 4 slot_shift dispatches + 4 ttnn.copy at each emit.
+ttl_fanout_compressor_slot_shift_pad32_d512 = None  # attention compressor
+ttl_fanout_compressor_slot_shift_pad32_d128 = None  # indexer compressor
+
 # Fused slice/concat + softmax + weighted-sum + RMSNorm kernel for the
 # Compressor emit branch (overlap=True). One dispatch replaces ~8 ttnn ops.
 ttl_compressor_softmax_sum_norm_pad32_d512 = None  # attention compressor
@@ -3344,6 +3445,8 @@ def prebuild_ttl_decode_kernels(args: "ModelArgs"):
     global ttl_mhc_apply_mix_h_N1_h128, ttl_mhc_post_N1_h128
     global ttl_compressor_slot_shift_B1_pad32_d512
     global ttl_compressor_slot_shift_B1_pad32_d128
+    global ttl_fanout_compressor_slot_shift_pad32_d512
+    global ttl_fanout_compressor_slot_shift_pad32_d128
     global ttl_compressor_softmax_sum_norm_pad32_d512
     global ttl_compressor_softmax_sum_norm_pad32_d128
     global ttl_act_quant_block_M32_N448_B64
@@ -3373,6 +3476,10 @@ def prebuild_ttl_decode_kernels(args: "ModelArgs"):
         1, _RMS_TILE, args.head_dim)
     ttl_compressor_slot_shift_B1_pad32_d128 = _get_ttl_compressor_slot_shift_kernel(
         1, _RMS_TILE, args.index_head_dim)
+    ttl_fanout_compressor_slot_shift_pad32_d512 = (
+        _get_ttl_fanout_compressor_slot_shift_kernel(_RMS_TILE, args.head_dim))
+    ttl_fanout_compressor_slot_shift_pad32_d128 = (
+        _get_ttl_fanout_compressor_slot_shift_kernel(_RMS_TILE, args.index_head_dim))
 
     # Compressor emit branch (overlap=True ↔ compress_ratio=4). The kernel
     # softmaxes over all 32 ratio_pad rows; padding rows pull -inf from the
@@ -4661,29 +4768,27 @@ class DeviceCompressor(nn.Module):
         self._paged_update_cache(
             self.kv_cache_tt, kv_normed, self._emit_slot_tt, B, d)
 
-        # Slot-shift via tt-lang kernel (compressor_slot_shift). One kernel
-        # call per buffer (4 dispatches) replaces the old 16-dispatch loop
-        # of slice + update_cache_for_token_. Compute is `out = P @ in`;
-        # the result is copied back into the input buffer (single-tensor
-        # state with no Python attribute swap, so trace capture sees fixed
-        # tensor identities). The `_out_2d_tt` buffers act as scratch.
+        # Slot-shift via fanout tt-lang kernel: 4 buffers updated in place
+        # in one dispatch (P5). Replaces 4 per-buffer slot_shift dispatches
+        # + 4 ttnn.copy back. Each buffer runs on its own quadrant of the
+        # grid (rows=4 buffers, cols=d-tiles). The kernel writes back to
+        # the same tensors it reads (input == output), so no scratch +
+        # follow-up copy is needed.
         if self.overlap:
             if d == 512:
-                slot_shift = ttl_compressor_slot_shift_B1_pad32_d512
+                fanout = ttl_fanout_compressor_slot_shift_pad32_d512
             elif d == 128:
-                slot_shift = ttl_compressor_slot_shift_B1_pad32_d128
+                fanout = ttl_fanout_compressor_slot_shift_pad32_d128
             else:
-                raise ValueError(f"no compressor_slot_shift kernel built for d={d}")
-            if slot_shift is None:
+                raise ValueError(
+                    f"no fanout_compressor_slot_shift kernel built for d={d}")
+            if fanout is None:
                 raise RuntimeError(
-                    "compressor_slot_shift kernel not pre-built; "
+                    "fanout_compressor_slot_shift kernel not pre-built; "
                     "call prebuild_ttl_decode_kernels(args) first")
-            for base in ("kv_state_front", "kv_state_back",
-                         "score_state_front", "score_state_back"):
-                in_2d = getattr(self, f"{base}_2d_tt")
-                out_2d = getattr(self, f"{base}_out_2d_tt")
-                slot_shift(in_2d, self.shift_P_tt, out_2d)
-                ttnn.copy(out_2d, in_2d)
+            fanout(self.kv_state_front_2d_tt, self.kv_state_back_2d_tt,
+                   self.score_state_front_2d_tt, self.score_state_back_2d_tt,
+                   self.shift_P_tt)
 
         return kv_normed
 
