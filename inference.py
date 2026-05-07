@@ -5482,6 +5482,10 @@ class DeviceAttention(nn.Module):
         # Within a bucket the slice end and topk K are compile-time constants.
         self._topk_ramp_int_per_bucket = {}
         self._t_active_persistent_per_bucket = {}
+        # Bf16 [B,1,bk] tile of constant -1e4, used by the indexer topk body
+        # so the 5-op invalid-mask chain collapses into addcmul: see
+        # _indexer_topk_body for the closed form.
+        self._topk_neg_const_per_bucket = {}
         if self.compress_ratio == 4:
             max_T_for_buckets = self.max_seq_len // self.compress_ratio
             for bk in _INDEXER_TOPK_BUCKETS:
@@ -5502,6 +5506,13 @@ class DeviceAttention(nn.Module):
                 self._t_active_persistent_per_bucket[bk] = ttnn.from_torch(
                     torch.zeros((B, 1, bk), dtype=torch.int32),
                     device=self.mesh, dtype=ttnn.int32,
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=self._upload_mapper,
+                )
+                self._topk_neg_const_per_bucket[bk] = ttnn.from_torch(
+                    torch.full((B, 1, bk), -1e4, dtype=torch.bfloat16),
+                    device=self.mesh, dtype=ttnn.bfloat16,
                     layout=ttnn.TILE_LAYOUT,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     mesh_mapper=self._upload_mapper,
@@ -5693,11 +5704,14 @@ class DeviceAttention(nn.Module):
             self._indexer_score_in_tt, [0, 0, 0], [B, S, bucket])
         ramp_int_tt = self._topk_ramp_int_per_bucket[bucket]
         t_active_tt = self._t_active_persistent_per_bucket[bucket]
-        mask_bool = ttnn.lt(ramp_int_tt, t_active_tt)
-        mask_bf16 = ttnn.typecast(mask_bool, dtype=ttnn.bfloat16)
-        mask_minus_1 = ttnn.subtract(mask_bf16, 1.0)
-        mask_add = ttnn.multiply(mask_minus_1, 1e4)
-        masked_tt = ttnn.add(score_slice_tt, mask_add)
+        # masked = score + (mask - 1) * 1e4 = score - invalid * 1e4
+        # collapses 5 ops (lt + typecast + sub + mul + add) into 3 (ge +
+        # typecast + addcmul) by carrying the -1e4 in a persistent tile.
+        invalid_bool = ttnn.ge(ramp_int_tt, t_active_tt)
+        invalid_bf16 = ttnn.typecast(invalid_bool, dtype=ttnn.bfloat16)
+        masked_tt = ttnn.addcmul(
+            score_slice_tt, invalid_bf16,
+            self._topk_neg_const_per_bucket[bucket], value=1.0)
         vals_tt, idxs_tt = ttnn.topk(
             masked_tt, k=k_fixed, dim=-1, largest=True, sorted=True)
         invalid_bf16 = ttnn.lt(vals_tt, -1000.0)
@@ -7107,10 +7121,17 @@ class Model:
                     _ttnn_local.deallocate(t)
                 except Exception:
                     pass
+            for bk, t in list(da._topk_neg_const_per_bucket.items()):
+                try:
+                    _ttnn_local.deallocate(t)
+                except Exception:
+                    pass
             da._t_active_persistent_per_bucket = (
                 first_idx_owner._t_active_persistent_per_bucket)
             da._topk_ramp_int_per_bucket = (
                 first_idx_owner._topk_ramp_int_per_bucket)
+            da._topk_neg_const_per_bucket = (
+                first_idx_owner._topk_neg_const_per_bucket)
             da._t_active_shared = True
         if first_idx_owner is not None:
             self.transformer._t_active_shared_owner = first_idx_owner
