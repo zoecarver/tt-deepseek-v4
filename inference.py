@@ -4497,7 +4497,7 @@ def _device_apply_rotary_swap(ttnn, x_tt, cos_ext_tt, sin_signed_tt, P_tt,
     """Single-pass interleaved rotary using a precomputed swap matrix.
 
     Non-inverse: out = x*cos + swapped*sin → matmul + multiply + addcmul (3 ops).
-    Inverse:     out = x*cos - swapped*sin → matmul + 2 multiplies + subtract (4 ops).
+    Inverse:     out = x*cos - swapped*sin → matmul + multiply + addcmul(value=-1) (3 ops).
 
     See `_build_rotary_aux_tables` / `_build_rotary_swap_matrix` for
     table layouts. cos_ext_tt / sin_signed_tt must broadcast against
@@ -4505,12 +4505,10 @@ def _device_apply_rotary_swap(ttnn, x_tt, cos_ext_tt, sin_signed_tt, P_tt,
     """
     swapped = ttnn.matmul(x_tt, P_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
     c_term = ttnn.multiply(x_tt, cos_ext_tt)
-    if inverse:
-        s_term = ttnn.multiply(swapped, sin_signed_tt)
-        return ttnn.subtract(c_term, s_term)
-    # addcmul(input, t1, t2) = input + t1 * t2; folds the s_term multiply
-    # and final add into one fused dispatch.
-    return ttnn.addcmul(c_term, swapped, sin_signed_tt)
+    # addcmul(input, t1, t2, value=v) = input + v * t1 * t2; collapses the
+    # s_term multiply and final add/sub into one fused dispatch.
+    value = -1.0 if inverse else 1.0
+    return ttnn.addcmul(c_term, swapped, sin_signed_tt, value=value)
 
 
 def _device_q_rsqrt_norm(ttnn, q_tt, eps: float):
@@ -5707,9 +5705,9 @@ class DeviceAttention(nn.Module):
         idxs_int = ttnn.typecast(idxs_tt, dtype=ttnn.int32)
         idxs_winned = ttnn.add(idxs_int, win)
         idxs_plus_1 = ttnn.add(idxs_winned, 1)
-        correction = ttnn.multiply(idxs_plus_1, invalid_int)
-        cmp_idxs_int = ttnn.subtract(idxs_winned, correction)
-        return cmp_idxs_int
+        # cmp_idxs_int = idxs_winned - idxs_plus_1 * invalid_int
+        return ttnn.addcmul(
+            idxs_winned, idxs_plus_1, invalid_int, value=-1.0)
 
     def pre_stage_decode(self, start_pos: int, B: int = 1, S: int = 1):
         """Per-step host->device uploads for this attention layer (and its
