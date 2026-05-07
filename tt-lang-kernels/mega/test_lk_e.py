@@ -890,7 +890,10 @@ def make_lk_e_kernel(mesh, hc_attn_fn_cpu, hc_attn_scale_cpu, hc_attn_base_cpu,
                     shared_partial_out, next_a_out,
                     norm_slice_out=None,
                     external_post_attn_tt=None,
-                    external_comb_sk_attn_tt=None):
+                    external_comb_sk_attn_tt=None,
+                    skip_shared=False,
+                    post_ffn_out_tt=None,
+                    comb_sk_ffn_out_tt=None):
         if "scratch" not in state:
             # attn-side hc_pre scratch
             state["mixes_a"] = _zeros_fp32((NUM_TOKENS_PAD, _MHC_TILE))
@@ -990,10 +993,18 @@ def make_lk_e_kernel(mesh, hc_attn_fn_cpu, hc_attn_scale_cpu, hc_attn_base_cpu,
         ttnn.copy(a_input_tt, next_a_out)
 
         # 5. hc_pre_ffn on a_input_tt -> apply_mix_out_f (fp32).
+        # When `post_ffn_out_tt` / `comb_sk_ffn_out_tt` are supplied, write
+        # the hc_pre_ffn stash into them so an external (legacy) DeviceMHC
+        # ffn-side hc_post_device can read the stash without re-running
+        # hc_pre_ffn.
+        ffn_post_buf = post_ffn_out_tt if post_ffn_out_tt is not None \
+            else state["post_f"]
+        ffn_comb_sk_buf = comb_sk_ffn_out_tt if comb_sk_ffn_out_tt is not None \
+            else state["comb_sk_out_f"]
         _, _, ffn_hc_out_fp32 = _run_hc_pre(
             ffn_consts, a_input_tt,
-            state["mixes_f"], state["pre_f"], state["post_f"], state["comb_f"],
-            state["comb_sk_out_f"], state["apply_mix_out_f"],
+            state["mixes_f"], state["pre_f"], ffn_post_buf, state["comb_f"],
+            ffn_comb_sk_buf, state["apply_mix_out_f"],
             state["a_sliced_scratch_f"],
         )
 
@@ -1007,7 +1018,11 @@ def make_lk_e_kernel(mesh, hc_attn_fn_cpu, hc_attn_scale_cpu, hc_attn_base_cpu,
         if norm_slice_out is not None:
             ttnn.copy(state["norm_slice"], norm_slice_out)
 
-        # 7. shared expert SwiGLU.
+        # 7. shared expert SwiGLU. Skipped when caller has its own (e.g.
+        # TP=32-sharded) shared expert path; the kernel still produces
+        # next_a_out and norm_slice_out.
+        if skip_shared:
+            return
         x_padded_2d = ttnn.pad(
             state["norm_slice"],
             padding=[(0, TILE - NUM_TOKENS), (0, 0)], value=0.0)

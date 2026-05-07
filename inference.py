@@ -117,6 +117,19 @@ def _get_lk_a_make_kernel():
     return _MEGA_KERNEL_CACHE["lk_a_make_kernel"]
 
 
+def _get_lk_e_make_kernel():
+    """Lazy-import test_lk_e's `make_lk_e_kernel` factory.
+
+    Lk-E covers hc_post_attn → next_a → hc_pre_ffn → ffn_norm. With
+    skip_shared=True the SwiGLU portion of the kernel is bypassed so the
+    legacy TP=32-sharded shared expert keeps running.
+    """
+    if "lk_e_make_kernel" not in _MEGA_KERNEL_CACHE:
+        lk_e_mod = _import_mega_kernel("test_lk_e")
+        _MEGA_KERNEL_CACHE["lk_e_make_kernel"] = lk_e_mod.make_lk_e_kernel
+    return _MEGA_KERNEL_CACHE["lk_e_make_kernel"]
+
+
 # ==============================================================================
 # Global state (mirrors deepseek inference/model.py)
 # ==============================================================================
@@ -876,32 +889,57 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
         attn_out_tt = attn_dev.forward_device(
             bridge_tt, start_pos, start_pos_tt,
             wq_a_out_tt=lk_a_wq_a_out_tt)
-    with _phase("block.hc_post"):
-        x_2d = ttnn.reshape(attn_out_tt, [num_tokens, 1, hidden])
-        x_repeated = ttnn.repeat(x_2d, ttnn.Shape([1, mhc, 1]))
-        x_padded = ttnn.pad(
-            x_repeated,
-            padding=[(0, 0), (0, _MHC_TILE - mhc), (0, 0)],
-            value=0.0,
-        )
-        x_post_input = ttnn.reshape(
-            x_padded, [num_tokens * _MHC_TILE, hidden])
-        ttnn.typecast(x_post_input, dtype=ttnn.float32,
-                      output_tensor=mhc_attn._x_upload_tt)
-        post_out_tt = mhc_attn.hc_post_device(num_tokens)
-    with _phase("block.hc_pre"):
-        a_input_tt = _mhc_post_to_a_tt(
-            ttnn, post_out_tt, num_tokens, num_tokens_pad, mhc, hidden)
-        ffn_hc_out_fp32 = mhc_ffn.hc_pre_device(
-            num_tokens, num_tokens_pad, a_tt=a_input_tt)
-    with _phase("block.norm"):
-        ttnn.typecast(ffn_hc_out_fp32, dtype=ttnn.bfloat16,
-                      output_tensor=ffn_norm_dn._x_upload_tt)
-        ffn_norm_out_tt = ffn_norm_dn.forward_device(
-            ffn_norm_dn._x_upload_tt, num_tokens)
+    lk_e_active = getattr(layer, "_lk_e_active", False)
+    if lk_e_active:
+        with _phase("block.lk_e"):
+            attn_out_3d = ttnn.reshape(attn_out_tt, [num_tokens, 1, hidden])
+            layer._lk_e(
+                attn_out_3d,
+                x,
+                None, None, None,         # w1/w2/w3 (skip_shared=True)
+                None,                     # shared_partial_out (skip_shared)
+                layer._lk_e_next_a_tt,
+                norm_slice_out=mhc_ffn._norm_slice_tt,
+                external_post_attn_tt=mhc_attn._stash_post_tt,
+                external_comb_sk_attn_tt=mhc_attn._stash_comb_sk_tt,
+                skip_shared=True,
+                post_ffn_out_tt=mhc_ffn._post_tt,
+                comb_sk_ffn_out_tt=mhc_ffn._comb_sk_out_tt,
+            )
+            mhc_attn._stash_a_tt = None
+            mhc_attn._stash_post_tt = None
+            mhc_attn._stash_comb_sk_tt = None
+            mhc_ffn._stash_a_tt = layer._lk_e_next_a_tt
+            mhc_ffn._stash_post_tt = mhc_ffn._post_tt
+            mhc_ffn._stash_comb_sk_tt = mhc_ffn._comb_sk_out_tt
+    else:
+        with _phase("block.hc_post"):
+            x_2d = ttnn.reshape(attn_out_tt, [num_tokens, 1, hidden])
+            x_repeated = ttnn.repeat(x_2d, ttnn.Shape([1, mhc, 1]))
+            x_padded = ttnn.pad(
+                x_repeated,
+                padding=[(0, 0), (0, _MHC_TILE - mhc), (0, 0)],
+                value=0.0,
+            )
+            x_post_input = ttnn.reshape(
+                x_padded, [num_tokens * _MHC_TILE, hidden])
+            ttnn.typecast(x_post_input, dtype=ttnn.float32,
+                          output_tensor=mhc_attn._x_upload_tt)
+            post_out_tt = mhc_attn.hc_post_device(num_tokens)
+        with _phase("block.hc_pre"):
+            a_input_tt = _mhc_post_to_a_tt(
+                ttnn, post_out_tt, num_tokens, num_tokens_pad, mhc, hidden)
+            ffn_hc_out_fp32 = mhc_ffn.hc_pre_device(
+                num_tokens, num_tokens_pad, a_tt=a_input_tt)
+        with _phase("block.norm"):
+            ttnn.typecast(ffn_hc_out_fp32, dtype=ttnn.bfloat16,
+                          output_tensor=ffn_norm_dn._x_upload_tt)
+            ffn_norm_out_tt = ffn_norm_dn.forward_device(
+                ffn_norm_dn._x_upload_tt, num_tokens)
     with _phase("block.ffn"):
-        ttnn.slice(ffn_norm_out_tt, [0, 0], [num_tokens, hidden],
-                   output_tensor=mhc_ffn._norm_slice_tt)
+        if not lk_e_active:
+            ttnn.slice(ffn_norm_out_tt, [0, 0], [num_tokens, hidden],
+                       output_tensor=mhc_ffn._norm_slice_tt)
         moe_out_tt = layer.ffn.forward_device(
             mhc_ffn._norm_slice_tt, input_ids_tt)
     with _phase("block.hc_post"):
@@ -7046,6 +7084,61 @@ class Model:
 
             self._lk_a_kernels.append(lk_a)
 
+    def offload_lk_e(self, mesh):
+        """Mega kernel SWAP: hc_post_attn + next_a + hc_pre_ffn + ffn_norm
+        fused via Lk-E. The shared-expert SwiGLU portion of Lk-E is
+        skipped (skip_shared=True) so the legacy TP=32-sharded shared
+        expert keeps running.
+
+        Replaces `block.hc_post + block.hc_pre + block.norm` (the FFN-side
+        prep phases) with one call into `make_lk_e_kernel`. Reuses Lk-A's
+        attn-side hc_pre stash via `external_post_attn_tt` /
+        `external_comb_sk_attn_tt` so hc_pre_attn does not run twice.
+
+        Outputs:
+          - `_lk_e_next_a_tt` [num_tokens_pad, mhc*hidden] fp32: post-attn
+            residual that becomes mhc_ffn's `_stash_a_tt` for the trailing
+            (post-FFN) `hc_post_device` call.
+          - `mhc_ffn._post_tt` / `mhc_ffn._comb_sk_out_tt`: FFN-side
+            hc_pre stash, written directly into the legacy buffers so the
+            trailing `mhc_ffn.hc_post_device` finds the stash it expects.
+          - `mhc_ffn._norm_slice_tt`: ffn_norm output slice [1, dim] bf16
+            consumed by the shared+routed FFN.
+
+        Requires: offload_lk_a (provides post/comb_sk attn-side stash),
+        offload_mhc, offload_rms_norms.
+        """
+        import ttnn
+        make_lk_e = _get_lk_e_make_kernel()
+        self._lk_e_kernels = []
+        for layer in self.transformer.layers:
+            ffn_norm_dn = layer.ffn_norm.forward.__self__
+            gamma_cpu = ffn_norm_dn._cpu_gamma
+
+            lk_e = make_lk_e(
+                mesh,
+                hc_attn_fn_cpu=layer.hc_attn_fn,
+                hc_attn_scale_cpu=layer.hc_attn_scale,
+                hc_attn_base_cpu=layer.hc_attn_base,
+                hc_ffn_fn_cpu=layer.hc_ffn_fn,
+                hc_ffn_scale_cpu=layer.hc_ffn_scale,
+                hc_ffn_base_cpu=layer.hc_ffn_base,
+                ffn_norm_gamma_cpu=gamma_cpu,
+            )
+
+            num_tokens_pad = _MHC_TILE
+            layer._lk_e_next_a_tt = ttnn.from_torch(
+                torch.zeros(num_tokens_pad,
+                            self.args.hc_mult * self.args.dim,
+                            dtype=torch.float32),
+                device=mesh, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            )
+            layer._lk_e = lk_e
+            layer._lk_e_active = True
+            self._lk_e_kernels.append(lk_e)
+
     def _iter_device_modules(self):
         """Yield every Device* instance the model has constructed. Single
         source of truth for the orchestrator and any future tracing wiring."""
@@ -7255,6 +7348,7 @@ def main():
         ("attn_full", model.offload_attn_full),
         ("mhc", model.offload_mhc),
         ("lk_a", model.offload_lk_a),
+        ("lk_e", model.offload_lk_e),
         ("compressor_indexer", model.offload_compressor_indexer),
     ):
         print(f"[phase] offloading {label} on mesh ...")
