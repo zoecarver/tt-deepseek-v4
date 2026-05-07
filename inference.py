@@ -4249,36 +4249,56 @@ class DeviceSparseAttn(nn.Module):
         return out
 
 
-def _device_apply_rotary_interleaved(ttnn, x_tt, cos_pair_tt, sin_pair_tt, inverse: bool = False):
-    """Manual interleaved rotary on a device tensor.
+def _build_rotary_aux_tables(cos_full: torch.Tensor, sin_full: torch.Tensor):
+    """Pack rotary tables for the swap-matrix form of interleaved rotary.
 
-    Matches V4-Flash's view_as_complex format: x[..., rd] is reshaped to
-    [..., rd/2, 2] where the trailing 2 holds (real, imag) of one rotary
-    pair; cos_pair / sin_pair are [..., rd/2] broadcast tables.
+    Math:
+      forward:  out = x * cos_ext + (x @ P) * sin_signed
+      inverse:  out = x * cos_ext - (x @ P) * sin_signed
 
-      forward:  (a, b) -> (a*cos - b*sin, a*sin + b*cos)
-      inverse:  (a, b) -> (a*cos + b*sin, -a*sin + b*cos)
+    where P is the [rd, rd] block-diagonal swap matrix swapping adjacent
+    pairs and:
+      cos_ext[..., 2k]   = cos_ext[..., 2k+1] = cos_full[..., k]
+      sin_signed[..., 2k]   = -sin_full[..., k]
+      sin_signed[..., 2k+1] = +sin_full[..., k]
+
+    cos_full / sin_full have shape [..., rd/2]; outputs have shape [..., rd].
     """
-    out_shape = list(x_tt.shape)
-    rd = out_shape[-1]
-    pair_shape = out_shape[:-1] + [rd // 2, 2]
-    x_pairs = ttnn.reshape(x_tt, pair_shape)
-    pre = [0] * (len(pair_shape) - 1)
-    real = ttnn.slice(x_pairs, pre + [0], list(pair_shape[:-1]) + [1])
-    imag = ttnn.slice(x_pairs, pre + [1], list(pair_shape[:-1]) + [2])
-    # Add a trailing 1 dim to broadcast cos/sin across the (real, imag) pair.
-    cos_shape_b = list(cos_pair_tt.shape) + [1]
-    sin_shape_b = list(sin_pair_tt.shape) + [1]
-    cos_b = ttnn.reshape(cos_pair_tt, cos_shape_b)
-    sin_b = ttnn.reshape(sin_pair_tt, sin_shape_b)
+    cos_ext = cos_full.repeat_interleave(2, dim=-1).contiguous()
+    sin_signed = sin_full.repeat_interleave(2, dim=-1).clone()
+    sin_signed[..., 0::2] = -sin_signed[..., 0::2]
+    return cos_ext, sin_signed.contiguous()
+
+
+def _build_rotary_swap_matrix(rd: int, dtype=torch.bfloat16) -> torch.Tensor:
+    """Block-diagonal [rd, rd] swap matrix that maps x[..., 2k] <-> x[..., 2k+1]
+    when applied as `x @ P`. Used by `_device_apply_rotary_swap`."""
+    if rd % 2:
+        raise ValueError(f"rd={rd} must be even")
+    P = torch.zeros(rd, rd, dtype=dtype)
+    idx = torch.arange(rd // 2)
+    P[2 * idx,     2 * idx + 1] = 1.0
+    P[2 * idx + 1, 2 * idx]     = 1.0
+    return P
+
+
+def _device_apply_rotary_swap(ttnn, x_tt, cos_ext_tt, sin_signed_tt, P_tt,
+                              inverse: bool = False):
+    """Single-pass interleaved rotary using a precomputed swap matrix.
+
+    Replaces the 13-op slice/multiply/concat chain with 4 ttnn ops:
+    one matmul + two multiplies + one add (or subtract for inverse).
+
+    See `_build_rotary_aux_tables` / `_build_rotary_swap_matrix` for
+    table layouts. cos_ext_tt / sin_signed_tt must broadcast against
+    `x_tt` along the last dim (rd).
+    """
+    swapped = ttnn.matmul(x_tt, P_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    c_term = ttnn.multiply(x_tt, cos_ext_tt)
+    s_term = ttnn.multiply(swapped, sin_signed_tt)
     if inverse:
-        new_real = ttnn.add(ttnn.multiply(real, cos_b), ttnn.multiply(imag, sin_b))
-        new_imag = ttnn.subtract(ttnn.multiply(imag, cos_b), ttnn.multiply(real, sin_b))
-    else:
-        new_real = ttnn.subtract(ttnn.multiply(real, cos_b), ttnn.multiply(imag, sin_b))
-        new_imag = ttnn.add(ttnn.multiply(real, sin_b), ttnn.multiply(imag, cos_b))
-    paired = ttnn.concat([new_real, new_imag], dim=-1)
-    return ttnn.reshape(paired, out_shape)
+        return ttnn.subtract(c_term, s_term)
+    return ttnn.add(c_term, s_term)
 
 
 def _device_q_rsqrt_norm(ttnn, q_tt, eps: float):
@@ -4426,6 +4446,14 @@ class DeviceCompressor(nn.Module):
         sin_shifted_cpu = fc.imag[shifted].to(torch.bfloat16).contiguous()
         self.cos_compressor_tt = ttnn.as_tensor(cos_shifted_cpu, **rep)
         self.sin_compressor_tt = ttnn.as_tensor(sin_shifted_cpu, **rep)
+        # Packed tables for the swap-matrix rotary (collapses
+        # _device_apply_rotary_interleaved's 13-op chain to 4 ops).
+        cos_ext_compr, sin_signed_compr = _build_rotary_aux_tables(
+            cos_shifted_cpu, sin_shifted_cpu)
+        self.cos_ext_compressor_tt = ttnn.as_tensor(cos_ext_compr, **rep)
+        self.sin_signed_compressor_tt = ttnn.as_tensor(sin_signed_compr, **rep)
+        self.rope_P_tt = ttnn.as_tensor(
+            _build_rotary_swap_matrix(self.rope_head_dim), **rep)
 
         if self.rotate:
             h_mat = (_sylvester_hadamard(self.head_dim) *
@@ -4754,19 +4782,20 @@ class DeviceCompressor(nn.Module):
                 kv_2d = ttnn.slice(kv_2d, [0, 0], [B, d])
             kv_normed = ttnn.reshape(kv_2d, [B, 1, d])
 
-        rd_half = rd // 2
-        # cos_compressor_tt[start_pos] == cos_full[start_pos + 1 - ratio] for
-        # the emit positions (start_pos = k*ratio - 1, k>=1) that reach this
-        # branch; the per-step row pick stays on device via ttnn.embedding.
-        cos = ttnn.embedding(
-            start_pos_tt, self.cos_compressor_tt, layout=ttnn.TILE_LAYOUT)
-        sin = ttnn.embedding(
-            start_pos_tt, self.sin_compressor_tt, layout=ttnn.TILE_LAYOUT)
-        cos = ttnn.reshape(cos, [1, 1, rd_half])
-        sin = ttnn.reshape(sin, [1, 1, rd_half])
+        # cos_ext_compressor_tt[start_pos] == cos_full[start_pos + 1 - ratio]
+        # extended by repeat_interleave for the emit positions
+        # (start_pos = k*ratio - 1, k>=1) that reach this branch; the per-step
+        # row pick stays on device via ttnn.embedding.
+        cos_ext = ttnn.embedding(
+            start_pos_tt, self.cos_ext_compressor_tt, layout=ttnn.TILE_LAYOUT)
+        sin_signed = ttnn.embedding(
+            start_pos_tt, self.sin_signed_compressor_tt, layout=ttnn.TILE_LAYOUT)
+        cos_ext = ttnn.reshape(cos_ext, [1, 1, rd])
+        sin_signed = ttnn.reshape(sin_signed, [1, 1, rd])
         kv_nope = ttnn.slice(kv_normed, [0, 0, 0],     [B, 1, d - rd])
         kv_rope = ttnn.slice(kv_normed, [0, 0, d - rd], [B, 1, d])
-        kv_rope = _device_apply_rotary_interleaved(ttnn, kv_rope, cos, sin, inverse=False)
+        kv_rope = _device_apply_rotary_swap(
+            ttnn, kv_rope, cos_ext, sin_signed, self.rope_P_tt, inverse=False)
         kv_normed = ttnn.concat([kv_nope, kv_rope], dim=-1)
 
         if self.rotate:
@@ -4840,8 +4869,16 @@ class DeviceIndexer(nn.Module):
                  (self.head_dim ** -0.5)).to(torch.bfloat16)
         self.h_tt = ttnn.as_tensor(h_mat, **rep)
         fc = indexer.freqs_cis
-        self.cos_full_tt = ttnn.as_tensor(fc.real.to(torch.bfloat16).contiguous(), **rep)
-        self.sin_full_tt = ttnn.as_tensor(fc.imag.to(torch.bfloat16).contiguous(), **rep)
+        cos_full_cpu = fc.real.to(torch.bfloat16).contiguous()
+        sin_full_cpu = fc.imag.to(torch.bfloat16).contiguous()
+        self.cos_full_tt = ttnn.as_tensor(cos_full_cpu, **rep)
+        self.sin_full_tt = ttnn.as_tensor(sin_full_cpu, **rep)
+        cos_ext_cpu, sin_signed_cpu = _build_rotary_aux_tables(
+            cos_full_cpu, sin_full_cpu)
+        self.cos_ext_tt = ttnn.as_tensor(cos_ext_cpu, **rep)
+        self.sin_signed_tt = ttnn.as_tensor(sin_signed_cpu, **rep)
+        self.rope_P_tt = ttnn.as_tensor(
+            _build_rotary_swap_matrix(self.rope_head_dim), **rep)
         self._alloc_decode_tensors()
 
     def _alloc_decode_tensors(self):
@@ -4864,16 +4901,16 @@ class DeviceIndexer(nn.Module):
         q_tt = self.wq_b.forward_device(qr_tt)
         q_tt = ttnn.reshape(q_tt, [B, 1, H, D])
 
-        rd_half = rd // 2
-        cos = ttnn.embedding(
-            start_pos_tt, self.cos_full_tt, layout=ttnn.TILE_LAYOUT)
-        sin = ttnn.embedding(
-            start_pos_tt, self.sin_full_tt, layout=ttnn.TILE_LAYOUT)
-        cos = ttnn.reshape(cos, [1, 1, 1, rd_half])
-        sin = ttnn.reshape(sin, [1, 1, 1, rd_half])
+        cos_ext = ttnn.embedding(
+            start_pos_tt, self.cos_ext_tt, layout=ttnn.TILE_LAYOUT)
+        sin_signed = ttnn.embedding(
+            start_pos_tt, self.sin_signed_tt, layout=ttnn.TILE_LAYOUT)
+        cos_ext = ttnn.reshape(cos_ext, [1, 1, 1, rd])
+        sin_signed = ttnn.reshape(sin_signed, [1, 1, 1, rd])
         q_nope = ttnn.slice(q_tt, [0, 0, 0, 0],     [B, 1, H, D - rd])
         q_rope = ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, 1, H, D])
-        q_rope = _device_apply_rotary_interleaved(ttnn, q_rope, cos, sin, inverse=False)
+        q_rope = _device_apply_rotary_swap(
+            ttnn, q_rope, cos_ext, sin_signed, self.rope_P_tt, inverse=False)
         q_tt = ttnn.concat([q_nope, q_rope], dim=-1)
         q_tt = _device_rotate_activation(ttnn, q_tt, self.h_tt)
 
@@ -4952,6 +4989,12 @@ class DeviceAttention(nn.Module):
         )
         self.cos_full_tt = ttnn.as_tensor(cos_full, **rep)
         self.sin_full_tt = ttnn.as_tensor(sin_full, **rep)
+        cos_ext_cpu, sin_signed_cpu = _build_rotary_aux_tables(
+            cos_full, sin_full)
+        self.cos_ext_tt = ttnn.as_tensor(cos_ext_cpu, **rep)
+        self.sin_signed_tt = ttnn.as_tensor(sin_signed_cpu, **rep)
+        self.rope_P_tt = ttnn.as_tensor(
+            _build_rotary_swap_matrix(rd), **rep)
         self.max_seq_len = cos_full.shape[0]
 
         # wo_a: replicated [n_groups, in_per_group, o_lora_rank] (block-diagonal).
@@ -5448,14 +5491,16 @@ class DeviceAttention(nn.Module):
             q_tt = ttnn.reshape(q_full_tt, [B, S, H, D])
             q_tt = _device_q_rsqrt_norm(ttnn, q_tt, self.eps)
 
-            cos_q, sin_q = self._rotary_tables(start_pos_tt, S, q_dims=4)
+            cos_q_ext, sin_q_signed = self._rotary_tables(
+                start_pos_tt, S, q_dims=4)
             # Rotate q[..., -rd:] by slicing -> rotating -> concatenating.
             ttnn.slice(q_tt, [0, 0, 0, 0], [B, S, H, D - rd],
                        output_tensor=self._q_nope_scratch_tt)
             ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, S, H, D],
                        output_tensor=self._q_rope_scratch_tt)
-            q_rope = _device_apply_rotary_interleaved(
-                ttnn, self._q_rope_scratch_tt, cos_q, sin_q, inverse=False)
+            q_rope = _device_apply_rotary_swap(
+                ttnn, self._q_rope_scratch_tt, cos_q_ext, sin_q_signed,
+                self.rope_P_tt, inverse=False)
             q_tt = ttnn.concat([self._q_nope_scratch_tt, q_rope], dim=-1)
 
         # KV path: wkv -> kv_norm -> rotary.
@@ -5467,13 +5512,15 @@ class DeviceAttention(nn.Module):
             kv_2d = ttnn.reshape(kv_tt, [B * S, D])
             kv_2d = self._rmsnorm_device(self.kv_norm_dev, kv_2d, B * S)
             kv_tt = ttnn.reshape(kv_2d, [B, S, D])
-            cos_kv, sin_kv = self._rotary_tables(start_pos_tt, S, q_dims=3)
+            cos_kv_ext, sin_kv_signed = self._rotary_tables(
+                start_pos_tt, S, q_dims=3)
             ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd],
                        output_tensor=self._kv_nope_scratch_tt)
             ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D],
                        output_tensor=self._kv_rope_scratch_tt)
-            kv_rope = _device_apply_rotary_interleaved(
-                ttnn, self._kv_rope_scratch_tt, cos_kv, sin_kv, inverse=False)
+            kv_rope = _device_apply_rotary_swap(
+                ttnn, self._kv_rope_scratch_tt, cos_kv_ext, sin_kv_signed,
+                self.rope_P_tt, inverse=False)
             kv_tt = ttnn.concat([self._kv_nope_scratch_tt, kv_rope], dim=-1)
 
             # Device-side act_quant on the nope region (bf16 round-trip; no fp8
@@ -5587,13 +5634,15 @@ class DeviceAttention(nn.Module):
 
         with _phase("attn.o"):
             # Inverse rotary on o[..., -rd:].
-            cos_o, sin_o = self._rotary_tables(start_pos_tt, S, q_dims=4)
+            cos_o_ext, sin_o_signed = self._rotary_tables(
+                start_pos_tt, S, q_dims=4)
             ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H, D - rd],
                        output_tensor=self._o_nope_scratch_tt)
             ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H, D],
                        output_tensor=self._o_rope_scratch_tt)
-            o_rope = _device_apply_rotary_interleaved(
-                ttnn, self._o_rope_scratch_tt, cos_o, sin_o, inverse=True)
+            o_rope = _device_apply_rotary_swap(
+                ttnn, self._o_rope_scratch_tt, cos_o_ext, sin_o_signed,
+                self.rope_P_tt, inverse=True)
             o_tt = ttnn.concat([self._o_nope_scratch_tt, o_rope], dim=-1)
 
             # Group reshape: [B, S, H, D] -> [G, B*S, H*D/G] for batched matmul.
@@ -5636,28 +5685,30 @@ class DeviceAttention(nn.Module):
         return out
 
     def _rotary_tables(self, start_pos_tt, S: int, q_dims: int):
-        """Pick cos/sin rows for `start_pos_tt` via ttnn.embedding and reshape
-        for broadcasting against q (4D, [B,S,H,rd/2,1] post-unsqueeze) or kv
-        (3D, [B,S,rd/2,1]). start_pos_tt is a [1, 1] uint32 device tensor;
-        keeping the row index on device makes the surrounding rotary op
-        sequence trace-stable across decode positions. S must be 1 (decode)."""
+        """Pick cos_ext/sin_signed rows for `start_pos_tt` via ttnn.embedding
+        and reshape for broadcasting against q (4D, [B,S,1,rd]) or kv (3D,
+        [B,S,rd]). start_pos_tt is a [1, 1] uint32 device tensor; keeping
+        the row index on device makes the surrounding rotary op sequence
+        trace-stable across decode positions. S must be 1 (decode).
+
+        Returns (cos_ext, sin_signed) for `_device_apply_rotary_swap`."""
         ttnn = self._ttnn
         if S != 1:
             raise ValueError(
                 f"_rotary_tables expects S=1 for the device decode path, got S={S}"
             )
-        rd_half = self.rope_head_dim // 2
-        cos = ttnn.embedding(
-            start_pos_tt, self.cos_full_tt, layout=ttnn.TILE_LAYOUT)
-        sin = ttnn.embedding(
-            start_pos_tt, self.sin_full_tt, layout=ttnn.TILE_LAYOUT)
+        rd = self.rope_head_dim
+        cos_ext = ttnn.embedding(
+            start_pos_tt, self.cos_ext_tt, layout=ttnn.TILE_LAYOUT)
+        sin_signed = ttnn.embedding(
+            start_pos_tt, self.sin_signed_tt, layout=ttnn.TILE_LAYOUT)
         if q_dims == 4:
-            cos = ttnn.reshape(cos, [1, S, 1, rd_half])
-            sin = ttnn.reshape(sin, [1, S, 1, rd_half])
+            cos_ext = ttnn.reshape(cos_ext, [1, S, 1, rd])
+            sin_signed = ttnn.reshape(sin_signed, [1, S, 1, rd])
         else:  # q_dims == 3
-            cos = ttnn.reshape(cos, [1, S, rd_half])
-            sin = ttnn.reshape(sin, [1, S, rd_half])
-        return cos, sin
+            cos_ext = ttnn.reshape(cos_ext, [1, S, rd])
+            sin_signed = ttnn.reshape(sin_signed, [1, S, rd])
+        return cos_ext, sin_signed
 
 
 def _open_mesh(shape=(4, 8), trace_region_size: int = 200_000_000,
