@@ -1047,6 +1047,19 @@ class Transformer(nn.Module):
         )
         ttnn.copy_host_to_device_tensor(sp_host, self._start_pos_tt)
 
+        # Shared kv_slot for paged_update_cache: identical across all layers
+        # (start_pos % window_size, window_size=128 model constant). Upload
+        # once here so per-layer pre_stage_decode skips this transfer.
+        shared_slot = getattr(self, "_shared_kv_slot_tt", None)
+        if shared_slot is not None:
+            win = self.layers[0].attn.window_size
+            slot_host = ttnn.from_torch(
+                torch.tensor([start_pos % win], dtype=torch.int32),
+                dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=self._input_ids_upload_mapper,
+            )
+            ttnn.copy_host_to_device_tensor(slot_host, shared_slot)
+
         # Per-layer slot / T_active uploads. Each DeviceAttention.pre_stage_decode
         # also recurses into its compressor and indexer.
         with _phase("pre_stage"):
@@ -5616,12 +5629,13 @@ class DeviceAttention(nn.Module):
         ttnn = self._ttnn
         attn = self.attn
         win = self.window_size
-        kv_slot_host = ttnn.from_torch(
-            torch.tensor([start_pos % win], dtype=torch.int32),
-            dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
-            mesh_mapper=self._upload_mapper,
-        )
-        ttnn.copy_host_to_device_tensor(kv_slot_host, self._kv_slot_tt)
+        if not getattr(self, "_kv_slot_shared", False):
+            kv_slot_host = ttnn.from_torch(
+                torch.tensor([start_pos % win], dtype=torch.int32),
+                dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=self._upload_mapper,
+            )
+            ttnn.copy_host_to_device_tensor(kv_slot_host, self._kv_slot_tt)
         device_comp = getattr(attn, "_device_compressor", None)
         if device_comp is not None:
             device_comp.pre_stage_decode(start_pos, B=B)
@@ -6532,6 +6546,20 @@ class Model:
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
         )
 
+        # Single shared per-step kv_cache slot upload buffer. window_size is a
+        # model constant (128), so kv_slot = start_pos % win is identical
+        # across all 43 layers — one upload/token instead of 43 lets every
+        # DeviceAttention's paged_update_cache read from the same int32 slot
+        # tensor. Each DeviceAttention's `_kv_slot_tt` is rebound to this
+        # shared buffer in `offload_attn_full`.
+        self.transformer._shared_kv_slot_tt = ttnn.from_torch(
+            torch.zeros(1, dtype=torch.int32),
+            device=mesh, dtype=ttnn.int32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+
         def _device_embed(self_embed, ids_tt):
             """Return a ttnn device tensor [B, S, hidden] bf16 TILE_LAYOUT,
             replicated across the mesh. ids_tt: [B, S] uint32 device tensor
@@ -6916,6 +6944,17 @@ class Model:
                 wo_a_cpu_weight=attn.wo_a.weight.detach(),
                 max_seq_len=attn.freqs_cis.shape[0],
             )
+            # All layers share the same kv_slot value (start_pos % win=128).
+            # Drop the per-layer slot tensor and rebind to the shared
+            # transformer-level upload buffer; pre_stage_decode skips its
+            # own slot upload when _kv_slot_shared is set.
+            try:
+                import ttnn
+                ttnn.deallocate(da._kv_slot_tt)
+            except Exception:
+                pass
+            da._kv_slot_tt = self.transformer._shared_kv_slot_tt
+            da._kv_slot_shared = True
             attn.forward = da.forward
             self._device_attn_full.append(da)
 
