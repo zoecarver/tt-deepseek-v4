@@ -855,16 +855,13 @@ def _block_forward(layer, x, start_pos: int, start_pos_tt,
                 post_tt_out=mhc_attn._post_tt,
                 comb_sk_out_tt_out=mhc_attn._comb_sk_out_tt,
             )
-            if getattr(attn_obj, "_lk_a_full_mesh", False):
-                # 2-stage all_gather: cluster_axis=1 collapses the col-axis
-                # shard, cluster_axis=0 then collapses the row-axis remainder
-                # to publish replicated _lk_a_wq_a_out_tt.
+            if getattr(attn_obj, "_lk_a_row_shard", False):
+                # Single cluster_axis=0 all_gather: rebuilds the replicated
+                # q_lora_rank from the 4 row-axis shards. The col axis was
+                # already replicated (per-row weights identical), so no
+                # cross-col gather is needed.
                 ttnn.all_gather(
-                    attn_obj._lk_a_wq_a_partial_tt, dim=-1, cluster_axis=1,
-                    num_links=1,
-                    output_tensor=attn_obj._lk_a_wq_a_row_gathered_tt)
-                ttnn.all_gather(
-                    attn_obj._lk_a_wq_a_row_gathered_tt, dim=-1, cluster_axis=0,
+                    attn_obj._lk_a_wq_a_partial_tt, dim=-1, cluster_axis=0,
                     num_links=1,
                     output_tensor=attn_obj._lk_a_wq_a_out_tt)
             mhc_attn._stash_a_tt = x
@@ -7050,8 +7047,15 @@ class Model:
             mesh_shape = tuple(mesh.shape)
             num_chips = mesh_shape[0] * mesh_shape[1]
             q_lora_rank = self.args.q_lora_rank
-            full_mesh_lk_a = (q_lora_rank % (num_chips * _RMS_TILE) == 0)
-            n_per_chip = (q_lora_rank // num_chips) if full_mesh_lk_a else q_lora_rank
+            # Row-axis 4-way shard: per-chip n_tiles_per_chip = 1024/4/32 = 8,
+            # which the fused rms+SUMMA kernel maps to (1, 1, 8) blocks ×
+            # (1, 8, 1) part_cfg = 8 cores along N per chip. Pre-shard used 8
+            # cores for the redundant full N; row-shard keeps the same per-chip
+            # parallelism while cutting per-chip FMAs by 4×. The replicated
+            # output is reconstructed by a single cluster_axis=0 all_gather
+            # (one CCL instead of the prior 2-stage gather).
+            row_shard_lk_a = (q_lora_rank % (mesh_shape[0] * _RMS_TILE) == 0)
+            n_per_chip = (q_lora_rank // mesh_shape[0]) if row_shard_lk_a else q_lora_rank
 
             lk_a = make_lk_a(
                 mesh,
@@ -7066,8 +7070,9 @@ class Model:
             gamma_f32 = gamma_cpu.detach().to(torch.float32)
             wq_a_baked = (gamma_f32[:, None] * wq_a_T.float()) \
                 .to(torch.bfloat16).contiguous()
-            wq_a_mapper = (ttnn.ShardTensorToMesh(mesh, dim=-1)
-                           if full_mesh_lk_a
+            wq_a_mapper = (ttnn.ShardTensor2dMesh(
+                                mesh, mesh_shape, dims=(-1, None))
+                           if row_shard_lk_a
                            else ttnn.ReplicateTensorToMesh(mesh))
             attn._lk_a_wq_a_w_tt = ttnn.as_tensor(
                 wq_a_baked, device=mesh, dtype=ttnn.bfloat16,
@@ -7081,19 +7086,12 @@ class Model:
                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                 device=mesh, memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
-            if full_mesh_lk_a:
-                # Per-chip kernel output [1, 1, q_lora_rank] sharded along the
-                # full mesh on the last dim. The 2-stage all_gather
-                # (cluster_axis=1 then 0) reconstructs the replicated
-                # _lk_a_wq_a_out_tt.
+            if row_shard_lk_a:
+                # Per-chip kernel output [1, 1, q_lora_rank/4] sharded along
+                # the row axis only (cluster_axis=0). One all_gather along
+                # cluster_axis=0 reconstructs the replicated _lk_a_wq_a_out_tt.
                 zeros_qlora = torch.zeros(1, 1, q_lora_rank, dtype=torch.bfloat16)
                 attn._lk_a_wq_a_partial_tt = ttnn.from_torch(
-                    zeros_qlora, device=mesh, dtype=ttnn.bfloat16,
-                    layout=ttnn.TILE_LAYOUT,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=-1),
-                )
-                attn._lk_a_wq_a_row_gathered_tt = ttnn.from_torch(
                     zeros_qlora, device=mesh, dtype=ttnn.bfloat16,
                     layout=ttnn.TILE_LAYOUT,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -7102,8 +7100,7 @@ class Model:
                 )
             else:
                 attn._lk_a_wq_a_partial_tt = attn._lk_a_wq_a_out_tt
-                attn._lk_a_wq_a_row_gathered_tt = None
-            attn._lk_a_full_mesh = full_mesh_lk_a
+            attn._lk_a_row_shard = row_shard_lk_a
             attn._lk_a_x_pre_norm_tt = ttnn.zeros(
                 shape=(_RMS_TILE, self.args.dim),
                 dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
