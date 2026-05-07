@@ -1063,6 +1063,17 @@ class Transformer(nn.Module):
         # Per-layer slot / T_active uploads. Each DeviceAttention.pre_stage_decode
         # also recurses into its compressor and indexer.
         with _phase("pre_stage"):
+            # Shared indexer T_active staging: every indexer layer in this
+            # model has compress_ratio=4 and reads the same persistent
+            # bucket buffer, so the upload only needs to happen once per
+            # token. Layers with `_t_active_shared` skip their own staging.
+            shared_first = getattr(self, "_t_active_shared_owner", None)
+            if shared_first is not None:
+                T_active_pre = (start_pos + 1) // shared_first.compress_ratio
+                if T_active_pre > 0:
+                    bucket_pre = _pick_indexer_topk_bucket(T_active_pre)
+                    shared_first._stage_indexer_topk_inputs(
+                        B, S, bucket_pre, T_active_pre)
             for layer in self.layers:
                 attn_dev = layer.attn.forward.__self__
                 attn_dev.pre_stage_decode(start_pos, B=B, S=S)
@@ -5644,7 +5655,9 @@ class DeviceAttention(nn.Module):
             # Indexer owns its own DeviceCompressor (separate kv/score state
             # from attn._device_compressor); stage its slot uploads too.
             device_indexer.dc.pre_stage_decode(start_pos, B=B)
-        if self.compress_ratio and device_indexer is not None:
+        if (self.compress_ratio
+                and device_indexer is not None
+                and not getattr(self, "_t_active_shared", False)):
             T_active_pre = (start_pos + 1) // self.compress_ratio
             if T_active_pre > 0:
                 bucket_pre = _pick_indexer_topk_bucket(T_active_pre)
@@ -6957,6 +6970,38 @@ class Model:
             da._kv_slot_shared = True
             attn.forward = da.forward
             self._device_attn_full.append(da)
+
+        # Indexer T_active is identical across all compress_ratio=4 layers
+        # ((start_pos+1)//4 + bucket pick) — share one set of persistent
+        # buffers so the per-step upload happens once instead of 20x. The
+        # first indexer layer keeps its allocations and acts as the staging
+        # owner; later indexer layers' dicts are rebound to the same set
+        # (their original buffers are deallocated).
+        first_idx_owner = None
+        import ttnn as _ttnn_local
+        for da in self._device_attn_full:
+            if da.compress_ratio != 4:
+                continue
+            if first_idx_owner is None:
+                first_idx_owner = da
+                continue
+            for bk, t in list(da._t_active_persistent_per_bucket.items()):
+                try:
+                    _ttnn_local.deallocate(t)
+                except Exception:
+                    pass
+            for bk, t in list(da._topk_ramp_int_per_bucket.items()):
+                try:
+                    _ttnn_local.deallocate(t)
+                except Exception:
+                    pass
+            da._t_active_persistent_per_bucket = (
+                first_idx_owner._t_active_persistent_per_bucket)
+            da._topk_ramp_int_per_bucket = (
+                first_idx_owner._topk_ramp_int_per_bucket)
+            da._t_active_shared = True
+        if first_idx_owner is not None:
+            self.transformer._t_active_shared_owner = first_idx_owner
 
     def offload_mhc(self, mesh):
         """Run Block.hc_pre + Block.hc_post on the 1xN mesh via tt-lang kernels.
