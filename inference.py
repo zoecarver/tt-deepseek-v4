@@ -5153,7 +5153,8 @@ class DeviceIndexer(nn.Module):
         )
 
     def forward_device_score(self, x_tt, qr_tt, B: int, start_pos: int,
-                              start_pos_tt):
+                              start_pos_tt, cos_ext_4d=None,
+                              sin_signed_4d=None):
         ttnn = self._ttnn
         H_full = self.n_heads
         H_local = self.n_local_heads
@@ -5171,16 +5172,20 @@ class DeviceIndexer(nn.Module):
             optional_output_tensor=self._wq_b_out_tt)
         q_tt = ttnn.reshape(self._wq_b_out_tt, [B, 1, H_local, D])
 
-        cos_ext = ttnn.embedding(
-            start_pos_tt, self.cos_ext_tt, layout=ttnn.TILE_LAYOUT)
-        sin_signed = ttnn.embedding(
-            start_pos_tt, self.sin_signed_tt, layout=ttnn.TILE_LAYOUT)
-        cos_ext = ttnn.reshape(cos_ext, [1, 1, 1, rd])
-        sin_signed = ttnn.reshape(sin_signed, [1, 1, 1, rd])
+        # Reuse attn's hoisted [1,S,1,rd] cos/sin when supplied (indexer.freqs_cis
+        # is bound to attn.freqs_cis at offload, so the tables are identical).
+        if cos_ext_4d is None or sin_signed_4d is None:
+            cos_2d = ttnn.embedding(
+                start_pos_tt, self.cos_ext_tt, layout=ttnn.TILE_LAYOUT)
+            sin_2d = ttnn.embedding(
+                start_pos_tt, self.sin_signed_tt, layout=ttnn.TILE_LAYOUT)
+            cos_ext_4d = ttnn.reshape(cos_2d, [1, 1, 1, rd])
+            sin_signed_4d = ttnn.reshape(sin_2d, [1, 1, 1, rd])
         q_nope = ttnn.slice(q_tt, [0, 0, 0, 0],     [B, 1, H_local, D - rd])
         q_rope = ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, 1, H_local, D])
         q_rope = _device_apply_rotary_swap(
-            ttnn, q_rope, cos_ext, sin_signed, self.rope_P_tt, inverse=False)
+            ttnn, q_rope, cos_ext_4d, sin_signed_4d, self.rope_P_tt,
+            inverse=False)
         q_tt = ttnn.concat([q_nope, q_rope], dim=-1)
         q_tt = _device_rotate_activation(ttnn, q_tt, self.h_tt)
 
@@ -5925,6 +5930,8 @@ class DeviceAttention(nn.Module):
                             score_tt = device_indexer.forward_device_score(
                                 x_tt, qr_tt, B, start_pos,
                                 start_pos_tt=start_pos_tt,
+                                cos_ext_4d=cos_ext_4d,
+                                sin_signed_4d=sin_signed_4d,
                             )
                             bucket = _pick_indexer_topk_bucket(T_active)
                             k_fixed = min(device_indexer.index_topk, bucket)
