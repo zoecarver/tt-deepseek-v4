@@ -4118,15 +4118,28 @@ class DeviceSparseAttn(nn.Module):
         self.mesh = mesh
         self.mesh_shape = tuple(mesh.shape)
         self.softmax_scale = float(softmax_scale)
-        self.n_heads = attn_sink.shape[0]
-        sink_4d = attn_sink.to(torch.bfloat16).view(1, 1, self.n_heads, 1).contiguous()
+        # Head-shard along col axis: each col owns H/cols heads. The sink
+        # tensor is sized to the full head count on host but is sharded on
+        # the head dim across cols, so each chip's per-call compute touches
+        # only its local head subset.
+        n_rows, n_cols = self.mesh_shape
+        full_heads = attn_sink.shape[0]
+        if full_heads % n_cols != 0:
+            raise ValueError(
+                f"attn_sink heads {full_heads} not divisible by mesh cols {n_cols}"
+            )
+        self.n_heads_full = full_heads
+        self.n_heads = full_heads // n_cols
+        sink_4d = attn_sink.to(torch.bfloat16).view(
+            1, 1, full_heads, 1).contiguous()
         self.sink_tt = ttnn.as_tensor(
             sink_4d,
             device=mesh,
             layout=ttnn.TILE_LAYOUT,
             dtype=ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            mesh_mapper=ttnn.ShardTensor2dMesh(
+                mesh, self.mesh_shape, dims=(None, 2)),
         )
         self._alloc_decode_tensors()
 
@@ -4999,19 +5012,37 @@ class DeviceAttention(nn.Module):
             _build_rotary_swap_matrix(rd), **rep)
         self.max_seq_len = cos_full.shape[0]
 
-        # wo_a: replicated [n_groups, in_per_group, o_lora_rank] (block-diagonal).
-        # Original CPU weight: [n_groups * o_lora_rank, in_per_group].
+        # wo_a: head-sharded across cols. Original CPU weight is
+        # [n_groups * o_lora_rank, in_per_group]; reshape to
+        # [n_groups, in_per_group, o_lora_rank] then shard the group dim
+        # across cols (1 group per col when n_groups == n_cols == 8).
+        # Per-chip view becomes [1, in_per_group, o_lora_rank], which the
+        # matmul broadcasts as a 2D [in, R] weight.
         out_total, in_per_group = wo_a_cpu_weight.shape
         if out_total != self.n_groups * self.o_lora_rank:
             raise ValueError(
                 f"wo_a shape {tuple(wo_a_cpu_weight.shape)} != expected "
                 f"({self.n_groups * self.o_lora_rank}, in_per_group)"
             )
+        n_rows, n_cols = self.mesh_shape
+        if self.n_groups != n_cols:
+            raise ValueError(
+                f"head-shard expects n_groups={self.n_groups} == mesh cols={n_cols}; "
+                "mixed-shape paths not implemented"
+            )
+        if self.n_heads % n_cols != 0:
+            raise ValueError(
+                f"n_heads={self.n_heads} not divisible by mesh cols={n_cols}"
+            )
+        self.n_local_heads = self.n_heads // n_cols
         self.wo_a_in_per_group = in_per_group
         w_g = wo_a_cpu_weight.to(torch.bfloat16).view(
             self.n_groups, self.o_lora_rank, in_per_group
         ).transpose(1, 2).contiguous()  # [G, in, R]
-        self.wo_a_w_tt = ttnn.as_tensor(w_g, **rep)
+        wo_a_shard = dict(rep)
+        wo_a_shard["mesh_mapper"] = ttnn.ShardTensor2dMesh(
+            mesh, self.mesh_shape, dims=(None, 0))
+        self.wo_a_w_tt = ttnn.as_tensor(w_g, **wo_a_shard)
 
         # Persistent device-side joint MLA kv_cache. Shape on device:
         # [1, 1, kv_cache_size_pad, head_dim] (B=1, num_heads=1) so
@@ -5041,8 +5072,10 @@ class DeviceAttention(nn.Module):
         """Mega Lk-B kernel: fused q_norm rmsnorm + wq_b matmul.
 
         Replaces the legacy `q_norm + reshape + wq_b.forward_device` chain
-        in `forward_device`. Weight is replicated (vs col-sharded
-        `DeviceColLinear`); on Galaxy this fits and avoids the all_gather.
+        in `forward_device`. wq_b is head-sharded along the col axis: each
+        col owns `n_local_heads * head_dim` of the output. Per-chip kernel
+        becomes 8x smaller (N=4096 vs full 32768) and the trailing reshape
+        produces only the col's local heads.
 
         The compiled ttl.operation is shared across all layers via
         `_get_lk_b_fused_kernel`; per-layer state is just the gamma-baked
@@ -5051,8 +5084,11 @@ class DeviceAttention(nn.Module):
         ttnn = self._ttnn
         attn = self.attn
         K = self.q_lora_rank
-        N = self.n_heads * self.head_dim
+        n_rows, n_cols = self.mesh_shape
+        N_full = self.n_heads * self.head_dim
+        N = N_full // n_cols
         TILE = 32
+        self._lk_b_N_per_col = N
         self._lk_b_kernel = _get_lk_b_fused_kernel(M=TILE, K=K, N=N)
 
         gamma = _resolve_q_norm_gamma(attn.q_norm).flatten().contiguous()
@@ -5067,13 +5103,16 @@ class DeviceAttention(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
-        self._lk_b_w_tt = ttnn.as_tensor(wq_b_baked, **rep)
+        col_shard = dict(rep)
+        col_shard["mesh_mapper"] = ttnn.ShardTensor2dMesh(
+            self.mesh, self.mesh_shape, dims=(None, -1))
+        self._lk_b_w_tt = ttnn.as_tensor(wq_b_baked, **col_shard)
         self._lk_b_scaler_tt = ttnn.from_torch(
             torch.ones((TILE, TILE), dtype=torch.bfloat16), **rep)
         self._lk_b_y_padded_tt = ttnn.from_torch(
-            torch.zeros((TILE, N), dtype=torch.bfloat16), **rep)
+            torch.zeros((TILE, N_full), dtype=torch.bfloat16), **col_shard)
         self._lk_b_out_tt = ttnn.from_torch(
-            torch.zeros(1, 1, N, dtype=torch.bfloat16), **rep)
+            torch.zeros(1, 1, N_full, dtype=torch.bfloat16), **col_shard)
 
     def _alloc_decode_tensors(self, B: int = 1):
         """Allocate the joint MLA kv_cache buffer eagerly so first decode
@@ -5206,20 +5245,27 @@ class DeviceAttention(nn.Module):
         # pattern. Each forward_device call slices q/kv/o into nope+rope
         # halves before/after rotary; ttnn.slice accepts output_tensor=, so
         # these scratches absorb 6 per-call allocs.
+        # q_* and o_* are head-sharded across cols (each col owns
+        # n_local_heads of the H total). Host tensor is sized to full H so
+        # the col-shard mapper splits the head axis 8-ways. kv_* are
+        # replicated (the joint MLA latent is shared across heads).
         H, D = self.n_heads, self.head_dim
         rd = self.rope_head_dim
         S = 1
+        n_rows, n_cols = self.mesh_shape
+        head_shard_4d = ttnn.ShardTensor2dMesh(
+            self.mesh, self.mesh_shape, dims=(None, 2))
         self._q_nope_scratch_tt = ttnn.from_torch(
             torch.zeros(B, S, H, D - rd, dtype=torch.bfloat16),
             device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=self._upload_mapper,
+            mesh_mapper=head_shard_4d,
         )
         self._q_rope_scratch_tt = ttnn.from_torch(
             torch.zeros(B, S, H, rd, dtype=torch.bfloat16),
             device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=self._upload_mapper,
+            mesh_mapper=head_shard_4d,
         )
         self._kv_nope_scratch_tt = ttnn.from_torch(
             torch.zeros(B, S, D - rd, dtype=torch.bfloat16),
@@ -5237,10 +5283,31 @@ class DeviceAttention(nn.Module):
             torch.zeros(B, S, H, D - rd, dtype=torch.bfloat16),
             device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=self._upload_mapper,
+            mesh_mapper=head_shard_4d,
         )
         self._o_rope_scratch_tt = ttnn.from_torch(
             torch.zeros(B, S, H, rd, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=head_shard_4d,
+        )
+        # Pre-allocated destinations for the head-shard wo_a path. Per chip
+        # logical shape after the local matmul is [1, B*S, o_lora_rank]
+        # (one group's contribution); the cluster_axis=1 all_gather along
+        # dim=-1 assembles the full [1, B*S, n_groups * o_lora_rank] tensor.
+        # _wo_a_local_tt is allocated as a col-sharded tensor of the full
+        # gathered shape so the per-chip slice exactly matches the matmul
+        # output and we can write directly via optional_output_tensor=.
+        n_groups_full = self.n_groups * self.o_lora_rank
+        self._wo_a_local_tt = ttnn.from_torch(
+            torch.zeros(1, B * S, n_groups_full, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(
+                self.mesh, self.mesh_shape, dims=(None, -1)),
+        )
+        self._wo_a_gathered_tt = ttnn.from_torch(
+            torch.zeros(1, B * S, n_groups_full, dtype=torch.bfloat16),
             device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=self._upload_mapper,
@@ -5430,6 +5497,7 @@ class DeviceAttention(nn.Module):
                 "DeviceAttention.forward_device requires start_pos_tt "
                 "(no host->device upload inside the trace body).")
         H, D = self.n_heads, self.head_dim
+        H_local = self.n_local_heads
         rd = self.rope_head_dim
         win = self.window_size
 
@@ -5474,31 +5542,34 @@ class DeviceAttention(nn.Module):
             qr_2d = self._rmsnorm_device(self.q_norm_dev, q_lora_2d, B * S)
             qr_tt = ttnn.reshape(qr_2d, [B, S, self.q_lora_rank])
             # SWAP-Lk-B: fused q_norm rmsnorm + wq_b matmul (single ttl.operation).
-            # Pad input [1,1,K] -> [TILE,K] via pad, run the shared kernel
-            # into per-layer y_padded scratch, slice/reshape back.
+            # wq_b is head-sharded across cols, so the per-chip kernel produces
+            # only n_local_heads * head_dim outputs. Pad input [1,1,K] ->
+            # [TILE,K], run the shared kernel into per-layer y_padded scratch
+            # (per-chip [TILE, N_per_col]), slice/reshape back to [B, S, H_local, D].
             q_lora_padded = ttnn.pad(
                 q_lora_2d, padding=[(0, 32 - B * S), (0, 0)], value=0.0)
             self._lk_b_kernel(
                 q_lora_padded, self._lk_b_w_tt,
                 self._lk_b_scaler_tt, self._lk_b_y_padded_tt,
             )
+            N_per_col = self._lk_b_N_per_col
             y_row = ttnn.slice(
                 self._lk_b_y_padded_tt, [0, 0],
-                [B * S, self.n_heads * self.head_dim])
+                [B * S, N_per_col])
             ttnn.copy(
-                ttnn.reshape(y_row, [B, S, self.n_heads * self.head_dim]),
+                ttnn.reshape(y_row, [B, S, N_per_col]),
                 self._lk_b_out_tt,
             )
             q_full_tt = self._lk_b_out_tt
-            q_tt = ttnn.reshape(q_full_tt, [B, S, H, D])
+            q_tt = ttnn.reshape(q_full_tt, [B, S, H_local, D])
             q_tt = _device_q_rsqrt_norm(ttnn, q_tt, self.eps)
 
             cos_q_ext, sin_q_signed = self._rotary_tables(
                 start_pos_tt, S, q_dims=4)
             # Rotate q[..., -rd:] by slicing -> rotating -> concatenating.
-            ttnn.slice(q_tt, [0, 0, 0, 0], [B, S, H, D - rd],
+            ttnn.slice(q_tt, [0, 0, 0, 0], [B, S, H_local, D - rd],
                        output_tensor=self._q_nope_scratch_tt)
-            ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, S, H, D],
+            ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, S, H_local, D],
                        output_tensor=self._q_rope_scratch_tt)
             q_rope = _device_apply_rotary_swap(
                 ttnn, self._q_rope_scratch_tt, cos_q_ext, sin_q_signed,
@@ -5635,36 +5706,40 @@ class DeviceAttention(nn.Module):
             # o_tt: [B, S, H, D].
 
         with _phase("attn.o"):
-            # Inverse rotary on o[..., -rd:].
+            # Inverse rotary on o[..., -rd:]. o_tt is per-col [B,S,H_local,D].
             cos_o_ext, sin_o_signed = self._rotary_tables(
                 start_pos_tt, S, q_dims=4)
-            ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H, D - rd],
+            ttnn.slice(o_tt, [0, 0, 0, 0], [B, S, H_local, D - rd],
                        output_tensor=self._o_nope_scratch_tt)
-            ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H, D],
+            ttnn.slice(o_tt, [0, 0, 0, D - rd], [B, S, H_local, D],
                        output_tensor=self._o_rope_scratch_tt)
             o_rope = _device_apply_rotary_swap(
                 ttnn, self._o_rope_scratch_tt, cos_o_ext, sin_o_signed,
                 self.rope_P_tt, inverse=True)
             o_tt = ttnn.concat([self._o_nope_scratch_tt, o_rope], dim=-1)
 
-            # Group reshape: [B, S, H, D] -> [G, B*S, H*D/G] for batched matmul.
-            per_group = (H * D) // self.n_groups
-            if per_group != self.wo_a_in_per_group:
+            # Head-sharded wo_a: per chip, o_tt represents this col's group
+            # of n_local_heads heads (== one of the n_groups groups). Flatten
+            # head*D into wo_a's input dim and do a single matmul against the
+            # local [1, in, R] weight. The leading 1 broadcasts; result is
+            # per-chip [1, B*S, R]. Reshape to [B, S, R] and all-gather along
+            # the col axis to assemble the full [B, S, n_groups * R] tensor.
+            in_per = self.wo_a_in_per_group
+            if in_per != H_local * D:
                 raise RuntimeError(
-                    f"wo_a in_per_group {self.wo_a_in_per_group} != H*D/G {per_group}"
+                    f"wo_a in_per_group {in_per} != H_local*D {H_local * D}"
                 )
-            o_perm = ttnn.reshape(o_tt, [B, S, self.n_groups, per_group])
-            # Permute to [G, B, S, in_per_group] then merge B*S.
-            o_perm = ttnn.permute(o_perm, [2, 0, 1, 3])
-            o_g = ttnn.reshape(o_perm, [self.n_groups, B * S, per_group])
-            # Block-diag matmul: [G, B*S, in] @ [G, in, R] -> [G, B*S, R]
-            o_wo_a_g = ttnn.matmul(o_g, self.wo_a_w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-            # Reshape back to [B, S, G, R] then flatten last two dims.
-            o_wo_a_rs = ttnn.reshape(o_wo_a_g, [self.n_groups, B, S, self.o_lora_rank])
-            o_wo_a = ttnn.permute(o_wo_a_rs, [1, 2, 0, 3])  # [B, S, G, R]
-            R = self.o_lora_rank
-            o_flat = ttnn.reshape(o_wo_a, [B, S, self.n_groups * R])
-            out_tt = attn.wo_b.forward_device(o_flat)             # [B, S, dim]
+            o_g_3d = ttnn.reshape(o_tt, [1, B * S, in_per])
+            ttnn.matmul(
+                o_g_3d, self.wo_a_w_tt,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                optional_output_tensor=self._wo_a_local_tt)
+            ttnn.all_gather(
+                self._wo_a_local_tt, dim=-1, cluster_axis=1,
+                num_links=1, output_tensor=self._wo_a_gathered_tt)
+            wo_b_in = ttnn.reshape(
+                self._wo_a_gathered_tt, [B, S, self.n_groups * self.o_lora_rank])
+            out_tt = attn.wo_b.forward_device(wo_b_in)
         return out_tt
 
     def _rmsnorm_device(self, norm_dev: "DeviceRMSNorm", x_2d_tt, num_rows: int):
