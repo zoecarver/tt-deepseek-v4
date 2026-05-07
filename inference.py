@@ -1432,14 +1432,17 @@ class DeviceColLinear(nn.Module):
 
     Weight: [out, in] (nn.Linear order). Transposed to [in, out] for ttnn.
     Auto-selects sharding based on out_dim:
-      - **Full-mesh (TP=N)**: when `out_dim % (num_chips * TILE) == 0`, shard
-        the out axis 1D-flat across all 32 chips. Each chip holds
-        [in, out/N]. After matmul, two sequential all_gathers (cluster_axis=1
-        then cluster_axis=0) reconstruct the full out_dim replicated across
-        the mesh.
-      - **Cols-only (TP=cols)**: otherwise, fall back to the original 8-chip
-        col-shard. Each chip holds [in, out/cols], with 4x replication on
-        the row axis. After matmul, one all_gather on cluster_axis=1.
+      - **Row-only (TP=rows)**: when `out_dim % (n_rows * TILE) == 0` AND
+        the cols axis can also fit (`out_dim % n_cols == 0`), shard along
+        the row axis only. Each chip holds [in, out/rows]; the col axis is
+        replicated (per-row weights identical). After matmul, a single
+        cluster_axis=0 all_gather rebuilds the full out_dim. This trades
+        the 32-chip TP for a 4-chip TP but cuts the CCL from a 2-stage
+        all_gather pair to one short row-axis hop, which empirically beats
+        the 2-stage path for every linear we hit (Lk-A row-shard win).
+      - **Cols-only (TP=cols)**: otherwise, fall back to the 8-chip col-shard.
+        Each chip holds [in, out/cols], with 4x replication on the row
+        axis. After matmul, one all_gather on cluster_axis=1.
     Output is replicated [1, 1, out_dim] in either mode, same calling
     contract.
     """
@@ -1453,16 +1456,17 @@ class DeviceColLinear(nn.Module):
         self.mesh = mesh
         self.mesh_shape = tuple(mesh.shape)
         n_rows, n_cols = self.mesh_shape
-        num_chips = n_rows * n_cols
         out_dim, in_dim = cpu_weight.shape
         if out_dim % n_cols != 0:
             raise ValueError(
                 f"col-linear out_dim {out_dim} not divisible by mesh cols {n_cols}"
             )
-        # Pick the finest shard that keeps each chip's slice tile-aligned.
-        full_mesh = (out_dim % (num_chips * self._TILE) == 0)
-        self._full_mesh = full_mesh
-        self._n_shards = num_chips if full_mesh else n_cols
+        # Prefer row-only 4-way shard when feasible: keeps the col axis
+        # replicated so the output gather is a single cluster_axis=0 hop
+        # across 4 chips (vs 32-way 2-stage gather).
+        row_only = (out_dim % (n_rows * self._TILE) == 0)
+        self._full_mesh = row_only
+        self._n_shards = n_rows if row_only else n_cols
         self.in_dim = in_dim
         self.out_dim = out_dim
         w_io = _weight_to_bf16(cpu_weight).transpose(0, 1).contiguous()  # [in, out]
@@ -1483,14 +1487,16 @@ class DeviceColLinear(nn.Module):
     def _w_mapper(self):
         ttnn = self._ttnn
         if self._full_mesh:
-            return ttnn.ShardTensorToMesh(self.mesh, dim=-1)
+            # Row-only shard: shard last dim along axis 0 (rows), replicate
+            # along axis 1 (cols). One cluster_axis=0 all_gather rebuilds
+            # the replicated output.
+            return ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(-1, None))
         return ttnn.ShardTensor2dMesh(self.mesh, self.mesh_shape, dims=(None, -1))
 
     def _alloc_decode_tensors(self):
         """Pre-allocate per-step output buffers for [B=1, S=1, out_dim]
-        decode. The intermediate `_row_gathered_tt` is only used in the
-        full-mesh path (after all_gather cluster_axis=1, before
-        cluster_axis=0); skip it in the cols-only path."""
+        decode. Both the row-only and cols-only paths need only one
+        per-chip partial buffer + one replicated gather destination."""
         ttnn = self._ttnn
         zeros = torch.zeros(1, 1, self.out_dim, dtype=torch.bfloat16)
         self._matmul_out_tt = ttnn.from_torch(
@@ -1505,19 +1511,6 @@ class DeviceColLinear(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
-        if self._full_mesh:
-            # After cluster_axis=1 gather, each row holds n_cols × per-chip
-            # contiguous out values, replicated across cols within the row.
-            # Shard tensor dim -1 across rows (axis 0 of mesh), replicate on
-            # cols. The next all_gather (cluster_axis=0) collapses this into
-            # _gather_out_tt.
-            self._row_gathered_tt = ttnn.from_torch(
-                zeros,
-                device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=ttnn.ShardTensor2dMesh(
-                    self.mesh, self.mesh_shape, dims=(-1, None)),
-            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ttnn = self._ttnn
@@ -1532,7 +1525,8 @@ class DeviceColLinear(nn.Module):
         )
         y_tt = ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         if self._full_mesh:
-            composer = ttnn.ConcatMeshToTensor(self.mesh, dim=-1)
+            # Row-only shard: dim 0 holds rows × per-chip contiguous out values.
+            composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(-1, 0))
         else:
             composer = ttnn.ConcatMesh2dToTensor(self.mesh, self.mesh_shape, dims=(0, -1))
         y = ttnn.to_torch(y_tt, mesh_composer=composer)
@@ -1544,21 +1538,16 @@ class DeviceColLinear(nn.Module):
 
     def forward_device(self, x_tt) -> "object":
         """Device-only path. x_tt: replicated input [1, 1, in_dim]. Returns
-        replicated output [1, 1, out_dim]. In TP=N mode the gather is two
-        sequential all_gathers (cluster_axis=1 then cluster_axis=0); in
-        TP=cols mode it's a single cluster_axis=1 gather. Output buffers
-        are pre-allocated; all ops write in place."""
+        replicated output [1, 1, out_dim]. In row-only mode the gather is a
+        single cluster_axis=0 (4-way) hop; in cols-only mode a single
+        cluster_axis=1 (8-way) hop. Output buffers are pre-allocated; all
+        ops write in place."""
         ttnn = self._ttnn
         ttnn.matmul(x_tt, self.w_tt, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                     optional_output_tensor=self._matmul_out_tt)
-        if self._full_mesh:
-            ttnn.all_gather(self._matmul_out_tt, dim=-1, cluster_axis=1,
-                            num_links=1, output_tensor=self._row_gathered_tt)
-            ttnn.all_gather(self._row_gathered_tt, dim=-1, cluster_axis=0,
-                            num_links=1, output_tensor=self._gather_out_tt)
-        else:
-            ttnn.all_gather(self._matmul_out_tt, dim=-1, cluster_axis=1,
-                            num_links=1, output_tensor=self._gather_out_tt)
+        cluster_axis = 0 if self._full_mesh else 1
+        ttnn.all_gather(self._matmul_out_tt, dim=-1, cluster_axis=cluster_axis,
+                        num_links=1, output_tensor=self._gather_out_tt)
         return self._gather_out_tt
 
 
