@@ -125,6 +125,10 @@ _PHASE_COUNTS: dict[str, int] = {}
 # wall time, since traced replays don't run any Python phase ctx mgr).
 _PHASE_PREWARM_ACCUM: dict[str, float] = {}
 _PHASE_PREWARM_COUNTS: dict[str, int] = {}
+# Set when --warmup-tokens fires after trace-warm: signals that
+# _PHASE_ACCUM was zeroed and the snapshot above is now stale, so
+# `_phase_postwarm` should read _PHASE_ACCUM directly.
+_PHASE_WARMUP_RESET_FIRED: bool = False
 # When set, called at the start and end of every _phase() to flush the device
 # command queue. Without this, ttnn ops are non-blocking and a phase's wall
 # time captures dispatch overhead instead of compute, with the actual work
@@ -180,7 +184,14 @@ def _phase_snapshot_at_trace_warm():
 
 
 def _phase_postwarm():
-    """Return (accum_delta, counts_delta) for steady-state replay only."""
+    """Return (accum_delta, counts_delta) for steady-state replay only.
+
+    When `--warmup-tokens` fires after trace-warm it zeroes _PHASE_ACCUM,
+    so the snapshot taken at trace-warm is stale; in that case
+    `_PHASE_WARMUP_RESET_FIRED` is True and we read _PHASE_ACCUM directly
+    (post-reset = post-warm)."""
+    if _PHASE_WARMUP_RESET_FIRED:
+        return dict(_PHASE_ACCUM), dict(_PHASE_COUNTS)
     a = {k: _PHASE_ACCUM[k] - _PHASE_PREWARM_ACCUM.get(k, 0.0)
          for k in _PHASE_ACCUM}
     c = {k: _PHASE_COUNTS[k] - _PHASE_PREWARM_COUNTS.get(k, 0)
@@ -6802,8 +6813,10 @@ class Model:
                 nxt = self.step_decode(nxt, pos)
             pos += 1
             if warmup_tokens > 0 and i + 1 == warmup_tokens:
+                global _PHASE_WARMUP_RESET_FIRED
                 _PHASE_ACCUM.clear()
                 _PHASE_COUNTS.clear()
+                _PHASE_WARMUP_RESET_FIRED = True
                 print(f"[phase] warmup complete after {warmup_tokens} tokens; "
                       f"phase counters reset")
 
