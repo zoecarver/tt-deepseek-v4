@@ -5046,7 +5046,11 @@ class DeviceIndexer(nn.Module):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=col_shard,
         )
+        # Pre-bake softmax_scale * H_full^-0.5 into the weights_proj weight so
+        # the per-token w_tt scaling collapses out of the score path.
+        scale = float(self.softmax_scale) * (float(self.n_heads) ** -0.5)
         wp_io = _weight_to_bf16(weights_proj_dev._cpu_weight).transpose(0, 1).contiguous()
+        wp_io = (wp_io.to(torch.float32) * scale).to(torch.bfloat16).contiguous()
         self._w_w_tt = ttnn.as_tensor(
             wp_io,
             device=mesh, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
@@ -5111,13 +5115,13 @@ class DeviceIndexer(nn.Module):
         # fp4_act_quant SKIPPED (bf16 policy).
         self.dc.forward_device(x_tt, B, start_pos, start_pos_tt=start_pos_tt)
 
-        scale = self.softmax_scale * (H_full ** -0.5)
+        # softmax_scale * H_full^-0.5 is pre-baked into self._w_w_tt at upload.
         # Head-sharded weights_proj: per-chip output is [1, 1, H_local].
         ttnn.matmul(
             x_tt, self._w_w_tt,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             optional_output_tensor=self._w_out_tt)
-        w_tt = ttnn.multiply(self._w_out_tt, scale)
+        w_tt = self._w_out_tt
 
         # kv_cache is replicated across the mesh; matmul(q, kv_cache^T) via
         # transpose_b folds the explicit transpose into the score matmul.
