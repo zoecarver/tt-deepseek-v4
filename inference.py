@@ -157,6 +157,20 @@ def _get_lk_d_idx_q_headshard_make_kernel():
     return _MEGA_KERNEL_CACHE["lk_d_idx_q_headshard_make_kernel"]
 
 
+def _get_lk_c_q_rotary_headshard_make_kernel():
+    """Lazy-import test_lk_c's `make_lk_c_q_rotary_kernel_headshard`.
+
+    Head-shard q-rotary for the main attention's q-stack: rotates rope
+    cols of post-rms_norm q in-place. Replaces 2x slice + rotary swap
+    (matmul + multiply + addcmul) + concat = 6 ttnn dispatches.
+    """
+    if "lk_c_q_rotary_headshard_make_kernel" not in _MEGA_KERNEL_CACHE:
+        mod = _import_mega_kernel("test_lk_c")
+        _MEGA_KERNEL_CACHE["lk_c_q_rotary_headshard_make_kernel"] = (
+            mod.make_lk_c_q_rotary_kernel_headshard)
+    return _MEGA_KERNEL_CACHE["lk_c_q_rotary_headshard_make_kernel"]
+
+
 # ==============================================================================
 # Global state (mirrors deepseek inference/model.py)
 # ==============================================================================
@@ -5712,6 +5726,19 @@ class DeviceAttention(nn.Module):
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
         )
 
+        # Lk-C-Q rotary: in-place rope-half rotation on post-rms_norm q.
+        # Replaces (per call) 2x slice + rotary swap (matmul + multiply +
+        # addcmul) + concat = 6 ttnn dispatches with one ttl.operation.
+        self._lk_c_q_rotary_kernel = _get_lk_c_q_rotary_headshard_make_kernel()(
+            self.mesh,
+            cos_full_cpu=self._cos_full_cpu,
+            sin_full_cpu=self._sin_full_cpu,
+            n_per_chip=self.n_local_heads * self.head_dim,
+            h_per_chip=self.n_local_heads,
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_head_dim,
+        )
+
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         """Single-token forward. Prefill is driven externally as a per-token
         loop, so seqlen is always 1 and start_pos==0 is handled by _decode."""
@@ -5949,15 +5976,13 @@ class DeviceAttention(nn.Module):
             q_tt = ttnn.rms_norm(
                 q_tt, weight=self.q_rsqrt_ones_tt, epsilon=self.eps)
 
-            # Rotate q[..., -rd:] by slicing -> rotating -> concatenating.
-            ttnn.slice(q_tt, [0, 0, 0, 0], [B, S, H_local, D - rd],
-                       output_tensor=self._q_nope_scratch_tt)
-            ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, S, H_local, D],
-                       output_tensor=self._q_rope_scratch_tt)
-            q_rope = _device_apply_rotary_swap(
-                ttnn, self._q_rope_scratch_tt, cos_ext_4d, sin_signed_4d,
-                self.rope_P_tt, inverse=False)
-            q_tt = ttnn.concat([self._q_nope_scratch_tt, q_rope], dim=-1)
+            # SWAP-Lk-C-Q: in-place rotary on rope cols of q_tt. Replaces
+            # 2x slice + matmul + multiply + addcmul + concat (6 ttnn
+            # dispatches) with one ttl.operation. ttnn.reshape between
+            # [B, S, H_local, D] and 2D [B*S, H_local*D] is free per-chip.
+            q_2d = ttnn.reshape(q_tt, [B * S, H_local * D])
+            self._lk_c_q_rotary_kernel(q_2d, start_pos_tt)
+            q_tt = ttnn.reshape(q_2d, [B, S, H_local, D])
 
         # KV path: wkv -> kv_norm -> rotary -> nope-half act_quant.
         # SWAP-Lk-D1: all post-wkv work is fused into one tt-lang dispatch

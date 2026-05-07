@@ -346,6 +346,130 @@ def _build_swap_matrix(rd: int) -> torch.Tensor:
     return P
 
 
+def _make_q_rotary_headshard_kernel(n_per_chip: int, h_per_chip: int,
+                                     D: int, rd: int,
+                                     fp32_dest_acc_en: bool = True):
+    """In-place rotary on rope half of post-rms_norm q, head-shard layout.
+
+    Input/output: [TILE_pad, n_per_chip] (per-chip). Per chip we own
+    h_per_chip heads laid out contiguously along the col axis. For each
+    head h, cols [h*D + (D-rd), h*D + D) are the rope half (rd_t = rd/TILE
+    tile-cols). The kernel reads each rope tile, applies
+        out = q*cos + (q@P)*sin
+    and writes back. Nope cols are NOT touched (caller passes the same
+    tensor as both input and output to keep them in place).
+
+    Grid: (h_per_chip, 1). Each col-core handles one head's rd_t rope
+    tiles. cos/sin/P per rope position are shared across heads.
+    """
+    if n_per_chip != h_per_chip * D:
+        raise ValueError(
+            f"n_per_chip={n_per_chip} != h_per_chip*D={h_per_chip * D}")
+    D_t = D // TILE
+    nope_t = (D - rd) // TILE
+    rd_t = rd // TILE
+
+    @ttl.operation(grid=(h_per_chip, 1), fp32_dest_acc_en=fp32_dest_acc_en)
+    def q_rotary(q, P, cos, sin, out):
+        in_cb = ttl.make_dataflow_buffer_like(q, shape=(1, 1), block_count=2)
+        P_cb = ttl.make_dataflow_buffer_like(P, shape=(1, 1), block_count=2)
+        cos_cb = ttl.make_dataflow_buffer_like(cos, shape=(1, 1), block_count=2)
+        sin_cb = ttl.make_dataflow_buffer_like(sin, shape=(1, 1), block_count=2)
+        swap_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+        out_cb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), block_count=2)
+
+        @ttl.compute()
+        def compute():
+            for r in range(rd_t):
+                i = in_cb.wait()
+                P_blk = P_cb.wait()
+                sw = swap_cb.reserve()
+                sw.store(i @ P_blk)
+                sw_blk = swap_cb.wait()
+                c = cos_cb.wait()
+                s = sin_cb.wait()
+                o = out_cb.reserve()
+                o.store(i * c + sw_blk * s)
+
+        @ttl.datamovement()
+        def dm_read():
+            col_c, _ = ttl.node(dims=2)
+            head_off = col_c * D_t
+            for r in range(rd_t):
+                tile_c = head_off + nope_t + r
+                ttl.copy(q[0:1, tile_c:tile_c + 1],
+                         in_cb.reserve()).wait()
+                ttl.copy(P[r:r + 1, r:r + 1],
+                         P_cb.reserve()).wait()
+                ttl.copy(cos[0:1, r:r + 1],
+                         cos_cb.reserve()).wait()
+                ttl.copy(sin[0:1, r:r + 1],
+                         sin_cb.reserve()).wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            col_c, _ = ttl.node(dims=2)
+            head_off = col_c * D_t
+            for r in range(rd_t):
+                tile_c = head_off + nope_t + r
+                o = out_cb.wait()
+                ttl.copy(o, out[0:1, tile_c:tile_c + 1]).wait()
+
+    return q_rotary
+
+
+def make_lk_c_q_rotary_kernel_headshard(mesh, cos_full_cpu, sin_full_cpu,
+                                         n_per_chip: int, h_per_chip: int,
+                                         head_dim: int,
+                                         rope_head_dim: int = ROPE_HEAD_DIM):
+    """Mega kernel for the Lk-C q-rotary slice on legacy's head-shard.
+
+    Replaces (per call): 2x ttnn.slice + matmul + multiply + addcmul +
+    ttnn.concat = 6 ttnn dispatches with one ttl.operation that rotates
+    rope cols of post-rms_norm q in place.
+
+    Caller must pass the SAME ttnn tensor as both input q_tt and the
+    out arg. Nope cols are unchanged; rope cols are overwritten with
+    `q*cos + (q@P)*sin`.
+    """
+    if n_per_chip != h_per_chip * head_dim:
+        raise ValueError(
+            f"n_per_chip={n_per_chip} != h_per_chip*head_dim="
+            f"{h_per_chip * head_dim}")
+
+    rotary_kernel = _make_q_rotary_headshard_kernel(
+        n_per_chip=n_per_chip, h_per_chip=h_per_chip,
+        D=head_dim, rd=rope_head_dim)
+
+    rep = dict(device=mesh, layout=ttnn.TILE_LAYOUT,
+               memory_config=ttnn.DRAM_MEMORY_CONFIG,
+               mesh_mapper=ttnn.ReplicateTensorToMesh(mesh))
+    cos_ext_packed, sin_signed_packed = _build_rotary_tables(
+        cos_full_cpu, sin_full_cpu, inverse=False)
+    cos_ext_tt = ttnn.as_tensor(cos_ext_packed, dtype=ttnn.bfloat16, **rep)
+    sin_signed_tt = ttnn.as_tensor(sin_signed_packed, dtype=ttnn.bfloat16, **rep)
+    P_cpu = _build_swap_matrix(rope_head_dim)
+    P_tt = ttnn.as_tensor(P_cpu.contiguous(), dtype=ttnn.bfloat16, **rep)
+
+    def lk_c_q_rotary_kernel(q_2d_tt, start_pos_tt):
+        """In-place: rotate rope cols of q_2d_tt in place.
+
+        q_2d_tt is the post-rms_norm q reshaped to per-chip 2D
+        [B*S, n_per_chip] (or anything ttnn presents as 2D with the same
+        per-chip storage). Caller is responsible for the upstream reshape
+        and downstream re-reshape back to [B, S, h_per_chip, head_dim].
+        """
+        cos_b_2d = ttnn.embedding(
+            start_pos_tt, cos_ext_tt, layout=ttnn.TILE_LAYOUT)
+        sin_b_2d = ttnn.embedding(
+            start_pos_tt, sin_signed_tt, layout=ttnn.TILE_LAYOUT)
+        cos_b = ttnn.reshape(cos_b_2d, [TILE, rope_head_dim])
+        sin_b = ttnn.reshape(sin_b_2d, [TILE, rope_head_dim])
+        rotary_kernel(q_2d_tt, P_tt, cos_b, sin_b, q_2d_tt)
+
+    return lk_c_q_rotary_kernel
+
+
 def make_lk_c_kernel(mesh, cos_full_cpu, sin_full_cpu):
     """Mega kernel for Lk-C = q_rsqrt_norm + q rotary + wkv matmul.
 
