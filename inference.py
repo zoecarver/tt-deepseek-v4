@@ -5802,7 +5802,6 @@ class DeviceAttention(nn.Module):
             kv_rope = _device_apply_rotary_swap(
                 ttnn, self._kv_rope_scratch_tt, cos_kv_ext, sin_kv_signed,
                 self.rope_P_tt, inverse=False)
-            kv_tt = ttnn.concat([self._kv_nope_scratch_tt, kv_rope], dim=-1)
 
             # Device-side act_quant on the nope region (bf16 round-trip; no fp8
             # cast under the bf16-everywhere precision policy). One tt-lang
@@ -5814,10 +5813,7 @@ class DeviceAttention(nn.Module):
                 raise RuntimeError(
                     "act_quant_block kernel not pre-built; "
                     "call prebuild_ttl_decode_kernels(args) first")
-            nope_2d = ttnn.reshape(
-                ttnn.slice(kv_tt, [0, 0, 0], [B, S, D - rd]),
-                [B * S, D - rd],
-            )
+            nope_2d = ttnn.reshape(self._kv_nope_scratch_tt, [B * S, D - rd])
             ttl_act_quant_block_M32_N448_B64(
                 nope_2d,
                 self._act_quant_sc_tt,
@@ -5827,8 +5823,7 @@ class DeviceAttention(nn.Module):
                 ttnn.slice(self._act_quant_out_tt, [0, 0], [B * S, D - rd]),
                 [B, S, D - rd],
             )
-            kv_rope_only = ttnn.slice(kv_tt, [0, 0, D - rd], [B, S, D])
-            kv_tt = ttnn.concat([kv_nope_q, kv_rope_only], dim=-1)
+            kv_tt = ttnn.concat([kv_nope_q, kv_rope], dim=-1)
 
         # Build the topk index tensor entirely on device.
         # Window slot indices are sliced from the precomputed
