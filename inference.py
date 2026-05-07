@@ -5277,6 +5277,10 @@ class DeviceAttention(nn.Module):
         self.sin_signed_tt = ttnn.as_tensor(sin_signed_cpu, **rep)
         self.rope_P_tt = ttnn.as_tensor(
             _build_rotary_swap_matrix(rd), **rep)
+        # Per-head rsqrt-norm uses ttnn.rms_norm with an all-ones gamma
+        # (no-op affine), folding mul/mean/add/rsqrt/mul into one dispatch.
+        self.q_rsqrt_ones_tt = ttnn.as_tensor(
+            torch.ones(self.head_dim, dtype=torch.bfloat16), **rep)
         self.max_seq_len = cos_full.shape[0]
 
         # wo_a: head-sharded across cols. Original CPU weight is
@@ -5831,7 +5835,8 @@ class DeviceAttention(nn.Module):
                 self._lk_b_y_padded_tt, [0, 0],
                 [B * S, N_per_col])
             q_tt = ttnn.reshape(y_row, [B, S, H_local, D])
-            q_tt = _device_q_rsqrt_norm(ttnn, q_tt, self.eps)
+            q_tt = ttnn.rms_norm(
+                q_tt, weight=self.q_rsqrt_ones_tt, epsilon=self.eps)
 
             cos_q_ext, sin_q_signed = self._rotary_tables(
                 start_pos_tt, S, q_dims=4)
