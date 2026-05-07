@@ -4863,14 +4863,26 @@ class DeviceIndexer(nn.Module):
         import ttnn
         self._ttnn = ttnn
         self.mesh = mesh
+        self.mesh_shape = tuple(mesh.shape)
+        n_rows, n_cols = self.mesh_shape
         self.indexer = indexer
         self.dc = dc
+        # wq_b_dev / weights_proj_dev are kept for the host-fallback `forward`
+        # path on ColumnParallelLinear. The decode path uses head-sharded
+        # weights allocated below.
         self.wq_b = wq_b_dev
         self.weights_proj = weights_proj_dev
 
         self.head_dim = indexer.head_dim
         self.rope_head_dim = indexer.rope_head_dim
         self.n_heads = indexer.n_heads
+        if self.n_heads % n_cols != 0:
+            raise ValueError(
+                f"indexer n_heads {self.n_heads} not divisible by mesh cols {n_cols}"
+            )
+        self.n_local_heads = self.n_heads // n_cols
+        self.q_lora_rank = wq_b_dev.in_dim
+        self.dim = weights_proj_dev.in_dim
         self.compress_ratio = indexer.compress_ratio
         self.softmax_scale = float(indexer.softmax_scale)
         self.index_topk = indexer.index_topk
@@ -4894,18 +4906,54 @@ class DeviceIndexer(nn.Module):
         self.sin_signed_tt = ttnn.as_tensor(sin_signed_cpu, **rep)
         self.rope_P_tt = ttnn.as_tensor(
             _build_rotary_swap_matrix(self.rope_head_dim), **rep)
+
+        # Head-shard wq_b along col axis. Each col holds [in=q_lora_rank,
+        # n_local_heads * head_dim]. Bypasses DeviceColLinear's 2-stage
+        # full-mesh all_gather; the score path stays head-sharded right
+        # through to the per-col reduction.
+        col_shard = ttnn.ShardTensor2dMesh(mesh, self.mesh_shape, dims=(None, -1))
+        wq_b_io = _weight_to_bf16(wq_b_dev._cpu_weight).transpose(0, 1).contiguous()
+        self._wq_b_w_tt = ttnn.as_tensor(
+            wq_b_io,
+            device=mesh, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=col_shard,
+        )
+        wp_io = _weight_to_bf16(weights_proj_dev._cpu_weight).transpose(0, 1).contiguous()
+        self._w_w_tt = ttnn.as_tensor(
+            wp_io,
+            device=mesh, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=col_shard,
+        )
         self._alloc_decode_tensors()
 
     def _alloc_decode_tensors(self):
-        """No per-step buffers yet; q/cos/sin slices and score temporaries
-        still allocate per-call. Reserved entry point for the future
-        `indexer_score_reduce` fused kernel."""
-        return
+        """Per-step output buffers for the head-sharded matmuls. Both are
+        col-axis sharded along the last (head) dim; per-chip slice equals
+        n_local_heads * head_dim (q) or n_local_heads (w)."""
+        ttnn = self._ttnn
+        col_shard = ttnn.ShardTensor2dMesh(
+            self.mesh, self.mesh_shape, dims=(None, -1))
+        H_full = self.n_heads * self.head_dim
+        self._wq_b_out_tt = ttnn.from_torch(
+            torch.zeros(1, 1, H_full, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=col_shard,
+        )
+        self._w_out_tt = ttnn.from_torch(
+            torch.zeros(1, 1, self.n_heads, dtype=torch.bfloat16),
+            device=self.mesh, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=col_shard,
+        )
 
     def forward_device_score(self, x_tt, qr_tt, B: int, start_pos: int,
                               start_pos_tt):
         ttnn = self._ttnn
-        H = self.n_heads
+        H_full = self.n_heads
+        H_local = self.n_local_heads
         D = self.head_dim
         rd = self.rope_head_dim
         if start_pos_tt is None:
@@ -4913,8 +4961,12 @@ class DeviceIndexer(nn.Module):
                 "DeviceIndexer.forward_device_score requires start_pos_tt "
                 "(no host->device upload inside the trace body).")
 
-        q_tt = self.wq_b.forward_device(qr_tt)
-        q_tt = ttnn.reshape(q_tt, [B, 1, H, D])
+        # Head-sharded wq_b: per-chip output is [1, 1, H_local * D].
+        ttnn.matmul(
+            qr_tt, self._wq_b_w_tt,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            optional_output_tensor=self._wq_b_out_tt)
+        q_tt = ttnn.reshape(self._wq_b_out_tt, [B, 1, H_local, D])
 
         cos_ext = ttnn.embedding(
             start_pos_tt, self.cos_ext_tt, layout=ttnn.TILE_LAYOUT)
@@ -4922,8 +4974,8 @@ class DeviceIndexer(nn.Module):
             start_pos_tt, self.sin_signed_tt, layout=ttnn.TILE_LAYOUT)
         cos_ext = ttnn.reshape(cos_ext, [1, 1, 1, rd])
         sin_signed = ttnn.reshape(sin_signed, [1, 1, 1, rd])
-        q_nope = ttnn.slice(q_tt, [0, 0, 0, 0],     [B, 1, H, D - rd])
-        q_rope = ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, 1, H, D])
+        q_nope = ttnn.slice(q_tt, [0, 0, 0, 0],     [B, 1, H_local, D - rd])
+        q_rope = ttnn.slice(q_tt, [0, 0, 0, D - rd], [B, 1, H_local, D])
         q_rope = _device_apply_rotary_swap(
             ttnn, q_rope, cos_ext, sin_signed, self.rope_P_tt, inverse=False)
         q_tt = ttnn.concat([q_nope, q_rope], dim=-1)
@@ -4932,20 +4984,30 @@ class DeviceIndexer(nn.Module):
         # fp4_act_quant SKIPPED (bf16 policy).
         self.dc.forward_device(x_tt, B, start_pos, start_pos_tt=start_pos_tt)
 
-        scale = self.softmax_scale * (H ** -0.5)
-        w_tt = self.weights_proj.forward_device(x_tt)
-        w_tt = ttnn.multiply(w_tt, scale)
+        scale = self.softmax_scale * (H_full ** -0.5)
+        # Head-sharded weights_proj: per-chip output is [1, 1, H_local].
+        ttnn.matmul(
+            x_tt, self._w_w_tt,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            optional_output_tensor=self._w_out_tt)
+        w_tt = ttnn.multiply(self._w_out_tt, scale)
 
         kv_T_tt = ttnn.transpose(self.dc.kv_cache_tt, -2, -1)   # [B, 1, D, T_pad]
-        score = ttnn.matmul(q_tt, kv_T_tt)                        # [B, 1, H, T_pad]
+        # kv is replicated across the mesh; matmul against the head-sharded
+        # q produces a per-chip [B, 1, H_local, T_pad] partial.
+        score = ttnn.matmul(q_tt, kv_T_tt)                       # [B, 1, H_local, T_pad]
 
         # TODO(tt-lang): fuse relu * weights * sum + topk into a single
         # `indexer_score_reduce` kernel (README candidate #4).
         score = ttnn.relu(score)
-        score_t = ttnn.transpose(score, -2, -1)                   # [B, 1, T_pad, H]
-        w_b = ttnn.reshape(w_tt, [B, 1, 1, H])
+        score_t = ttnn.transpose(score, -2, -1)                  # [B, 1, T_pad, H_local]
+        w_b = ttnn.reshape(w_tt, [B, 1, 1, H_local])
         score_t = ttnn.multiply(score_t, w_b)
-        return ttnn.sum(score_t, dim=-1, keepdim=False)           # [B, 1, T_pad]
+        partial = ttnn.sum(score_t, dim=-1, keepdim=False)       # per-chip [B, 1, T_pad]
+        # Combine the per-col head partials. cluster_axis=1 leaves the
+        # input replicated across rows, so the result is fully replicated
+        # (matching the score scratch buffer's mesh mapper).
+        return ttnn.all_reduce(partial, cluster_axis=1)
 
 
 class DeviceAttention(nn.Module):
