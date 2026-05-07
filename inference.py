@@ -715,8 +715,10 @@ class MoE(nn.Module):
             indices_tt if indices_tt.dtype == ttnn.int32
             else ttnn.typecast(indices_tt, ttnn.int32))
         indices_4d = ttnn.reshape(indices_int32, [1, 1, 1, topk])
-        match = ttnn.eq(indices_4d, self._chip_ids_4d_tt)
-        match_bf16 = ttnn.typecast(match, ttnn.bfloat16)
+        # ttnn.eq(dtype=bf16) folds the (eq -> typecast bool->bf16) chain into
+        # a single dispatch; the result feeds directly into the weights mul.
+        match_bf16 = ttnn.eq(
+            indices_4d, self._chip_ids_4d_tt, dtype=ttnn.bfloat16)
         ttnn.multiply(weights_4d, match_bf16, output_tensor=match_bf16)
         mask = ttnn.sum(match_bf16, dim=-1, keepdim=True)
 
